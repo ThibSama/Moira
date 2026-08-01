@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Moira
+Comment=Monitor Claude and Codex quotas
+Exec=moira
+Icon=io.github.moira.QuotaMonitor
+Terminal=false
+Categories=Utility;
+Keywords=Claude;Codex;quota;usage;
+StartupNotify=true

@@ -1,0 +1,3 @@
+#!/bin/sh
+PYTHONPATH=/usr/lib/moira exec /usr/bin/python3 -m moira.app "$@"
+

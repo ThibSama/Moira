@@ -1,0 +1,6 @@
+Claude Code usage
+Five hour usage: 42%
+Resets at: 2026-08-01T18:30:00+02:00
+Seven day usage: 68%
+Resets at: 2026-08-06T09:15:00+02:00
+

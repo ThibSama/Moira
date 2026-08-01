@@ -1,0 +1,11 @@
+Package: moira
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: Moira contributors
+Depends: python3 (>= 3.11), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-secret-1
+Description: Claude and Codex quota monitor
+ A compact Ubuntu GTK4 application showing Claude and Codex quota usage,
+ reset times, and optional NTFY notifications.
+
