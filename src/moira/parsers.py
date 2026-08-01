@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -124,14 +125,28 @@ def parse_codex_rate_limits(payload: dict[str, Any], retrieved_at: datetime) -> 
             window = snapshot.get(name)
             if isinstance(window, dict) and window.get("windowDurationMins") is not None:
                 candidates.append(window)
-    weekly = [item for item in candidates if int(item["windowDurationMins"]) >= 7 * 24 * 60]
+    weekly = [
+        item
+        for item in candidates
+        if isinstance(item.get("windowDurationMins"), int)
+        and not isinstance(item["windowDurationMins"], bool)
+        and item["windowDurationMins"] == 7 * 24 * 60
+    ]
     if not weekly:
         raise ParseError("Codex weekly quota window missing")
     window = min(weekly, key=lambda item: int(item["windowDurationMins"]))
     try:
-        used = float(window["usedPercent"])
+        used_value = window["usedPercent"]
         reset_value = window["resetsAt"]
-        if reset_value is None:
+        if (
+            isinstance(used_value, bool)
+            or not isinstance(used_value, (int, float))
+            or isinstance(reset_value, bool)
+            or not isinstance(reset_value, (int, float))
+        ):
+            raise ValueError
+        used = float(used_value)
+        if not math.isfinite(used) or not math.isfinite(float(reset_value)) or reset_value <= 0:
             raise ValueError
         reset = datetime.fromtimestamp(float(reset_value), UTC)
     except (KeyError, TypeError, ValueError, OverflowError) as exc:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moira-quota-monitor"
-version = "0.1.0"
+version = "0.1.1"
 description = "Ubuntu quota monitor for Claude and Codex"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,6 +15,7 @@ dependencies = []
 
 [project.scripts]
 moira = "moira.app:main"
+moira-claude-statusline = "moira.claude_integration:statusline_main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

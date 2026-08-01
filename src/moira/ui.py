@@ -13,7 +13,10 @@ from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from .alerts import evaluate_alerts, merge_with_stale
 from .autostart import set_enabled as set_autostart
+from .claude_integration import remove as remove_claude_integration
+from .claude_integration import setup as setup_claude_integration
 from .collectors import ClaudeCollector, CodexCollector
+from .desktop import create_shortcut, remove_shortcut
 from .models import QuotaReading, QuotaStatus
 from .ntfy import Notification, send
 from .persistence import Settings, load_settings, load_state, save_settings, save_state
@@ -165,6 +168,22 @@ class MainWindow(Adw.ApplicationWindow):
         buttons.append(save)
         buttons.append(test)
         box.append(buttons)
+        integration_buttons = Gtk.Box(spacing=8)
+        setup_claude = Gtk.Button(label="Set up Claude integration")
+        setup_claude.connect("clicked", self._setup_claude)
+        remove_claude = Gtk.Button(label="Remove Claude integration")
+        remove_claude.connect("clicked", self._remove_claude)
+        integration_buttons.append(setup_claude)
+        integration_buttons.append(remove_claude)
+        box.append(integration_buttons)
+        shortcut_buttons = Gtk.Box(spacing=8)
+        create_desktop = Gtk.Button(label="Create desktop shortcut")
+        create_desktop.connect("clicked", self._create_desktop_shortcut)
+        remove_desktop = Gtk.Button(label="Remove desktop shortcut")
+        remove_desktop.connect("clicked", self._remove_desktop_shortcut)
+        shortcut_buttons.append(create_desktop)
+        shortcut_buttons.append(remove_desktop)
+        box.append(shortcut_buttons)
         self.settings_status = Gtk.Label(xalign=0)
         self.settings_status.set_wrap(True)
         box.append(self.settings_status)
@@ -308,11 +327,50 @@ class MainWindow(Adw.ApplicationWindow):
         )
         return False
 
+    def _setup_claude(self, *_: Any) -> None:
+        try:
+            changed = setup_claude_integration()
+            self.settings_status.set_text(
+                "Claude integration installed. Complete one Claude response to populate quotas."
+                if changed
+                else "Claude integration is already installed."
+            )
+        except Exception as exc:
+            self.settings_status.set_text(f"Claude integration was not changed: {exc}")
+
+    def _remove_claude(self, *_: Any) -> None:
+        try:
+            changed = remove_claude_integration()
+            self.settings_status.set_text(
+                "Claude integration removed and the previous status line restored."
+                if changed
+                else "Claude integration is not installed."
+            )
+        except Exception as exc:
+            self.settings_status.set_text(f"Claude integration was not changed: {exc}")
+
+    def _create_desktop_shortcut(self, *_: Any) -> None:
+        try:
+            target, changed = create_shortcut()
+            action = "created" if changed else "already exists"
+            self.settings_status.set_text(f"Desktop shortcut {action}: {target}")
+        except Exception as exc:
+            self.settings_status.set_text(f"Desktop shortcut is unavailable: {exc}")
+
+    def _remove_desktop_shortcut(self, *_: Any) -> None:
+        try:
+            changed = remove_shortcut()
+            self.settings_status.set_text(
+                "Desktop shortcut removed." if changed else "Desktop shortcut is already absent."
+            )
+        except Exception as exc:
+            self.settings_status.set_text(f"Desktop shortcut is unavailable: {exc}")
+
     def _about(self, *_: Any) -> None:
         dialog = Adw.AboutDialog(
             application_name="Moira",
             application_icon="io.github.moira.QuotaMonitor",
-            version="0.1.0",
+            version="0.1.1",
             developer_name="Moira contributors",
             license_type=Gtk.License.MIT_X11,
             comments="Claude and Codex quota monitor for Ubuntu",

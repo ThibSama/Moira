@@ -77,6 +77,32 @@ def test_codex_structured_weekly_only() -> None:
                 ]
             }
         },
+        {
+            "result": {
+                "rateLimits": [
+                    {
+                        "secondary": {
+                            "usedPercent": 10,
+                            "windowDurationMins": 10081,
+                            "resetsAt": 1786204800,
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            "result": {
+                "rateLimits": [
+                    {
+                        "secondary": {
+                            "usedPercent": "10",
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1786204800,
+                        }
+                    }
+                ]
+            }
+        },
     ],
 )
 def test_codex_missing_or_malformed(payload: dict[str, object]) -> None:

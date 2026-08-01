@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+from moira.claude_integration import update_cache
 from moira.collectors import ClaudeCollector
 from moira.models import QuotaStatus
 from moira.ntfy import Notification, build_request, send
@@ -9,15 +10,16 @@ from moira.persistence import Settings, load_settings, save_settings
 
 
 def test_ntfy_request_construction() -> None:
+    token = "fixture-token"
     request = build_request(
         "https://notify.example/base",
         "my topic",
         Notification("Title", "Body", "warning", 4),
-        "secret-placeholder",
+        token,
     )
     assert request.full_url == "https://notify.example/base/my%20topic"
     assert request.data == b"Body"
-    assert request.get_header("Authorization") == "Bearer secret-placeholder"
+    assert request.get_header("Authorization") == f"Bearer {token}"
     assert request.get_header("Title") == "Title"
     assert request.method == "POST"
 
@@ -44,29 +46,27 @@ def test_versioned_settings_and_no_token_on_disk(tmp_path: Path, monkeypatch: ob
 
 
 def test_collector_unavailable(monkeypatch: object) -> None:
-    with patch("moira.collectors.shutil.which", return_value=None):
+    with patch.dict("os.environ", {"XDG_STATE_HOME": "/nonexistent/moira-test"}):
         reading = ClaudeCollector().collect()[0]
     assert reading.status is QuotaStatus.UNAVAILABLE
+    assert "not found" in reading.detail
 
 
 def test_collector_parse_error() -> None:
-    with (
-        patch("moira.collectors.shutil.which", return_value="/bin/claude"),
-        patch("moira.collectors.capture_slash_command", return_value="changed output"),
-    ):
+    with patch("moira.claude_integration._read_object", return_value={"bad": "cache"}):
         reading = ClaudeCollector().collect()[0]
     assert reading.status is QuotaStatus.PARSE_ERROR
 
 
-def test_collector_available() -> None:
-    output = (
-        "Five hour 10% resets at 2026-08-01T18:30:00+02:00\n"
-        "Weekly 20% resets at 2026-08-08T18:30:00+02:00"
-    )
-    with (
-        patch("moira.collectors.shutil.which", return_value="/bin/claude"),
-        patch("moira.collectors.capture_slash_command", return_value=output),
-    ):
+def test_collector_available(tmp_path: Path) -> None:
+    payload = {
+        "rate_limits": {
+            "five_hour": {"used_percentage": 10, "resets_at": 1785600000},
+            "seven_day": {"used_percentage": 20, "resets_at": 1786204800},
+        }
+    }
+    with patch.dict("os.environ", {"XDG_STATE_HOME": str(tmp_path)}):
+        assert update_cache(payload)
         readings = ClaudeCollector().collect()
     assert len(readings) == 2
     assert all(item.status is QuotaStatus.AVAILABLE for item in readings)

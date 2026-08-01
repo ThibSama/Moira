@@ -12,6 +12,6 @@
   </description>
   <launchable type="desktop-id">io.github.moira.QuotaMonitor.desktop</launchable>
   <provides><binary>moira</binary></provides>
-  <releases><release version="0.1.0" date="2026-08-01"/></releases>
+  <releases><release version="0.1.1" date="2026-08-01"/></releases>
   <content_rating type="oars-1.1"/>
 </component>

@@ -4,11 +4,11 @@ Moira is a compact Ubuntu GTK4/Libadwaita utility for Claude and Codex quotas. I
 
 ## Data sources and behavior
 
-- Claude: the installed `claude` CLI's `/usage` view is captured in an isolated pseudo-terminal and parsed strictly. Claude Code must already be logged in.
-- Codex: the installed `codex app-server` read-only `account/rateLimits/read` method returns structured windows. Moira selects only the declared weekly window. It intentionally does not model or display a Codex five-hour quota.
-- A missing CLI produces **Unavailable**. An unexpected provider format produces **Parse error**. When a refresh fails after a success, Moira retains the last successful values as **Stale**.
+- Claude Code sends structured `rate_limits.five_hour` and `rate_limits.seven_day` data to its configured status-line command after a response. Moira chains the existing command and reads its own minimal cache; it never scrapes the rendered `/usage` screen.
+- The installed `codex app-server` read-only `account/rateLimits/read` method returns structured windows. Moira completes the initialize handshake first and accepts only a window declared as exactly 10,080 minutes (seven days). It intentionally does not model or display a Codex five-hour quota.
+- Missing data produces **Unavailable**. Invalid provider data produces **Parse error**. When a refresh fails after a success, Moira retains the last successful values as **Stale**.
 
-Provider CLI interfaces can change. Parsers intentionally fail closed instead of treating changed or missing data as 0%.
+Provider interfaces can change. Validation fails closed instead of treating changed or missing data as 0%.
 
 ## Install on Ubuntu
 
@@ -16,10 +16,14 @@ Build and install the Debian package:
 
 ```sh
 ./scripts/build-deb.sh
-sudo apt install ./dist/moira_0.1.0_all.deb
+sudo apt install ./dist/moira_0.1.1_all.deb
 ```
 
-The package depends on Python 3, PyGObject, GTK4, Libadwaita, and libsecret GI. Run `moira` or launch **Moira** from the application menu. Install the same `.deb` on the second PC; authenticate each provider CLI separately on that machine.
+The package depends on Python 3, PyGObject, GTK4, Libadwaita, and libsecret GI. Run `moira` or launch **Moira** from the application menu. Install the same `.deb` on another PC and authenticate each provider CLI separately there.
+
+In Notifications, select **Set up Claude integration**. Moira first validates `~/.claude/settings.json`. If a command status line already exists, Moira stores its complete status-line object and substitutes `/usr/bin/moira-claude-statusline`; the wrapper passes the original JSON input to the old command and preserves its output and exit status. Setup writes atomically and creates `settings.json.moira-backup`. **Remove Claude integration** restores only the saved status-line field, preserving unrelated settings changed since setup. Removal refuses to act if another program changed the status line in the meantime.
+
+Complete one minimal Claude response after setup if no recent status-line event exists. Until both structured limits arrive, Moira shows waiting/unavailable (or retains an older successful reading as stale), never 0%.
 
 Uninstall without deleting per-user settings:
 
@@ -29,20 +33,24 @@ sudo apt remove moira
 
 Optional user data can be removed manually from `~/.config/moira` and `~/.local/state/moira`. The NTFY token is a GNOME Keyring item named “Moira NTFY token” and is not in those directories.
 
-## Notifications and configuration
+## Notifications, privacy, and desktop integration
 
-The Notifications view configures an HTTP(S) NTFY server, one topic segment, enabled state, comma-separated thresholds, reset alerts, error alerts, and login autostart. “Send test notification” is the only explicit live delivery test. A non-empty token field updates GNOME Keyring; leaving it blank preserves the existing token.
+The Notifications view configures an HTTP(S) NTFY server, one topic segment, enabled state, comma-separated thresholds, reset alerts, error alerts, and login autostart. **Send test notification** performs the explicit live delivery test. A non-empty token field updates GNOME Keyring; leaving it blank preserves the existing token.
 
 Configuration is versioned JSON at `$XDG_CONFIG_HOME/moira/config.json` (normally `~/.config/moira/config.json`). Last readings and alert deduplication keys are at `$XDG_STATE_HOME/moira/state.json`. Both are written with mode `0600`. Enabling autostart creates `$XDG_CONFIG_HOME/autostart/io.github.moira.QuotaMonitor.desktop` at runtime.
 
+Claude's separate `$XDG_STATE_HOME/moira/claude-rate-limits.json` cache contains only `five_hour` and `seven_day` objects. Each has `service`, `percentage`, `reset_epoch`, and `retrieved_at`; status-line input, prompts, transcript paths, workspaces, model names, account data, and secrets are never written by Moira. Chained third-party status-line commands still receive the original input and retain responsibility for their own privacy behavior.
+
 Threshold notifications require a crossing from below to at-or-above a threshold in the same quota window. Reset and parse/error notifications are deduplicated. Delivery failures are not marked sent and may retry after the next qualifying refresh.
+
+**Create desktop shortcut** and **Remove desktop shortcut** resolve `XDG_DESKTOP_DIR` through `xdg-user-dir`, copy the packaged launcher, mark it executable, and request GNOME's trusted metadata when `gio` supports it. Both operations are idempotent. If the session has no distinct XDG desktop directory, desktop files are unsupported and Moira explains that instead of guessing an English or localized folder name.
 
 ## Development
 
 ```sh
 python3 -m venv --system-site-packages .venv
 .venv/bin/pip install -e . pytest ruff mypy build
-.venv/bin/pytest
+.venv/bin/python -m pytest
 .venv/bin/ruff format --check .
 .venv/bin/ruff check .
 .venv/bin/mypy
@@ -57,12 +65,12 @@ Tests use sanitized fixtures and mocks. They do not require provider accounts, n
 ## Troubleshooting
 
 - **Unavailable / CLI not found:** install the official provider CLI and ensure `claude` or `codex` is on the desktop session's `PATH`.
-- **Parse error:** update the provider CLI and Moira. The CLI output/protocol may have changed; Moira keeps old successful values stale rather than inventing usage.
-- **No Claude values:** open Claude Code normally, sign in, and verify `/usage` works for the current account. Some account types may not expose these windows.
-- **No Codex weekly value:** run `codex doctor`, confirm login, and update Codex. Moira requires a rate-limit window with a declared duration of at least seven days.
+- **No Claude values:** set up the integration, use Claude Code normally, and complete a response. Some account types may not expose both windows.
+- **Claude integration conflict:** Moira chains only a valid command-type status line. Inspect the non-secret `statusLine` field and decide which integration should own it; Moira does not overwrite an unknown change.
+- **No Codex weekly value:** confirm login and update Codex. Moira requires a rate-limit window declared as exactly seven days.
 - **Keyring error:** ensure GNOME Keyring/libsecret is installed and unlocked. Moira never falls back to a plaintext token.
-- **NTFY test fails:** verify the server URL, topic, network, server certificate, and token permissions. The UI displays the exact local exception but never the token.
+- **NTFY test fails:** verify the server URL, topic, network, certificate, and token permissions. The token is never included in errors.
+- **Desktop shortcut unavailable:** confirm `xdg-user-dir DESKTOP` points to a separate existing directory. Use the application menu if the shell hides desktop files.
 - **Stale countdown reaches zero:** refresh again after connectivity/authentication is restored. Stale timestamps remain the last provider-reported values.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for module boundaries and source rationale.
-
+See [ARCHITECTURE.md](ARCHITECTURE.md) for module boundaries and [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for recovery and live checks.
