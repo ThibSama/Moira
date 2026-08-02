@@ -28,7 +28,7 @@ def build_request(
         "Title": notification.title,
         "Tags": notification.tags,
         "Priority": str(notification.priority),
-        "User-Agent": "Moira/0.2.0",
+        "User-Agent": "Moira/0.2.1",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"

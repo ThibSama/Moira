@@ -36,7 +36,7 @@ _FRENCH: dict[str, str] = {
     "Topic": "Sujet",
     "Optional access token": "Jeton d'accès facultatif",
     "Leave blank to keep current keyring token": (  # noqa: E501
-        "Laisser vide pour conserver le jetre du trousseau"
+        "Laisser vide pour conserver le jeton du trousseau"
     ),
     "Thresholds (%)": "Seuils (%)",
     "Alert when a quota resets": "Alerter lors d'une réinitialisation de quota",

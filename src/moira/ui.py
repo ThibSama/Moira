@@ -392,14 +392,14 @@ class MainWindow(Adw.ApplicationWindow):
     def _finish_refresh(self) -> bool:
         previous = self.state.readings
         merged = merge_with_stale(previous, self.pending)
+        now = datetime.now(UTC)
         if self.settings.ntfy_enabled:
             alerts = evaluate_alerts(
-                previous, self.pending, self.settings, set(self.state.alert_keys)
+                previous, self.pending, self.settings, set(self.state.alert_keys), now=now
             )
             for alert in alerts:
                 self.executor.submit(self._deliver_alert, alert.key, alert.notification)
         self.state.readings = merged
-        now = datetime.now(UTC)
         self.state.last_refresh = now.strftime("%H:%M:%S")
         self._next_refresh_time = time.monotonic() + self.settings.refresh_minutes * 60
         self.state.next_refresh = self._compute_next_refresh_str()
@@ -578,7 +578,7 @@ class MainWindow(Adw.ApplicationWindow):
         dialog = Adw.AboutDialog(
             application_name=_("Moira"),
             application_icon="io.github.moira.QuotaMonitor",
-            version="0.2.0",
+            version="0.2.1",
             developer_name="Moira contributors",
             license_type=Gtk.License.MIT_X11,
             comments=_("Claude and Codex quota monitor for Ubuntu"),

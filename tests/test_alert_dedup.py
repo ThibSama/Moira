@@ -173,3 +173,178 @@ def test_reset_suppressed_during_exhaustion_recovery() -> None:
     )
     resets = [a for a in alerts if a.key.startswith("reset:")]
     assert len(resets) == 0
+
+
+# ── 0.2.1 regression: expired 100% reading produces no exhaustion ──
+
+
+def test_expired_100_pct_produces_no_exhaustion_alert() -> None:
+    """An AVAILABLE weekly reading at 100% whose reset_at has passed must not
+    produce an exhaustion alert."""
+    past_reset = NOW - timedelta(hours=1)
+    settings = Settings(thresholds=[])
+    alerts = evaluate_alerts(
+        [],
+        [reading(pct=100, reset=past_reset)],
+        settings,
+        set(),
+        now=NOW,
+    )
+    exh = [a for a in alerts if a.key.startswith("exhausted:")]
+    assert len(exh) == 0
+
+
+def test_expired_100_pct_produces_no_recovery_alert() -> None:
+    """An expired 100% reading must not produce a recovery alert either."""
+    past_reset = NOW - timedelta(hours=1)
+    settings = Settings(thresholds=[])
+    alerts = evaluate_alerts(
+        [reading(pct=100, reset=past_reset)],
+        [reading(pct=100, reset=past_reset)],
+        settings,
+        set(),
+        now=NOW,
+    )
+    rec = [a for a in alerts if a.key.startswith("recovered:")]
+    assert len(rec) == 0
+
+
+# ── 0.2.1 regression: UI and alerts use equivalent exhaustion semantics ──
+
+
+def test_ui_and_alerts_equivalent_for_exhausted_reading() -> None:
+    """is_weekly_exhausted (UI) and evaluate_alerts agree on a current exhausted reading."""
+    from moira.exhaustion import is_weekly_exhausted
+
+    settings = Settings(thresholds=[])
+    r = reading(pct=100, reset=RESET)
+    alerts = evaluate_alerts([], [r], settings, set(), now=NOW)
+    exh_alerts = [a for a in alerts if a.key.startswith("exhausted:")]
+    # The UI rule and the alert rule must agree
+    assert is_weekly_exhausted(r, now=NOW) is True
+    assert len(exh_alerts) == 1
+
+
+def test_ui_and_alerts_equivalent_for_expired_reading() -> None:
+    """Both UI and alerts agree that an expired 100% reading is not exhausted."""
+    from moira.exhaustion import is_weekly_exhausted
+
+    past_reset = NOW - timedelta(hours=1)
+    r = reading(pct=100, reset=past_reset)
+    settings = Settings(thresholds=[])
+    alerts = evaluate_alerts([], [r], settings, set(), now=NOW)
+    exh_alerts = [a for a in alerts if a.key.startswith("exhausted:")]
+    assert is_weekly_exhausted(r, now=NOW) is False
+    assert len(exh_alerts) == 0
+
+
+# ── 0.2.1 regression: threshold 100 suppressed, lower thresholds fire ──
+
+
+def test_threshold_100_suppressed_while_90_fires() -> None:
+    """When exhaustion fires at 100%, the generic 100% threshold is suppressed
+    but a crossed lower threshold (e.g. 90) governed normally.
+
+    Since reading goes from 80→100 and exhaustion fires, the 100% threshold
+    would fire. The 100% threshold should NOT appear. The 90% threshold should
+    appear if crossed.
+    """
+    settings = Settings(thresholds=[90, 100])
+    alerts = evaluate_alerts(
+        [reading(pct=80)],
+        [reading(pct=100)],
+        settings,
+        set(),
+        now=NOW,
+    )
+    exh = [a for a in alerts if a.key.startswith("exhausted:")]
+    assert len(exh) == 1
+
+    threshold_alerts = [a for a in alerts if a.key.startswith("threshold:")]
+    # Only the 90% threshold should fire (crossed from 80→100), NOT the 100% one.
+    threshold_values = {a.key.rsplit(":", 1)[-1] for a in threshold_alerts}
+    assert "90" in threshold_values
+    assert "100" not in threshold_values
+
+
+def test_lower_thresholds_fire_normally_at_non_100_crossing() -> None:
+    """Lower threshold crossings not involving 100% are governed normally."""
+    settings = Settings(thresholds=[50, 75, 90, 100])
+    alerts = evaluate_alerts(
+        [reading(pct=49)],
+        [reading(pct=95)],
+        settings,
+        set(),
+        now=NOW,
+    )
+    threshold_alerts = [a for a in alerts if a.key.startswith("threshold:")]
+    threshold_values = {a.key.rsplit(":", 1)[-1] for a in threshold_alerts}
+    assert threshold_values == {"50", "75", "90"}
+    assert "100" not in threshold_values
+
+
+# ── 0.2.1 regression: recovery after new window or sub-100 fresh reading ──
+
+
+def test_recovery_after_new_window_deduplicated() -> None:
+    """Recovery when a new weekly window appears remains deduplicated."""
+    settings = Settings(thresholds=[])
+    sent: set[str] = set()
+    first = evaluate_alerts(
+        [reading(pct=100, reset=RESET)],
+        [reading(pct=50, reset=NEW_RESET)],
+        settings,
+        sent,
+        now=NOW,
+    )
+    sent.update(a.key for a in first)
+    assert len(first) == 1
+    second = evaluate_alerts(
+        [reading(pct=100, reset=RESET)],
+        [reading(pct=50, reset=NEW_RESET)],
+        settings,
+        sent,
+        now=NOW,
+    )
+    assert len(second) == 0
+
+
+def test_recovery_after_sub_100_fresh_reading_deduplicated() -> None:
+    """Recovery when the reading drops below 100% in the same reset window
+    remains deduplicated (per-reading identity)."""
+    settings = Settings(thresholds=[])
+    sent: set[str] = set()
+    first = evaluate_alerts(
+        [reading(pct=100)],
+        [reading(pct=50)],
+        settings,
+        sent,
+        now=NOW,
+    )
+    sent.update(a.key for a in first)
+    assert len(first) == 1
+    second = evaluate_alerts(
+        [reading(pct=100)],
+        [reading(pct=50)],
+        settings,
+        sent,
+        now=NOW,
+    )
+    assert len(second) == 0
+
+
+# ── 0.2.1 regression: five-hour 100% does not trigger exhaustion ──
+
+
+def test_five_hour_100_pct_does_not_fire_exhaustion() -> None:
+    """A five-hour reading at 100% must not produce a weekly exhaustion alert."""
+    settings = Settings(thresholds=[])
+    alerts = evaluate_alerts(
+        [],
+        [reading(label="Five-hour", pct=100)],
+        settings,
+        set(),
+        now=NOW,
+    )
+    exh = [a for a in alerts if a.key.startswith("exhausted:")]
+    assert len(exh) == 0

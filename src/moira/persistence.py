@@ -49,21 +49,17 @@ class Settings:
 def _migrate_v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
     """Additively migrate a v1 config dict to v2.
 
-    Preserves all user settings. The old default of 10 minutes is mapped to the
-    new default of 2 minutes if the user never changed it (i.e. the config still
-    has the old default of 10). Valid existing custom values in the new allowed
-    set are preserved as-is.
+    Preserves all user settings. Every refresh_minutes value in the v2 allowed
+    set — including 10 — is preserved exactly. The new default of 2 minutes is
+    applied only when refresh_minutes is absent or holds an invalid value.
     """
     migrated = dict(data)
     old = migrated.get("refresh_minutes")
-    if old is None or old == 10:
-        # Old default → new default
-        migrated["refresh_minutes"] = DEFAULT_REFRESH_MINUTES
-    elif old in VALID_REFRESH_MINUTES:
-        # Custom but valid → preserve
+    if old is not None and old in VALID_REFRESH_MINUTES:
+        # Valid existing value → preserve as-is
         pass
     else:
-        # Invalid for v2 → fall back to new default
+        # Absent or invalid → new default
         migrated["refresh_minutes"] = DEFAULT_REFRESH_MINUTES
     migrated["version"] = CONFIG_VERSION
     return migrated

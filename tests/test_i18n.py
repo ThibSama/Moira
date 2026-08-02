@@ -99,3 +99,11 @@ def test_exhaustion_strings_translated() -> None:
             "Weekly quota exhausted — usage blocked until reset"
         )
         assert tr("Unavailable until weekly reset") != "Unavailable until weekly reset"
+
+
+def test_french_token_placeholder_correct() -> None:
+    """The French translation must use 'jeton', not the typo 'jetre'."""
+    with _set_locale("fr_FR.UTF-8"):
+        translated = tr("Leave blank to keep current keyring token")
+        assert "jetre" not in translated
+        assert "jeton" in translated

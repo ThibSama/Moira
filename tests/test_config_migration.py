@@ -27,11 +27,12 @@ def test_valid_refresh_choices() -> None:
     assert VALID_REFRESH_MINUTES == (1, 2, 5, 10, 15, 30)
 
 
-def test_v1_default_10_mins_migrates_to_2() -> None:
+def test_v1_10_mins_preserved() -> None:
+    """Every valid value including 10 must be preserved exactly."""
     v1 = {"version": 1, "refresh_minutes": 10}
     v2 = _migrate_v1_to_v2(v1)
     assert v2["version"] == 2
-    assert v2["refresh_minutes"] == 2
+    assert v2["refresh_minutes"] == 10
 
 
 def test_v1_custom_5_mins_preserved() -> None:
@@ -40,9 +41,30 @@ def test_v1_custom_5_mins_preserved() -> None:
     assert v2["refresh_minutes"] == 5
 
 
-def test_v1_invalid_value_migrates_to_default() -> None:
-    v1 = {"version": 1, "refresh_minutes": 7}
-    v2 = _migrate_v1_to_v2(v1)
+def test_all_valid_v1_refresh_values_preserved() -> None:
+    """Every value in VALID_REFRESH_MINUTES, including 10, survives migration."""
+    for val in VALID_REFRESH_MINUTES:
+        v2 = _migrate_v1_to_v2({"version": 1, "refresh_minutes": val})
+        assert v2["refresh_minutes"] == val, f"{val} was not preserved"
+
+
+def test_v1_missing_refresh_minutes_becomes_default() -> None:
+    v2 = _migrate_v1_to_v2({"version": 1})
+    assert v2["refresh_minutes"] == DEFAULT_REFRESH_MINUTES
+
+
+def test_v1_invalid_refresh_minutes_becomes_default() -> None:
+    v2 = _migrate_v1_to_v2({"version": 1, "refresh_minutes": 7})
+    assert v2["refresh_minutes"] == DEFAULT_REFRESH_MINUTES
+
+
+def test_v1_zero_refresh_minutes_becomes_default() -> None:
+    v2 = _migrate_v1_to_v2({"version": 1, "refresh_minutes": 0})
+    assert v2["refresh_minutes"] == DEFAULT_REFRESH_MINUTES
+
+
+def test_v1_negative_refresh_minutes_becomes_default() -> None:
+    v2 = _migrate_v1_to_v2({"version": 1, "refresh_minutes": -1})
     assert v2["refresh_minutes"] == DEFAULT_REFRESH_MINUTES
 
 
@@ -95,7 +117,7 @@ def test_load_settings_migrates_v1(tmp_path: Path) -> None:
     with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
         settings = load_settings()
     assert settings.version == 2
-    assert settings.refresh_minutes == 2
+    assert settings.refresh_minutes == 10
     assert settings.ntfy_topic == "test"
     assert settings.ntfy_enabled is True
 

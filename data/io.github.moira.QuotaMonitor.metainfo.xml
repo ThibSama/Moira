@@ -13,6 +13,11 @@
   <launchable type="desktop-id">io.github.moira.QuotaMonitor.desktop</launchable>
   <provides><binary>moira</binary></provides>
   <releases>
+    <release version="0.2.1" date="2026-08-02">
+      <description>
+        <p>Preserves all valid refresh intervals during v1-to-v2 migration, unifies exhaustion semantics between UI and notifications with reset-aware canonical rule, suppresses only the duplicate generic 100% threshold alert, and corrects a French localization typo.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-08-02">
       <description>
         <p>Weekly exhaustion semantics, French localization with English fallback, visible configurable refresh interval, focus-regain refresh, 30-second countdown recompute, and deduplicated exhaustion/recovery NTFY events.</p>

@@ -23,7 +23,7 @@ Moira detects the locale from the environment (LANG/LC_ALL/LC_MESSAGES) and disp
 
 ## Refresh
 
-Moira refreshes at startup, on focus regain (with a monotonic debounce and overlap guard), and at a configurable interval. Refresh choices are 1, 2, 5, 10, 15, or 30 minutes. New configurations default to 2 minutes. Saving a new interval immediately replaces the GLib provider timer without a restart or duplicates. The last and next refresh times are displayed.
+Moira refreshes at startup, on focus regain (with a monotonic debounce and overlap guard), and at a configurable interval. Refresh choices are 1, 2, 5, 10, 15, or 30 minutes. New configurations default to 2 minutes. The v1-to-v2 migration preserves every valid refresh value including 10; the 2-minute default is used only when the value is absent or invalid. Saving a new interval immediately replaces the GLib provider timer without a restart or duplicates. The last and next refresh times are displayed.
 
 Countdowns and next-refresh times are recomputed locally every 30 seconds without collectors. Claude data changes only after a Claude Code response; cache rereads are not fresh provider events.
 
@@ -33,7 +33,7 @@ Build and install the Debian package:
 
 ```sh
 ./scripts/build-deb.sh
-sudo apt install ./dist/moira_0.2.0_all.deb
+sudo apt install ./dist/moira_0.2.1_all.deb
 ```
 
 The package depends on Python 3, PyGObject, GTK4, Libadwaita, and libsecret GI. Run `moira` or launch **Moira** from the application menu. Install the same `.deb` on another PC and authenticate each provider CLI separately there.
@@ -54,7 +54,7 @@ Optional user data can be removed manually from `~/.config/moira` and `~/.local/
 
 The Notifications view configures an HTTP(S) NTFY server, one topic segment, enabled state, comma-separated thresholds, reset alerts, error alerts, refresh interval, and login autostart. **Send test notification** performs the explicit live delivery test. A non-empty token field updates GNOME Keyring; leaving it blank preserves the existing token.
 
-Exhaustion and recovery NTFY events are deduplicated once per service/window and are independent from threshold alerts. A duplicate generic 100% threshold alert is suppressed when an exhaustion event fires. Threshold notifications require a crossing from below to at-or-above a threshold in the same quota window. Reset and parse/error notifications are deduplicated. Delivery failures are not marked sent and may retry after the next qualifying refresh.
+Exhaustion and recovery NTFY events are deduplicated once per service/window and are independent from threshold alerts. Only the generic 100% threshold alert is suppressed when an exhaustion event fires; lower-threshold crossings are governed normally. Threshold notifications require a crossing from below to at-or-above a threshold in the same quota window. Reset and parse/error notifications are deduplicated. Delivery failures are not marked sent and may retry after the next qualifying refresh.
 
 Configuration is versioned JSON at `$XDG_CONFIG_HOME/moira/config.json` (normally `~/.config/moira/config.json`). Last readings and alert deduplication keys are at `$XDG_STATE_HOME/moira/state.json`. Both are written with mode `0600`. Enabling autostart creates `$XDG_CONFIG_HOME/autostart/io.github.moira.QuotaMonitor.desktop` at runtime.
 
@@ -89,6 +89,6 @@ Tests use sanitized fixtures and mocks. They do not require provider accounts, n
 - **NTFY test fails:** verify the server URL, topic, network, certificate, and token permissions. The token is never included in errors.
 - **Desktop shortcut unavailable:** confirm `xdg-user-dir DESKTOP` points to a separate existing directory. Use the application menu if the shell hides desktop files.
 - **Stale countdown reaches zero:** refresh again after connectivity/authentication is restored. Stale timestamps remain the last provider-reported values.
-- **Weekly exhaustion:** when a weekly reading reaches 100%, Moira blocks usage display and shows the weekly reset countdown. Exhaustion is cleared only by a new AVAILABLE reading below 100% or a new reset window.
+- **Weekly exhaustion:** when a weekly reading reaches 100%, Moira blocks usage display and shows the weekly reset countdown. Exhaustion is cleared only by a new AVAILABLE reading below 100% or a new reset window. An expired 100% reading from a past window does not establish exhaustion.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for module boundaries and [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for recovery and live checks.

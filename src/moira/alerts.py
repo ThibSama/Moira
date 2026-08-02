@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 
+from .exhaustion import is_weekly_exhausted
 from .i18n import tr
 from .models import QuotaReading, QuotaStatus, Service
 from .ntfy import Notification
@@ -23,14 +25,17 @@ def _service_name(service: Service) -> str:
     return service.value.title()
 
 
-def _is_weekly_exhausted(reading: QuotaReading) -> bool:
-    """Check if a reading represents an exhausted weekly window at >=100%."""
-    return (
-        reading.status is QuotaStatus.AVAILABLE
-        and reading.percentage is not None
-        and reading.percentage >= 100
-        and ("week" in reading.quota_label.lower() or "seven" in reading.quota_label.lower())
-    )
+def _is_weekly(reading: QuotaReading) -> bool:
+    """Return True if the reading's quota label indicates a weekly window."""
+    label = reading.quota_label.lower()
+    return "week" in label or "seven" in label or "7" in label
+
+
+def _is_weekly_exhausted(reading: QuotaReading | None, *, now: datetime | None) -> bool:
+    """Canonical reset-aware exhaustion rule, scoped to weekly readings only."""
+    if reading is None or not _is_weekly(reading):
+        return False
+    return is_weekly_exhausted(reading, now=now)
 
 
 def evaluate_alerts(
@@ -38,6 +43,8 @@ def evaluate_alerts(
     current: list[QuotaReading],
     settings: Settings,
     sent_keys: set[str],
+    *,
+    now: datetime | None = None,
 ) -> list[PendingAlert]:
     old = {_identity(item): item for item in previous}
     alerts: list[PendingAlert] = []
@@ -50,8 +57,10 @@ def evaluate_alerts(
             and reading.reset_at
         ):
             reset_key = reading.reset_at.isoformat()
+            exhausted = _is_weekly_exhausted(reading, now=now)
+            prior_exhausted = _is_weekly_exhausted(prior, now=now)
             # Exhaustion/recovery events: dedup per service/window, independent from thresholds
-            if _is_weekly_exhausted(reading):
+            if exhausted:
                 exh_key = f"exhausted:{identity}:{reset_key}"
                 if exh_key not in sent_keys:
                     alerts.append(
@@ -68,9 +77,9 @@ def evaluate_alerts(
                             ),
                         )
                     )
-                # Suppress the duplicate generic 100% threshold alert
-                continue
-            elif prior and _is_weekly_exhausted(prior) and not _is_weekly_exhausted(reading):
+                # Fall through to threshold checks: lower thresholds still fire,
+                # only the generic 100% threshold is suppressed below.
+            elif prior_exhausted and not exhausted:
                 # Recovery: previously exhausted, now below 100% or reset
                 rec_key = f"recovered:{identity}:{reset_key}"
                 if rec_key not in sent_keys:
@@ -92,7 +101,7 @@ def evaluate_alerts(
                 and prior
                 and prior.reset_at
                 and prior.reset_at != reading.reset_at
-                and not _is_weekly_exhausted(prior)
+                and not prior_exhausted
             ):
                 key = f"reset:{identity}:{reset_key}"
                 if key not in sent_keys:
@@ -106,9 +115,13 @@ def evaluate_alerts(
                             ),
                         )
                     )
-            # ── Threshold alerts (suppressed at 100% to avoid duplicate with exhaustion) ──
-            if prior and prior.percentage is not None and reading.percentage < 100:
+            # ── Threshold alerts (the generic 100% threshold is suppressed
+            #    when an exhaustion event fires for this reading) ──
+            if prior and prior.percentage is not None:
                 for threshold in settings.thresholds:
+                    # Suppress the generic 100% threshold when exhaustion fires
+                    if exhausted and threshold == 100:
+                        continue
                     key = f"threshold:{identity}:{reset_key}:{threshold}"
                     if prior.percentage < threshold <= reading.percentage and key not in sent_keys:
                         alerts.append(
