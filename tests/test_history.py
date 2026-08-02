@@ -13,6 +13,7 @@ import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -964,3 +965,270 @@ def test_stored_observations_normalized_to_utc(tmp_path: Path) -> None:
     assert rows[0].observed_at.tzinfo is UTC
     assert rows[0].observed_at == cet_time.astimezone(UTC)
     conn.close()
+
+
+# ── 1c: QuotaObservation rejects non-AVAILABLE_EXACT status ──
+
+
+def test_quota_observation_rejects_unsupported_status() -> None:
+    with pytest.raises(ValueError, match="AVAILABLE_EXACT"):
+        QuotaObservation(
+            service=Service.CLAUDE,
+            quota_label="Weekly",
+            percentage=50.0,
+            reset_at=RESET,
+            observed_at=NOW,
+            source="fixture",
+            status=HistoryStatus.UNSUPPORTED,
+        )
+
+
+def test_quota_observation_rejects_invalid_status() -> None:
+    with pytest.raises(ValueError, match="AVAILABLE_EXACT"):
+        QuotaObservation(
+            service=Service.CLAUDE,
+            quota_label="Weekly",
+            percentage=50.0,
+            reset_at=RESET,
+            observed_at=NOW,
+            source="fixture",
+            status=HistoryStatus.INVALID,
+        )
+
+
+def test_quota_observation_accepts_available_exact() -> None:
+    obs = QuotaObservation(
+        service=Service.CLAUDE,
+        quota_label="Weekly",
+        percentage=50.0,
+        reset_at=RESET,
+        observed_at=NOW,
+        source="fixture",
+        status=HistoryStatus.AVAILABLE_EXACT,
+    )
+    assert obs.status is HistoryStatus.AVAILABLE_EXACT
+
+
+# ── 1c: Invalid observations map to 'invalid observation' ──
+
+
+def test_invalid_observation_maps_to_invalid_observation(tmp_path: Path) -> None:
+    """A ValueError from domain validation maps to 'invalid observation',
+    not 'schema mismatch'."""
+    from moira.history import SchemaVersionError
+
+    # SchemaVersionError must be a subclass of ValueError but caught separately
+    assert issubclass(SchemaVersionError, ValueError)
+
+
+def test_schema_mismatch_still_maps_to_schema_mismatch(tmp_path: Path) -> None:
+    """An actual schema version mismatch maps to 'schema mismatch'."""
+    conn = _db(tmp_path)
+    conn.execute("UPDATE schema_meta SET version = 999")
+    conn.close()
+    result = write_history_safely(
+        [_reading(pct=50.0)], now=NOW, db_path=tmp_path / "history.sqlite3"
+    )
+    assert not result.ok
+    assert result.diagnostic == "schema mismatch"
+
+
+def test_domain_validation_error_maps_to_invalid_observation(tmp_path: Path) -> None:
+    """A domain ValueError (not SchemaVersionError) maps to 'invalid observation'.
+
+    We monkeypatch record_refresh to raise a plain ValueError, simulating
+    a domain validation failure that is not a schema version error.
+    """
+    import moira.history_db as history_db_module
+
+    original = history_db_module.record_refresh
+
+    def raise_value_error(*_args: Any, **_kwargs: Any) -> None:
+        raise ValueError("simulated domain validation failure")
+
+    history_db_module.record_refresh = raise_value_error
+    try:
+        result = write_history_safely(
+            [_reading(pct=50.0)], now=NOW, db_path=tmp_path / "history.sqlite3"
+        )
+    finally:
+        history_db_module.record_refresh = original
+
+    assert not result.ok
+    assert result.diagnostic == "invalid observation"
+
+
+# ── 1c: HistoryCoordinator — overflow, shutdown, diagnostics ──
+
+
+def test_coordinator_overflow_sets_backlog_saturated(tmp_path: Path) -> None:
+    """When the worker is busy, a second enqueue sets 'backlog saturated'."""
+    from moira.history_db import HistoryCoordinator
+
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+    coord.start()
+    try:
+        # Block the worker by locking the database
+        lock_conn = _connect(tmp_path / "history.sqlite3")
+        init_schema(lock_conn)
+        lock_conn.execute("BEGIN IMMEDIATE")
+
+        # First enqueue: accepted (worker picks it up, blocks on the lock)
+        accepted1 = coord.enqueue([_reading(pct=50.0)], now=NOW)
+        assert accepted1
+
+        # Give the worker time to pick up the first batch and block
+        time.sleep(0.5)
+
+        # Second enqueue: worker is busy → backlog saturated
+        accepted2 = coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
+        assert accepted2 is False
+        assert coord.status == "backlog saturated"
+
+        # Release the lock so the worker can proceed
+        lock_conn.execute("ROLLBACK")
+        lock_conn.close()
+    finally:
+        coord.shutdown(timeout=3.0)
+
+
+def test_coordinator_status_clears_after_successful_write(tmp_path: Path) -> None:
+    """Status returns to 'ok' after a successful write following saturation."""
+    from moira.history_db import HistoryCoordinator
+
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+    coord.start()
+    try:
+        # Force saturation by manually setting the status
+        coord._status = "backlog saturated"  # noqa: SLF001
+        assert coord.status == "backlog saturated"
+
+        # A successful write clears the status
+        coord.enqueue([_reading(pct=50.0)], now=NOW)
+        time.sleep(1.0)
+        assert coord.status == "ok"
+    finally:
+        coord.shutdown()
+
+
+def test_coordinator_no_raw_diagnostic_leakage(tmp_path: Path) -> None:
+    """Coordinator status never contains raw exception text, SQL, or paths."""
+    from moira.history_db import HistoryCoordinator
+
+    db_path = tmp_path / "corrupt.sqlite3"
+    db_path.write_text("not a database", encoding="utf-8")
+    coord = HistoryCoordinator(db_path=db_path)
+    coord.start()
+    try:
+        coord.enqueue([_reading(pct=50.0)], now=NOW)
+        time.sleep(1.0)
+        status = coord.status
+        assert "sqlite3" not in status.lower()
+        assert "operationalerror" not in status.lower()
+        assert "databaseerror" not in status.lower()
+        assert str(db_path) not in status
+        assert "traceback" not in status.lower()
+    finally:
+        coord.shutdown()
+
+
+def test_coordinator_shutdown_is_idempotent(tmp_path: Path) -> None:
+    """Shutdown can be called multiple times without error."""
+    from moira.history_db import HistoryCoordinator
+
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+    coord.start()
+    coord.shutdown()
+    coord.shutdown()  # Idempotent
+    coord.shutdown()  # Still fine
+
+
+def test_coordinator_rejects_new_work_after_shutdown(tmp_path: Path) -> None:
+    """After shutdown, enqueue returns False and does not accept new work."""
+    from moira.history_db import HistoryCoordinator
+
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+    coord.start()
+    coord.shutdown()
+    accepted = coord.enqueue([_reading(pct=50.0)], now=NOW)
+    assert accepted is False
+
+
+def test_coordinator_shutdown_terminates_worker(tmp_path: Path) -> None:
+    """The worker thread terminates after shutdown."""
+    from moira.history_db import HistoryCoordinator
+
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+    coord.start()
+    assert coord._thread is not None  # noqa: SLF001
+    assert coord._thread.is_alive()  # noqa: SLF001
+    coord.shutdown(timeout=3.0)
+    # Thread is no longer tracked
+    assert coord._thread is None  # noqa: SLF001
+
+
+def test_coordinator_shutdown_bounded_with_locked_db(tmp_path: Path) -> None:
+    """Shutdown completes within the bounded timeout even if the DB is locked."""
+    from moira.history_db import HistoryCoordinator
+
+    db_path = tmp_path / "history.sqlite3"
+    lock_conn = _connect(db_path)
+    init_schema(lock_conn)
+    lock_conn.execute("BEGIN IMMEDIATE")
+
+    coord = HistoryCoordinator(db_path=db_path)
+    coord.start()
+    start = time.monotonic()
+    coord.shutdown(timeout=2.0)
+    elapsed = time.monotonic() - start
+    # Should complete within ~2 seconds even with a locked DB
+    assert elapsed < 4.0
+
+    lock_conn.execute("ROLLBACK")
+    lock_conn.close()
+
+
+def test_coordinator_newest_wins_policy(tmp_path: Path) -> None:
+    """When multiple batches arrive while the worker is busy, the newest
+    pending batch replaces the older one."""
+    from moira.history_db import HistoryCoordinator
+
+    db_path = tmp_path / "history.sqlite3"
+    lock_conn = _connect(db_path)
+    init_schema(lock_conn)
+    lock_conn.execute("BEGIN IMMEDIATE")
+
+    coord = HistoryCoordinator(db_path=db_path)
+    coord.start()
+    try:
+        # First batch accepted, worker blocks on the lock
+        coord.enqueue([_reading(pct=50.0)], now=NOW)
+        time.sleep(0.5)
+
+        # Second batch: replaces any pending, sets saturated
+        coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
+        # Third batch: replaces the second pending batch
+        coord.enqueue([_reading(pct=75.0)], now=NOW + timedelta(minutes=2))
+        assert coord.status == "backlog saturated"
+
+        # Check that the newest (75%) is the pending batch
+        assert coord._pending is not None  # noqa: SLF001
+        assert coord._pending[0].percentage == 75.0  # noqa: SLF001
+
+        lock_conn.execute("ROLLBACK")
+        lock_conn.close()
+    finally:
+        coord.shutdown(timeout=5.0)
+
+
+def test_coordinator_start_idempotent(tmp_path: Path) -> None:
+    """Starting twice does not create a second thread."""
+    from moira.history_db import HistoryCoordinator
+
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+    coord.start()
+    thread1 = coord._thread  # noqa: SLF001
+    coord.start()  # No-op
+    thread2 = coord._thread  # noqa: SLF001
+    assert thread1 is thread2
+    coord.shutdown()

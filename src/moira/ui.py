@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import queue
 import threading
 import time
 from datetime import UTC, datetime
@@ -20,6 +19,7 @@ from .claude_integration import setup as setup_claude_integration
 from .collectors import ClaudeCollector, CodexCollector
 from .desktop import create_shortcut, remove_shortcut
 from .exhaustion import derive_state
+from .history_db import HistoryCoordinator
 from .i18n import is_french, tr
 from .models import QuotaReading, QuotaStatus, Service
 from .ntfy import Notification, send
@@ -221,15 +221,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._last_focus_time: float = 0.0
         self._focus_debounce_seconds = 2.0
         self._next_refresh_time: float = 0.0
-        self._history_queue: queue.Queue[tuple[list[QuotaReading], datetime] | None] = queue.Queue(
-            maxsize=1
-        )
-        self._history_status = "ok"
-        self._history_worker_stop = threading.Event()
-        self._history_thread = threading.Thread(
-            target=self._history_worker, name="moira-history", daemon=True
-        )
-        self._history_thread.start()
+        self._history_coordinator = HistoryCoordinator()
+        self._history_coordinator.start()
         self._build()
         self._render()
         if not smoke_test:
@@ -239,6 +232,8 @@ class MainWindow(Adw.ApplicationWindow):
             GLib.timeout_add_seconds(30, self._local_recompute)
             # Focus regain handler
             self.connect("notify::is-active", self._on_focus_change)
+        # Shutdown handler: stop the history worker cleanly on window close
+        self.connect("close-request", self._on_close_request)
 
     def _build(self) -> None:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -422,35 +417,21 @@ class MainWindow(Adw.ApplicationWindow):
     def _record_history(self, readings: list[QuotaReading], now: datetime) -> None:
         """Enqueue fresh quota observations for off-thread history writing.
 
-        Never blocks the GTK thread. If the previous write is still in
-        progress (queue full), the new batch is silently dropped — the next
-        refresh will enqueue again. History failure does not affect quota
-        state, display, or alerts.
+        Never blocks the GTK thread. If the worker is busy, the newest batch
+        replaces any pending batch (newest-wins) and a sanitized status is set.
+        History failure does not affect quota state, display, or alerts.
         """
-        snapshot = list(readings)
-        try:
-            self._history_queue.put_nowait((snapshot, now))
-        except queue.Full:
-            pass
+        self._history_coordinator.enqueue(readings, now)
 
-    def _history_worker(self) -> None:
-        """Daemon thread that drains the history write queue.
+    def _on_close_request(self, *_: Any) -> bool:
+        """Stop the history worker cleanly on window close.
 
-        Performs connect/schema/write/purge off the GTK thread. Stores a
-        sanitized status for the future Diagnostic view.
+        The coordinator shutdown is bounded (joins with a 2-second timeout)
+        and never blocks GTK for the SQLite five-second lock. Pending work
+        is discarded with a sanitized status.
         """
-        from .history_db import write_history_safely
-
-        while not self._history_worker_stop.is_set():
-            try:
-                item = self._history_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            if item is None:
-                break
-            readings, now = item
-            result = write_history_safely(readings, now=now)
-            self._history_status = result.diagnostic
+        self._history_coordinator.shutdown()
+        return False
 
     def _compute_next_refresh_str(self) -> str:
         if self._next_refresh_time <= 0:

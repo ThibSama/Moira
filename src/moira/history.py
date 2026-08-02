@@ -28,6 +28,10 @@ class HistoryStatus(StrEnum):
     INVALID = "invalid"
 
 
+class SchemaVersionError(ValueError):
+    """Raised when the database schema version does not match the expected version."""
+
+
 def _ensure_utc(dt: datetime) -> datetime:
     """Normalize a datetime to UTC. Naive datetimes are rejected."""
     if dt.tzinfo is None:
@@ -75,6 +79,8 @@ class QuotaObservation:
     status: HistoryStatus = HistoryStatus.AVAILABLE_EXACT
 
     def __post_init__(self) -> None:
+        if self.status is not HistoryStatus.AVAILABLE_EXACT:
+            raise ValueError("QuotaObservation status must be AVAILABLE_EXACT")
         _validate_non_empty(self.quota_label, "quota_label")
         _validate_percentage(self.percentage)
         _validate_non_empty(self.source, "source")

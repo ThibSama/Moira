@@ -14,11 +14,18 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .history import HistoryStatus, HistoryWriteResult, QuotaObservation, TokenObservation
+from .history import (
+    HistoryStatus,
+    HistoryWriteResult,
+    QuotaObservation,
+    SchemaVersionError,
+    TokenObservation,
+)
 from .models import Service
 from .persistence import state_dir
 
@@ -31,6 +38,7 @@ _DIAG_OK = "ok"
 _DIAG_DB_ERROR = "database unavailable"
 _DIAG_SCHEMA_ERROR = "schema mismatch"
 _DIAG_VALIDATION_ERROR = "invalid observation"
+_DIAG_BACKLOG = "backlog saturated"
 
 
 def history_path() -> Path:
@@ -207,7 +215,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
             _migrate_v1_to_v2(conn)
             return
         elif row[0] != SCHEMA_VERSION:
-            raise ValueError(
+            raise SchemaVersionError(
                 f"history database schema version {row[0]} does not match expected {SCHEMA_VERSION}"
             )
         conn.execute("COMMIT")
@@ -551,10 +559,118 @@ def write_history_safely(
             record_refresh(conn, readings, now=clock)
         finally:
             conn.close()
-    except ValueError:
+    except SchemaVersionError:
         return HistoryWriteResult(ok=False, diagnostic=_DIAG_SCHEMA_ERROR)
     except sqlite3.DatabaseError:
         return HistoryWriteResult(ok=False, diagnostic=_DIAG_DB_ERROR)
+    except ValueError:
+        return HistoryWriteResult(ok=False, diagnostic=_DIAG_VALIDATION_ERROR)
     except Exception:
         return HistoryWriteResult(ok=False, diagnostic=_DIAG_VALIDATION_ERROR)
     return HistoryWriteResult(ok=True, diagnostic=_DIAG_OK)
+
+
+class HistoryCoordinator:
+    """Bounded, testable coordinator for off-thread history writes.
+
+    Encapsulates a single-worker queue with documented overflow policy:
+    when the queue (maxsize=1) is full, the newest pending batch replaces
+    the queued batch (newest-wins). A sanitized ``backlog saturated``
+    status is set whenever any batch is discarded, and cleared only after
+    a later successful write.
+
+    Shutdown is idempotent: rejects new work, signals the worker via its
+    stop event and None sentinel, and joins with a bounded timeout that
+    never exceeds the SQLite five-second lock. The worker is a daemon
+    thread so it never blocks process exit.
+    """
+
+    def __init__(self, *, db_path: Path | None = None) -> None:
+        self._db_path = db_path or history_path()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._pending: list[Any] | None = None
+        self._pending_time: datetime | None = None
+        self._pending_lock = threading.Lock()
+        self._busy = False
+        self._status = _DIAG_OK
+        self._started = False
+
+    @property
+    def status(self) -> str:
+        """Return the current sanitized history status string."""
+        return self._status
+
+    def start(self) -> None:
+        """Start the worker thread if not already running."""
+        if self._started:
+            return
+        self._started = True
+        self._thread = threading.Thread(target=self._run, name="moira-history", daemon=True)
+        self._thread.start()
+
+    def enqueue(self, readings: list[Any], now: datetime) -> bool:
+        """Submit a batch for asynchronous writing.
+
+        Returns True if the batch was accepted. Returns False (and sets
+        ``backlog saturated``) if the worker was busy and the queue was
+        full. The newest batch is retained as pending and replaces any
+        older pending batch. Never blocks.
+        """
+        if self._stop.is_set():
+            return False
+        snapshot = list(readings)
+        with self._pending_lock:
+            if self._busy:
+                # Worker is still busy — replace the pending batch with
+                # the newest (newest-wins policy), report saturation.
+                self._pending = snapshot
+                self._pending_time = now
+                self._status = _DIAG_BACKLOG
+                return False
+            self._pending = snapshot
+            self._pending_time = now
+        return True
+
+    def _run(self) -> None:
+        """Worker loop: drain pending batches until shutdown."""
+        while not self._stop.is_set():
+            batch, when = self._take_pending()
+            if batch is None:
+                self._stop.wait(timeout=0.5)
+                continue
+            with self._pending_lock:
+                self._busy = True
+            result = write_history_safely(batch, now=when, db_path=self._db_path)
+            self._status = result.diagnostic
+            with self._pending_lock:
+                self._busy = False
+
+    def _take_pending(self) -> tuple[list[Any] | None, datetime | None]:
+        with self._pending_lock:
+            batch = self._pending
+            when = self._pending_time
+            self._pending = None
+            self._pending_time = None
+        return batch, when
+
+    def shutdown(self, *, timeout: float = 2.0) -> None:
+        """Idempotent shutdown. Rejects new work, signals the worker,
+        and joins with a bounded timeout. Never blocks longer than
+        ``timeout`` seconds (well under the SQLite five-second lock).
+
+        Pending work is discarded with a ``backlog saturated`` status.
+        """
+        if not self._started:
+            return
+        self._stop.set()
+        # Discard any pending batch
+        with self._pending_lock:
+            if self._pending is not None:
+                self._status = _DIAG_BACKLOG
+            self._pending = None
+            self._pending_time = None
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+        self._started = False
