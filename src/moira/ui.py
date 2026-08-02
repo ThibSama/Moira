@@ -441,8 +441,8 @@ class MainWindow(Adw.ApplicationWindow):
         terminates before the join expires. Pending work is discarded
         with a sanitized status. Never blocks GTK for more than 3 seconds.
         """
-        self._history_page.shutdown()
         self._history_coordinator.clear_write_success_callback()
+        self._history_page.shutdown()
         self._history_coordinator.shutdown()
         return False
 

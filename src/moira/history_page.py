@@ -13,7 +13,8 @@ ways so hidden pages never receive write-triggered reads.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from typing import Any
 
 import gi
@@ -278,30 +279,55 @@ class HistoryPage(Gtk.Box):
                 parts.append(f"{_('Resets')}: {stats.reset_count}")
             # First/last observation in local time (pure presentation helper)
             if stats.first_observed is not None:
-                parts.append(f"{_('First')}: {format_observation_time(stats.first_observed)}")
+                parts.append(
+                    f"{_('First')}: "
+                    f"{format_observation_time(stats.first_observed, tz_provider=_system_local_tz)}"
+                )
             if stats.last_observed is not None:
-                parts.append(f"{_('Last')}: {format_observation_time(stats.last_observed)}")
+                parts.append(
+                    f"{_('Last')}: "
+                    f"{format_observation_time(stats.last_observed, tz_provider=_system_local_tz)}"
+                )
         label = Gtk.Label(label=_(" · ").join(parts), xalign=0, wrap=True)
         return label
 
 
+def _system_local_tz() -> timezone:
+    """Resolve the actual system local timezone at render time."""
+    import time as _time
+
+    offset = _time.localtime().tm_gmtoff
+    return timezone(timedelta(seconds=offset))
+
+
 def format_observation_time(
     utc_dt: datetime,
-    target_tz: timezone | None = None,
+    target_tz: tzinfo | None = None,
+    *,
+    tz_provider: Callable[[], tzinfo] | None = None,
 ) -> str:
     """Format a UTC datetime in the target timezone for display only.
 
-    Pure function. Defaults to the system local timezone when
-    ``target_tz`` is None. Naive timestamps (no tzinfo) raise
-    ValueError (fail-closed) — they must never be silently interpreted.
+    Pure function when ``target_tz`` is provided. When ``target_tz`` is
+    None and ``tz_provider`` is given, the provider is called at render
+    time to resolve the display timezone (injectable for tests).
+    When both are None, defaults to UTC.
+
+    Naive timestamps (no tzinfo) raise ValueError (fail-closed) — they
+    must never be silently interpreted.
     """
     if utc_dt.tzinfo is None:
         raise ValueError("naive timestamps are not allowed; use timezone-aware datetimes")
-    tz = target_tz if target_tz is not None else UTC
+    if target_tz is not None:
+        tz = target_tz
+    elif tz_provider is not None:
+        tz = tz_provider()
+    else:
+        tz = UTC
     local_dt = utc_dt.astimezone(tz)
     return local_dt.strftime("%Y-%m-%d %H:%M")
 
 
 def _format_local(utc_dt: datetime) -> str:
     """Format a UTC datetime in the system local timezone for display only."""
-    return format_observation_time(utc_dt, target_tz=None)
+    return format_observation_time(utc_dt, tz_provider=_system_local_tz)
