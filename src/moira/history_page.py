@@ -14,7 +14,7 @@ ways so hidden pages never receive write-triggered reads.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any
 
 import gi
@@ -24,7 +24,12 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from .history_chart import QuotaChart  # noqa: E402
-from .history_view import HistoryReader, HistoryViewResult, SeriesView  # noqa: E402
+from .history_view import (  # noqa: E402
+    HistoryReader,
+    HistoryViewResult,
+    SeriesStats,
+    SeriesView,
+)
 from .i18n import tr  # noqa: E402
 from .models import Service  # noqa: E402
 
@@ -263,41 +268,68 @@ class HistoryPage(Gtk.Box):
     @staticmethod
     def _series_stats_label(s: SeriesView) -> Gtk.Widget:
         """Build a label showing stats for one series."""
-        stats = s.stats
-        parts: list[str] = [f"{stats.service.value.title()} {stats.label}"]
-        if stats.count == 0:
-            parts.append(_("No observations"))
-        else:
-            if stats.latest is not None:
-                parts.append(f"{_('Latest')}: {stats.latest:.1f}%")
-            if stats.minimum is not None:
-                parts.append(f"{_('Min')}: {stats.minimum:.1f}%")
-            if stats.maximum is not None:
-                parts.append(f"{_('Max')}: {stats.maximum:.1f}%")
-            parts.append(f"{_('Count')}: {stats.count}")
-            if stats.reset_count > 0:
-                parts.append(f"{_('Resets')}: {stats.reset_count}")
-            # First/last observation in local time (pure presentation helper)
-            if stats.first_observed is not None:
-                parts.append(
-                    f"{_('First')}: "
-                    f"{format_observation_time(stats.first_observed, tz_provider=_system_local_tz)}"
-                )
-            if stats.last_observed is not None:
-                parts.append(
-                    f"{_('Last')}: "
-                    f"{format_observation_time(stats.last_observed, tz_provider=_system_local_tz)}"
-                )
-        label = Gtk.Label(label=_(" · ").join(parts), xalign=0, wrap=True)
-        return label
+        text = build_series_stats_text(s.stats, tr, converter=_system_local_converter)
+        return Gtk.Label(label=text, xalign=0, wrap=True)
 
 
-def _system_local_tz() -> timezone:
-    """Resolve the actual system local timezone at render time."""
-    import time as _time
+def build_series_stats_text(
+    stats: SeriesStats,
+    translator: Callable[[str], str],
+    *,
+    target_tz: tzinfo | None = None,
+    converter: Callable[[datetime], datetime] | None = None,
+    tz_provider: Callable[[], tzinfo] | None = None,
+) -> str:
+    """Build the complete per-series statistics text as a pure function.
 
-    offset = _time.localtime().tm_gmtoff
-    return timezone(timedelta(seconds=offset))
+    GTK only wraps this text in a label. The translator is injected
+    so tests don't depend on the locale. Timezone resolution is
+    injectable via target_tz/converter/tz_provider.
+    """
+    _ = translator
+    parts: list[str] = [f"{stats.service.value.title()} {stats.label}"]
+    if stats.count == 0:
+        parts.append(_("No observations"))
+    else:
+        if stats.latest is not None:
+            parts.append(f"{_('Latest')}: {stats.latest:.1f}%")
+        if stats.minimum is not None:
+            parts.append(f"{_('Min')}: {stats.minimum:.1f}%")
+        if stats.maximum is not None:
+            parts.append(f"{_('Max')}: {stats.maximum:.1f}%")
+        parts.append(f"{_('Count')}: {stats.count}")
+        if stats.reset_count > 0:
+            parts.append(f"{_('Resets')}: {stats.reset_count}")
+        if stats.first_observed is not None:
+            ft = format_observation_time(
+                stats.first_observed,
+                target_tz=target_tz,
+                converter=converter,
+                tz_provider=tz_provider,
+            )
+            parts.append(f"{_('First')}: {ft}")
+        if stats.last_observed is not None:
+            lt = format_observation_time(
+                stats.last_observed,
+                target_tz=target_tz,
+                converter=converter,
+                tz_provider=tz_provider,
+            )
+            parts.append(f"{_('Last')}: {lt}")
+    return _(" · ").join(parts)
+
+
+def _system_local_converter(utc_dt: datetime) -> datetime:
+    """Convert a UTC datetime to the OS local timezone using system rules.
+
+    Uses datetime.astimezone() with no arguments, which resolves the
+    correct offset for each observation instant, including DST
+    transitions. This is not a fixed offset — the OS timezone database
+    is authoritative.
+    """
+    if utc_dt.tzinfo is None:
+        raise ValueError("naive timestamps are not allowed; use timezone-aware datetimes")
+    return utc_dt.astimezone()
 
 
 def format_observation_time(
@@ -305,29 +337,35 @@ def format_observation_time(
     target_tz: tzinfo | None = None,
     *,
     tz_provider: Callable[[], tzinfo] | None = None,
+    converter: Callable[[datetime], datetime] | None = None,
 ) -> str:
     """Format a UTC datetime in the target timezone for display only.
 
-    Pure function when ``target_tz`` is provided. When ``target_tz`` is
-    None and ``tz_provider`` is given, the provider is called at render
-    time to resolve the display timezone (injectable for tests).
-    When both are None, defaults to UTC.
+    Resolution order:
+      1. ``target_tz`` explicit → deterministic pure function.
+      2. ``converter`` given → called per observation (supports DST).
+      3. ``tz_provider`` given → called once, fixed offset for all.
+      4. Both None → UTC fallback.
 
-    Naive timestamps (no tzinfo) raise ValueError (fail-closed) — they
-    must never be silently interpreted.
+    Naive timestamps (no tzinfo) raise ValueError (fail-closed).
     """
     if utc_dt.tzinfo is None:
         raise ValueError("naive timestamps are not allowed; use timezone-aware datetimes")
     if target_tz is not None:
-        tz = target_tz
+        local_dt = utc_dt.astimezone(target_tz)
+    elif converter is not None:
+        local_dt = converter(utc_dt)
     elif tz_provider is not None:
         tz = tz_provider()
+        local_dt = utc_dt.astimezone(tz)
     else:
-        tz = UTC
-    local_dt = utc_dt.astimezone(tz)
+        local_dt = utc_dt.astimezone(UTC)
     return local_dt.strftime("%Y-%m-%d %H:%M")
 
 
 def _format_local(utc_dt: datetime) -> str:
-    """Format a UTC datetime in the system local timezone for display only."""
-    return format_observation_time(utc_dt, tz_provider=_system_local_tz)
+    """Format a UTC datetime in the system local timezone for display only.
+
+    Uses _system_local_converter for DST-correct per-observation offsets.
+    """
+    return format_observation_time(utc_dt, converter=_system_local_converter)

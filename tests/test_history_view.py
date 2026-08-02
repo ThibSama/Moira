@@ -1378,3 +1378,250 @@ def test_shutdown_clears_callback_at_start(tmp_path: Path) -> None:
         assert callback_count[0] == 0
     finally:
         hdb.write_history_safely = original_write
+        coord.shutdown()
+
+
+# ── 2f: Production-path race with injected dispatch gate ──
+
+
+def test_production_race_clear_after_write_prevents_callback(tmp_path: Path) -> None:
+    """Production-path race: after a write succeeds but before clear is
+    called, the callback may or may not have fired. After clear returns,
+    no further callbacks fire for subsequent writes.
+    """
+    from moira.history_db import HistoryCoordinator
+
+    callback_count = [0]
+
+    coord = HistoryCoordinator(db_path=tmp_path / "test.sqlite3")
+    coord.set_write_success_callback(lambda: callback_count.__setitem__(0, callback_count[0] + 1))
+    coord.start()
+
+    try:
+        coord.enqueue([], NOW)
+        time.sleep(0.3)
+
+        # Clear the callback
+        coord.clear_write_success_callback()
+
+        # After clear, no further callbacks
+        count_after_clear = callback_count[0]
+        coord.enqueue([], NOW)
+        time.sleep(0.3)
+        assert callback_count[0] == count_after_clear
+    finally:
+        coord.shutdown()
+
+
+def test_already_invoking_callback_allowed_to_finish(tmp_path: Path) -> None:
+    """A callback already past the invocation boundary may finish.
+
+    The dispatch gate (held during invocation) blocks clear() until
+    the callback completes, proving the documented policy.
+    """
+    from moira.history_db import HistoryCoordinator
+
+    callback_started = threading.Event()
+    callback_block = threading.Event()
+    callback_finished = [0]
+
+    def slow_callback() -> None:
+        callback_started.set()
+        callback_block.wait(timeout=5.0)
+        callback_finished[0] += 1
+
+    coord = HistoryCoordinator(db_path=tmp_path / "test.sqlite3")
+    coord.set_write_success_callback(slow_callback)
+    coord.start()
+
+    coord.enqueue([], NOW)
+
+    # Wait for callback to start
+    assert callback_started.wait(timeout=3.0)
+
+    # Call clear in a separate thread — it should block until callback finishes
+    clear_done = threading.Event()
+
+    def do_clear() -> None:
+        coord.clear_write_success_callback()
+        clear_done.set()
+
+    clear_thread = threading.Thread(target=do_clear, daemon=True)
+    clear_thread.start()
+
+    # Clear should be blocked (callback holds the dispatch gate)
+    assert not clear_done.wait(timeout=1.0)
+
+    # Release the callback
+    callback_block.set()
+
+    # Now clear can complete
+    assert clear_done.wait(timeout=3.0)
+    assert callback_finished[0] == 1
+
+    coord.shutdown()
+
+
+# ── 2f: DST boundary with Europe/Paris ──
+
+
+def test_dst_boundary_europe_paris() -> None:
+    """Observations on opposite sides of a DST transition receive correct
+    offsets using Europe/Paris (CET -> CEST).
+
+    DST transition: 2026-03-29 02:00 CET -> 03:00 CEST (clocks forward).
+    Before: UTC+01:00. After: UTC+02:00.
+    """
+    from zoneinfo import ZoneInfo
+
+    from moira.history_page import format_observation_time
+
+    try:
+        paris = ZoneInfo("Europe/Paris")
+    except Exception:
+        pytest.skip("zoneinfo timezone database not available")
+
+    # Before DST transition: 2026-03-28 12:00 UTC -> 13:00 Paris (UTC+1)
+    before = datetime(2026, 3, 28, 12, 0, 0, tzinfo=UTC)
+    result_before = format_observation_time(before, target_tz=paris)
+    assert result_before == "2026-03-28 13:00"
+
+    # After DST transition: 2026-03-29 12:00 UTC -> 14:00 Paris (UTC+2)
+    after = datetime(2026, 3, 29, 12, 0, 0, tzinfo=UTC)
+    result_after = format_observation_time(after, target_tz=paris)
+    assert result_after == "2026-03-29 14:00"
+
+
+def test_dst_converter_per_observation() -> None:
+    """The converter parameter resolves per-observation, not as a fixed offset."""
+    from zoneinfo import ZoneInfo
+
+    from moira.history_page import format_observation_time
+
+    try:
+        paris = ZoneInfo("Europe/Paris")
+    except Exception:
+        pytest.skip("zoneinfo timezone database not available")
+
+    def paris_converter(utc_dt: datetime) -> datetime:
+        return utc_dt.astimezone(paris)
+
+    # Before transition (UTC+1)
+    before = datetime(2026, 3, 28, 12, 0, 0, tzinfo=UTC)
+    assert format_observation_time(before, converter=paris_converter) == "2026-03-28 13:00"
+
+    # After transition (UTC+2)
+    after = datetime(2026, 3, 29, 12, 0, 0, tzinfo=UTC)
+    assert format_observation_time(after, converter=paris_converter) == "2026-03-29 14:00"
+
+
+# ── 2f: Pure build_series_stats_text tests ──
+
+
+def test_build_series_stats_text_utc() -> None:
+    """Complete per-series stats text with exact First/Last in UTC."""
+    from moira.history_page import build_series_stats_text
+    from moira.history_view import SeriesStats
+
+    stats = SeriesStats(
+        label="Weekly",
+        service=Service.CLAUDE,
+        latest=75.0,
+        minimum=10.0,
+        maximum=90.0,
+        first_observed=datetime(2026, 8, 2, 10, 0, 0, tzinfo=UTC),
+        last_observed=datetime(2026, 8, 2, 14, 0, 0, tzinfo=UTC),
+        count=5,
+        reset_count=1,
+    )
+
+    def identity(s: str) -> str:
+        return s
+
+    result = build_series_stats_text(stats, identity, target_tz=UTC)
+    assert "First: 2026-08-02 10:00" in result
+    assert "Last: 2026-08-02 14:00" in result
+    assert "Claude Weekly" in result
+    assert "Latest: 75.0%" in result
+    assert "Min: 10.0%" in result
+    assert "Max: 90.0%" in result
+    assert "Count: 5" in result
+    assert "Resets: 1" in result
+
+
+def test_build_series_stats_text_utc_plus_2() -> None:
+    """Complete per-series stats text with exact First/Last in UTC+02:00."""
+    from moira.history_page import build_series_stats_text
+    from moira.history_view import SeriesStats
+
+    tz_plus_2 = timezone(timedelta(hours=2))
+    stats = SeriesStats(
+        label="Weekly",
+        service=Service.CLAUDE,
+        latest=75.0,
+        minimum=10.0,
+        maximum=90.0,
+        first_observed=datetime(2026, 8, 2, 10, 0, 0, tzinfo=UTC),
+        last_observed=datetime(2026, 8, 2, 14, 0, 0, tzinfo=UTC),
+        count=3,
+        reset_count=0,
+    )
+
+    def identity(s: str) -> str:
+        return s
+
+    result = build_series_stats_text(stats, identity, target_tz=tz_plus_2)
+    assert "First: 2026-08-02 12:00" in result
+    assert "Last: 2026-08-02 16:00" in result
+    assert "Resets" not in result
+
+
+def test_build_series_stats_text_empty() -> None:
+    """Empty series stats produce 'No observations'."""
+    from moira.history_page import build_series_stats_text
+    from moira.history_view import SeriesStats
+
+    stats = SeriesStats(
+        label="Weekly",
+        service=Service.CLAUDE,
+        latest=None,
+        minimum=None,
+        maximum=None,
+        first_observed=None,
+        last_observed=None,
+        count=0,
+        reset_count=0,
+    )
+
+    def identity(s: str) -> str:
+        return s
+
+    result = build_series_stats_text(stats, identity, target_tz=UTC)
+    assert "No observations" in result
+    assert "First" not in result
+    assert "Last" not in result
+
+
+def test_build_series_stats_text_translator_injected() -> None:
+    """The translator is injected so tests don't depend on the locale."""
+    from moira.history_page import build_series_stats_text
+    from moira.history_view import SeriesStats
+
+    stats = SeriesStats(
+        label="Weekly",
+        service=Service.CLAUDE,
+        latest=50.0,
+        minimum=50.0,
+        maximum=50.0,
+        first_observed=datetime(2026, 8, 2, 10, 0, 0, tzinfo=UTC),
+        last_observed=datetime(2026, 8, 2, 14, 0, 0, tzinfo=UTC),
+        count=1,
+        reset_count=0,
+    )
+
+    def french(s: str) -> str:
+        return {"Latest": "Dernier", "First": "Premier", "Last": "Dernier"}.get(s, s)
+
+    result = build_series_stats_text(stats, french, target_tz=UTC)
+    assert "Premier: 2026-08-02 10:00" in result
+    assert "Dernier: 2026-08-02 14:00" in result

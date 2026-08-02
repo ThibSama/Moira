@@ -636,13 +636,17 @@ class HistoryCoordinator:
         # Lifecycle: "new", "running", "shutting_down", "terminated"
         self._lifecycle = "new"
         # Write-success callback for History refresh.
-        # Thread-safe: set/cleared under self._cond.
-        # Linearizable: a _callback_generation counter invalidates any
-        # captured callback after clear() returns. An already-executing
-        # callback is allowed to finish (documented policy).
+        # Thread-safe and linearizable: _dispatch_lock is held during
+        # the entire capture → revalidation → invocation sequence.
+        # clear() acquires _dispatch_lock before bumping the generation,
+        # so after clear returns no captured callback can begin.
+        # An already-invoking callback may finish (documented policy).
+        # Lock order: _dispatch_lock is always acquired before _cond
+        # when both are held. _cond-only sections never acquire
+        # _dispatch_lock.
         self._write_success_callback: Any = None
         self._callback_generation = 0
-        # Latest accepted generation (across in-flight and pending).
+        self._dispatch_lock = threading.Lock()
         self._latest_accepted_gen = 0
 
     @property
@@ -676,27 +680,30 @@ class HistoryCoordinator:
     def set_write_success_callback(self, callback: Any) -> None:
         """Set a callback fired after a successful history write.
 
-        Thread-safe: registered under the Condition. Bumps the callback
-        generation so any previously captured callback is invalidated.
+        Thread-safe: acquires _dispatch_lock then _cond.
         """
-        with self._cond:
-            self._write_success_callback = callback
-            self._callback_generation += 1
+        with self._dispatch_lock:
+            with self._cond:
+                self._write_success_callback = callback
+                self._callback_generation += 1
 
     def clear_write_success_callback(self) -> None:
         """Detach the write-success callback. Thread-safe and linearizable.
 
         After this call returns, the detached callback cannot begin later.
-        Bumps ``_callback_generation`` which invalidates any capture made
-        before the clear. An already-executing callback is allowed to
-        finish (documented policy). No bounded wait is required because
-        the generation check prevents new invocations.
+        Acquires _dispatch_lock so that any in-progress capture→invocation
+        sequence has completed (or not started) before the generation is
+        bumped. An already-invoking callback is allowed to finish
+        (documented policy). No bounded wait on the Condition is needed.
+
+        Lock order: _dispatch_lock before _cond.
 
         MainWindow should call this before page and coordinator shutdown.
         """
-        with self._cond:
-            self._write_success_callback = None
-            self._callback_generation += 1
+        with self._dispatch_lock:
+            with self._cond:
+                self._write_success_callback = None
+                self._callback_generation += 1
 
     def start(self) -> None:
         """Start the worker thread if in the NEW state.
@@ -792,20 +799,23 @@ class HistoryCoordinator:
                 )
                 callback = self._write_success_callback
                 captured_gen = self._callback_generation
-            # Fire write-success callback outside the lock.
-            # Linearizable detachment: revalidate the callback generation
-            # inside the lock immediately before invocation. If
-            # clear_write_success_callback() bumped the generation,
-            # the captured callback is invalid and will not fire.
+            # Fire write-success callback outside the Condition lock.
+            # The _dispatch_lock gate ensures linearizable detachment:
+            # clear() cannot return until this gate is released, so
+            # after clear returns no captured callback can begin.
+            # The callback is invoked outside _dispatch_lock-protected
+            # section only after revalidation passes — but the gate
+            # is held across both revalidation and invocation.
             if publish and callback is not None:
-                with self._cond:
-                    if self._callback_generation != captured_gen:
-                        callback = None
-                if callback is not None:
-                    try:
-                        callback()
-                    except Exception:
-                        pass
+                with self._dispatch_lock:
+                    with self._cond:
+                        if self._callback_generation != captured_gen:
+                            callback = None
+                    if callback is not None:
+                        try:
+                            callback()
+                        except Exception:
+                            pass
 
     def shutdown(self, *, timeout: float | None = None) -> None:
         """Idempotent shutdown.
@@ -824,15 +834,28 @@ class HistoryCoordinator:
                 f"shutdown_timeout ({self._shutdown_timeout}), and strictly "
                 f"greater than db_timeout ({self._db_timeout})"
             )
-        with self._cond:
-            if self._lifecycle == "terminated":
-                return
-            # Clear callback ownership at the start of shutdown so no
-            # callback fires during or after the join.
-            self._write_success_callback = None
-            self._callback_generation += 1
-            if self._lifecycle == "new":
-                # Shutdown before start — terminate immediately
+        with self._dispatch_lock:
+            with self._cond:
+                if self._lifecycle == "terminated":
+                    return
+                # Clear callback ownership at the start of shutdown so no
+                # callback fires during or after the join.
+                self._write_success_callback = None
+                self._callback_generation += 1
+                if self._lifecycle == "new":
+                    # Shutdown before start — terminate immediately
+                    if self._pending is not None:
+                        if self._saturation_gen < self._pending_gen:
+                            self._saturation_gen = self._pending_gen
+                        if self._saturation_gen > 0:
+                            self._status = _DIAG_BACKLOG
+                    self._pending = None
+                    self._pending_time = None
+                    self._pending_gen = 0
+                    self._lifecycle = "terminated"
+                    return
+                # RUNNING → SHUTTING_DOWN
+                self._lifecycle = "shutting_down"
                 if self._pending is not None:
                     if self._saturation_gen < self._pending_gen:
                         self._saturation_gen = self._pending_gen
@@ -841,20 +864,8 @@ class HistoryCoordinator:
                 self._pending = None
                 self._pending_time = None
                 self._pending_gen = 0
-                self._lifecycle = "terminated"
-                return
-            # RUNNING → SHUTTING_DOWN
-            self._lifecycle = "shutting_down"
-            if self._pending is not None:
-                if self._saturation_gen < self._pending_gen:
-                    self._saturation_gen = self._pending_gen
-                if self._saturation_gen > 0:
-                    self._status = _DIAG_BACKLOG
-            self._pending = None
-            self._pending_time = None
-            self._pending_gen = 0
-            self._cond.notify_all()
-            thread = self._thread
+                self._cond.notify_all()
+                thread = self._thread
         if thread is not None:
             thread.join(timeout=join_timeout)
             if thread.is_alive():
