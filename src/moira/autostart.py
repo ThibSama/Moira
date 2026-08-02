@@ -6,7 +6,7 @@ from pathlib import Path
 DESKTOP = """[Desktop Entry]
 Type=Application
 Name=Moira
-Comment=Monitor Claude and Codex quotas
+Comment=Surveiller les quotas Claude et Codex
 Exec=moira
 Icon=io.github.moira.QuotaMonitor
 Terminal=false

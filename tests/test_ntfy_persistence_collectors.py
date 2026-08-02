@@ -40,7 +40,7 @@ def test_versioned_settings_and_no_token_on_disk(tmp_path: Path, monkeypatch: ob
     with patcher:
         save_settings(Settings(ntfy_topic="topic"))
         raw = (tmp_path / "moira/config.json").read_text()
-        assert json.loads(raw)["version"] == 1
+        assert json.loads(raw)["version"] == 2
         assert "token" not in raw.lower()
         assert load_settings().ntfy_topic == "topic"
 

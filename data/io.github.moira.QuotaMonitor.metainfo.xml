@@ -12,6 +12,13 @@
   </description>
   <launchable type="desktop-id">io.github.moira.QuotaMonitor.desktop</launchable>
   <provides><binary>moira</binary></provides>
-  <releases><release version="0.1.1" date="2026-08-01"/></releases>
+  <releases>
+    <release version="0.2.0" date="2026-08-02">
+      <description>
+        <p>Weekly exhaustion semantics, French localization with English fallback, visible configurable refresh interval, focus-regain refresh, 30-second countdown recompute, and deduplicated exhaustion/recovery NTFY events.</p>
+      </description>
+    </release>
+    <release version="0.1.1" date="2026-08-01"/>
+  </releases>
   <content_rating type="oars-1.1"/>
 </component>

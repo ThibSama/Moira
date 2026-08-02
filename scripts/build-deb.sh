@@ -3,7 +3,7 @@ set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 stage="$project_dir/build/deb-root"
-output="$project_dir/dist/moira_0.1.1_all.deb"
+output="$project_dir/dist/moira_0.2.0_all.deb"
 
 rm -rf "$stage"
 mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/lib/moira" \
