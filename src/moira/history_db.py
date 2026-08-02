@@ -635,6 +635,8 @@ class HistoryCoordinator:
         self._last_write_diagnostic = _DIAG_OK
         # Lifecycle: "new", "running", "shutting_down", "terminated"
         self._lifecycle = "new"
+        # Write-success callback for History refresh
+        self._write_success_callback: Any = None
 
     @property
     def status(self) -> str:
@@ -663,6 +665,14 @@ class HistoryCoordinator:
         """Return the current lifecycle state string."""
         with self._cond:
             return self._lifecycle
+
+    def set_write_success_callback(self, callback: Any) -> None:
+        """Set a callback fired after a successful history write.
+
+        The callback is called outside the condition lock. It receives no
+        arguments. Use this to trigger a History tab refresh.
+        """
+        self._write_success_callback = callback
 
     def start(self) -> None:
         """Start the worker thread if in the NEW state.
@@ -750,6 +760,14 @@ class HistoryCoordinator:
                         # status. The diagnostic is stored internally.
                         self._status = _DIAG_BACKLOG
                 # else: an older write completed — preserve current status
+                fire_callback = result.ok and self._write_success_callback is not None
+                callback = self._write_success_callback
+            # Fire write-success callback outside the lock
+            if fire_callback and callback is not None:
+                try:
+                    callback()
+                except Exception:
+                    pass
 
     def shutdown(self, *, timeout: float | None = None) -> None:
         """Idempotent shutdown.

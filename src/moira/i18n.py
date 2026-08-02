@@ -130,6 +130,9 @@ _FRENCH: dict[str, str] = {
     "Max": "Max",
     "Count": "Nombre",
     "Resets": "Réinitialisations",
+    "No data": "Aucune donnée",
+    "No history database": "Aucune base de données d'historique",
+    "Exact token usage is not available": "L'utilisation exacte des jetons n'est pas disponible",
 }
 
 

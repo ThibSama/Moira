@@ -224,6 +224,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._next_refresh_time: float = 0.0
         self._history_coordinator = HistoryCoordinator()
         self._history_coordinator.start()
+        self._history_coordinator.set_write_success_callback(self._on_history_write_success)
         self._build()
         self._render()
         if not smoke_test:
@@ -419,8 +420,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._record_history(self.pending, now)
         self.refreshing = False
         self._render()
-        # Notify History page that new data may be available
-        self._history_page.on_refresh_complete()
+        # History refresh happens via the write-success callback,
+        # not here — only after the write actually succeeds.
         return False
 
     def _record_history(self, readings: list[QuotaReading], now: datetime) -> None:
@@ -442,6 +443,15 @@ class MainWindow(Adw.ApplicationWindow):
         """
         self._history_coordinator.shutdown()
         return False
+
+    def _on_history_write_success(self) -> None:
+        """Called from the history worker thread after a successful write.
+
+        Schedules a History tab refresh on the GLib idle loop. Only fires
+        after the write actually succeeds — failed, dropped, or saturated
+        writes do not trigger a refresh.
+        """
+        GLib.idle_add(self._history_page.on_refresh_complete)
 
     def _on_stack_changed(self, *_: Any) -> None:
         """Refresh History tab when it becomes visible."""

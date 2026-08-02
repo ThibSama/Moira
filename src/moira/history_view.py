@@ -1,26 +1,30 @@
 """Typed immutable view models and pure deterministic chart data preparation
 for the History UI.
 
-View models are immutable (frozen dataclasses). The async reader uses
-monotonically increasing request identity so only the newest read publishes
-results to GTK. No SQLite rows, connections, or raw payloads are exposed.
+View models are deeply immutable (frozen dataclasses with tuple fields).
+The async reader uses a genuinely bounded policy: at most one running read
+and one pending newest request. Stale generations never publish. No SQLite
+rows, connections, or raw payloads are exposed.
 
-The 90-day reduction preserves first/last points, extrema, percentage
-changes, reset transitions, and order while capping the output to a
-bounded number of points suitable for chart rendering.
+Reduction policy: first/last and all reset transitions are always kept.
+Local extrema are kept next. If mandatory points exceed the soft cap,
+the cap expands to accommodate all mandatory points (soft cap). Remaining
+slots are evenly sampled. Chronological order is always preserved.
 """
 
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from .history import QuotaObservation
+from .history import QuotaObservation, SchemaVersionError
 from .models import Service
 
-# Maximum points per series for chart rendering.
+# Soft cap for chart points. Mandatory points (first/last/resets/extrema)
+# may exceed this; the cap is expanded to accommodate them.
 MAX_CHART_POINTS = 200
 
 
@@ -53,7 +57,7 @@ class SeriesView:
     """An immutable view of one quota series for rendering."""
 
     stats: SeriesStats
-    points: list[ChartPoint]
+    points: tuple[ChartPoint, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,9 +65,10 @@ class HistoryViewResult:
     """The complete immutable result returned to GTK.
 
     Contains only typed view models — no SQLite rows or connections.
+    Series and points are tuples (deeply immutable).
     """
 
-    series: list[SeriesView]
+    series: tuple[SeriesView, ...]
     diagnostic: str
     range_label: str
     filter_label: str
@@ -112,45 +117,26 @@ def _build_stats(
     )
 
 
-def _reduce_points(
+def _find_mandatory_indices(
     observations: list[QuotaObservation],
     resets: list[bool],
-    max_points: int = MAX_CHART_POINTS,
-) -> list[ChartPoint]:
-    """Reduce observations to at most ``max_points`` chart points.
+) -> set[int]:
+    """Find all mandatory indices that must be preserved.
 
-    Dense 90-day reduction preserves:
-      - first and last points;
-      - extrema (local minima and maxima);
-      - percentage changes;
-      - reset transitions;
-      - chronological order.
-
-    For ``len(observations) <= max_points``, all points are kept.
+    Mandatory: first, last, and all reset transitions.
     """
-    if not observations:
-        return []
-
-    if len(observations) <= max_points:
-        return [
-            ChartPoint(
-                observed_at=obs.observed_at,
-                percentage=obs.percentage,
-                is_reset=resets[i],
-            )
-            for i, obs in enumerate(observations)
-        ]
-
-    # Select indices to keep: first, last, extrema, resets, then evenly sample
-    keep_indices: set[int] = {0, len(observations) - 1}
-
-    # Add reset transition indices
+    keep: set[int] = {0, len(observations) - 1}
     for i, is_reset in enumerate(resets):
         if is_reset:
-            keep_indices.add(i)
+            keep.add(i)
+    return keep
 
-    # Add local extrema (where direction changes)
-    percentages = [obs.percentage for obs in observations]
+
+def _find_extrema_indices(
+    percentages: list[float],
+) -> set[int]:
+    """Find local extrema (direction changes)."""
+    extrema: set[int] = set()
     for i in range(1, len(percentages) - 1):
         prev_pct = percentages[i - 1]
         curr_pct = percentages[i]
@@ -158,27 +144,77 @@ def _reduce_points(
         if (curr_pct > prev_pct and curr_pct > next_pct) or (
             curr_pct < prev_pct and curr_pct < next_pct
         ):
-            keep_indices.add(i)
+            extrema.add(i)
+    return extrema
 
-    # If still under max_points, evenly sample to fill remaining slots
-    remaining = max_points - len(keep_indices)
-    if remaining > 0:
-        step = max(1, len(observations) // (remaining + 1))
+
+def _reduce_points(
+    observations: list[QuotaObservation],
+    resets: list[bool],
+    max_points: int = MAX_CHART_POINTS,
+) -> tuple[ChartPoint, ...]:
+    """Reduce observations to a bounded number of chart points.
+
+    Priority policy (deterministic):
+      1. First and last points are always kept.
+      2. All reset transitions are always kept.
+      3. Local extrema are kept next.
+      4. Remaining slots are evenly sampled.
+
+    If mandatory points (first/last/resets) exceed ``max_points``, the
+    cap is expanded to accommodate all mandatory points (soft cap).
+    Extrema are added only if slots remain after mandatory points.
+    Even sampling fills the rest up to ``max_points``.
+
+    Does not claim to preserve every percentage change. Chronological
+    order is always preserved.
+    """
+    if not observations:
+        return ()
+
+    if len(observations) <= max_points:
+        return tuple(
+            ChartPoint(
+                observed_at=obs.observed_at,
+                percentage=obs.percentage,
+                is_reset=resets[i],
+            )
+            for i, obs in enumerate(observations)
+        )
+
+    # Step 1: mandatory indices (first, last, resets)
+    keep = _find_mandatory_indices(observations, resets)
+
+    # Step 2: add extrema if slots remain
+    available = max_points - len(keep)
+    if available > 0:
+        percentages = [obs.percentage for obs in observations]
+        extrema = _find_extrema_indices(percentages)
+        # Add extrema until we reach the cap
+        for idx in sorted(extrema):
+            if len(keep) >= max_points:
+                break
+            keep.add(idx)
+
+    # Step 3: evenly sample remaining slots
+    available = max_points - len(keep)
+    if available > 0:
+        step = max(1, len(observations) // (available + 1))
         for i in range(0, len(observations), step):
-            keep_indices.add(i)
-            if len(keep_indices) >= max_points:
+            keep.add(i)
+            if len(keep) >= max_points:
                 break
 
-    # Sort and cap
-    sorted_indices = sorted(keep_indices)[:max_points]
-    return [
+    # Sort and build result — soft cap may exceed max_points for mandatory
+    sorted_indices = sorted(keep)
+    return tuple(
         ChartPoint(
             observed_at=observations[i].observed_at,
             percentage=observations[i].percentage,
             is_reset=resets[i],
         )
         for i in sorted_indices
-    ]
+    )
 
 
 def _group_observations(
@@ -214,38 +250,132 @@ def prepare_history_view(
         points = _reduce_points(obs_list, resets, max_points)
         series.append(SeriesView(stats=stats, points=points))
     return HistoryViewResult(
-        series=series,
+        series=tuple(series),
         diagnostic=diagnostic,
         range_label=range_label,
         filter_label=filter_label,
     )
 
 
-# ── Async reader with request identity ──
+# ── Sanitized diagnostic constants ──
+
+_DIAG_OK = "ok"
+_DIAG_NO_DATABASE = "no database"
+_DIAG_EMPTY = "empty range"
+_DIAG_DB_ERROR = "database unavailable"
+_DIAG_SCHEMA_ERROR = "schema mismatch"
+_DIAG_LOADING = "loading"
+_DIAG_TOKENS_UNSUPPORTED = "exact tokens unavailable"
+
+
+def _safe_read(
+    *,
+    range_func: Any,
+    range_label: str,
+    filter_label: str,
+    service: Service | None,
+    now: datetime,
+    req_id: int,
+    db_path: Any,
+) -> tuple[int, HistoryViewResult] | None:
+    """Perform the SQLite read on the worker thread with proper error handling."""
+    from pathlib import Path
+
+    from .history_db import _connect, init_schema
+
+    path = Path(db_path) if not isinstance(db_path, Path) else db_path
+
+    # Detect absence without creating the database
+    if not path.exists():
+        return (
+            req_id,
+            HistoryViewResult(
+                series=(),
+                diagnostic=_DIAG_NO_DATABASE,
+                range_label=range_label,
+                filter_label=filter_label,
+            ),
+        )
+
+    try:
+        conn = _connect(path, timeout=1.0)
+        try:
+            init_schema(conn)
+            result = range_func(conn, now=now)
+            quota_obs: list[QuotaObservation] = result.get("quota", [])
+            if service is not None:
+                quota_obs = [o for o in quota_obs if o.service is service]
+            if not quota_obs:
+                return (
+                    req_id,
+                    HistoryViewResult(
+                        series=(),
+                        diagnostic=_DIAG_EMPTY,
+                        range_label=range_label,
+                        filter_label=filter_label,
+                    ),
+                )
+            view = prepare_history_view(
+                quota_obs,
+                range_label=range_label,
+                filter_label=filter_label,
+            )
+            return (req_id, view)
+        finally:
+            conn.close()
+    except SchemaVersionError:
+        return (
+            req_id,
+            HistoryViewResult(
+                series=(),
+                diagnostic=_DIAG_SCHEMA_ERROR,
+                range_label=range_label,
+                filter_label=filter_label,
+            ),
+        )
+    except Exception:
+        return (
+            req_id,
+            HistoryViewResult(
+                series=(),
+                diagnostic=_DIAG_DB_ERROR,
+                range_label=range_label,
+                filter_label=filter_label,
+            ),
+        )
 
 
 class HistoryReader:
-    """Bounded asynchronous reader for history data.
+    """Genuinely bounded asynchronous reader for history data.
 
-    Uses a monotonically increasing request identity so only the newest
-    read publishes results to GTK. At most one pending read exists at a
-    time; rapid changes do not create unbounded work. Stale results are
-    discarded.
+    At most one running read and one pending newest request. Rapid
+    changes replace only the pending request — never submit unbounded
+    work. Stale generations never publish.
 
     All SQLite work happens on the reader thread. GTK receives only
-    typed immutable HistoryViewResult objects via a callback on the
-    GLib idle loop.
+    typed immutable HistoryViewResult objects via an injected dispatcher
+    (defaults to GLib.idle_add). No callback may update a destroyed page.
     """
 
-    def __init__(self, executor: Any) -> None:
+    def __init__(
+        self,
+        executor: Any,
+        *,
+        dispatcher: Callable[..., None] | None = None,
+        db_path: Any = None,
+    ) -> None:
         self._executor = executor
+        self._dispatcher = dispatcher
+        self._db_path = db_path
         self._request_id = 0
-        self._lock = threading.Lock()
-        self._pending: Any | None = None
-        self._callback: Any | None = None
+        self._lock = threading.RLock()
+        self._running: Any | None = None
+        self._pending_request: dict[str, Any] | None = None
+        self._callback: Callable[[HistoryViewResult], None] | None = None
+        self._cancelled = False
 
-    def set_callback(self, callback: Any) -> None:
-        """Set the GTK callback that receives HistoryViewResult via GLib.idle_add."""
+    def set_callback(self, callback: Callable[[HistoryViewResult], None]) -> None:
+        """Set the callback that receives HistoryViewResult via the dispatcher."""
         self._callback = callback
 
     def request(
@@ -259,91 +389,89 @@ class HistoryReader:
     ) -> None:
         """Request a history read. Only the newest request's result is published.
 
-        If a read is already pending, the old request is superseded.
-        The callback receives the result only if this request is still
-        the newest when the read completes.
+        If a read is already running and a pending request exists, the
+        pending request is replaced (newest-wins). If no pending request
+        exists, it is stored. At most one running read and one pending
+        request exist at any time. Never submits unbounded work.
         """
         with self._lock:
+            if self._cancelled:
+                return
             self._request_id += 1
             req_id = self._request_id
-            # If a pending future exists, it will be ignored by req_id check
             clock = now or datetime.now(UTC)
 
-        future = self._executor.submit(
-            self._read,
-            range_func=range_func,
-            range_label=range_label,
-            filter_label=filter_label,
-            service=service,
-            now=clock,
-            req_id=req_id,
-        )
-        with self._lock:
-            self._pending = future
+            request_params = {
+                "range_func": range_func,
+                "range_label": range_label,
+                "filter_label": filter_label,
+                "service": service,
+                "now": clock,
+                "req_id": req_id,
+            }
+
+            if self._running is not None:
+                # A read is running — store/replace the pending request
+                self._pending_request = request_params
+                return
+
+            # No running read — submit immediately
+            self._running = req_id
+
+        future = self._executor.submit(self._read, **request_params)
         future.add_done_callback(self._on_done)
 
-    def _read(
-        self,
-        *,
-        range_func: Any,
-        range_label: str,
-        filter_label: str,
-        service: Service | None,
-        now: datetime,
-        req_id: int,
-    ) -> tuple[int, HistoryViewResult] | None:
+    def _maybe_submit_pending(self) -> None:
+        """Submit the pending request if one exists and no read is running."""
+        with self._lock:
+            if self._cancelled or self._pending_request is None:
+                return
+            params = self._pending_request
+            self._pending_request = None
+            self._running = params["req_id"]
+
+        future = self._executor.submit(self._read, **params)
+        future.add_done_callback(self._on_done)
+
+    def _read(self, **kwargs: Any) -> tuple[int, HistoryViewResult] | None:
         """Perform the actual SQLite read on the worker thread."""
-        from .history_db import _connect, history_path, init_schema
+        db_path = self._db_path
+        if db_path is None:
+            from .history_db import history_path
 
-        try:
-            conn = _connect(history_path(), timeout=1.0)
-            try:
-                init_schema(conn)
-                result = range_func(conn, now=now)
-                quota_obs: list[QuotaObservation] = result.get("quota", [])
-                if service is not None:
-                    quota_obs = [o for o in quota_obs if o.service is service]
-                view = prepare_history_view(
-                    quota_obs,
-                    range_label=range_label,
-                    filter_label=filter_label,
-                )
-                return (req_id, view)
-            finally:
-                conn.close()
-        except Exception:
-            from .history_db import _DIAG_DB_ERROR
-
-            # Return error diagnostic — sanitized, no raw exception text
-            return (
-                req_id,
-                HistoryViewResult(
-                    series=[],
-                    diagnostic=_DIAG_DB_ERROR,
-                    range_label=range_label,
-                    filter_label=filter_label,
-                ),
-            )
+            db_path = history_path()
+        return _safe_read(db_path=db_path, **kwargs)
 
     def _on_done(self, future: Any) -> None:
         """Callback when the read completes. Publishes only if newest."""
         try:
             result = future.result()
         except Exception:
-            return
-        if result is None:
-            return
-        req_id, view = result
+            result = None
+
         with self._lock:
-            if req_id != self._request_id:
-                # Stale result — discard
+            self._running = None
+            if result is None:
+                self._maybe_submit_pending()
                 return
-            self._pending = None
+            req_id, view = result
+            if self._cancelled or req_id != self._request_id:
+                # Stale or cancelled — discard
+                self._maybe_submit_pending()
+                return
+
         if self._callback is not None:
-            self._callback(view)
+            if self._dispatcher is not None:
+                self._dispatcher(self._callback, view)
+            else:
+                self._callback(view)
+
+        self._maybe_submit_pending()
 
     def cancel(self) -> None:
-        """Cancel all pending reads. Future callbacks will be discarded."""
+        """Cancel all pending and future reads. No callback will fire."""
         with self._lock:
+            self._cancelled = True
             self._request_id += 1
-            self._pending = None
+            self._pending_request = None
+            self._running = None
