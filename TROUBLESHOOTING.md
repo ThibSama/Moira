@@ -57,3 +57,11 @@ desktop-file-validate /usr/share/applications/io.github.moira.QuotaMonitor.deskt
 appstreamcli validate --no-net /usr/share/metainfo/io.github.moira.QuotaMonitor.metainfo.xml
 xdg-user-dir DESKTOP
 ```
+
+## Local history
+
+Moira stores quota observations in `$XDG_STATE_HOME/moira/history.sqlite3` (mode `0600`). Only fresh AVAILABLE readings with a percentage and `reset_at` are stored. STALE, error, unavailable, and parse-error readings are never recorded. No raw payloads, prompts, responses, transcript text, private paths, account identifiers, or secrets are retained. Token counts are never estimated or derived from percentages.
+
+Quota changes are recorded immediately. Otherwise, at most one unchanged sample per service/quota per 15-minute bucket is kept, making repeated refresh completions idempotent. Rows older than 90 days are purged after successful writes.
+
+History failure (database locked, disk error, schema mismatch) does not disrupt quota state, display, or alerts. The history write is caught and swallowed with only a sanitized diagnostic. Missing token telemetry does not affect quota collection, display, alerts, or quota-history recording.

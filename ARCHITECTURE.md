@@ -24,3 +24,32 @@ Codex app-server ─> ordered JSON-RPC handshake ─> validator ──┘       
 - `ui.py` owns GTK widgets and schedules collectors on worker threads. A refresh guard prevents overlap. Refresh occurs at startup, on focus regain (monotonic debounce), and at the configured interval. Countdowns recompute locally every 30 seconds without collectors. Saving a new interval immediately replaces the GLib timer without restart or duplicates.
 
 No database, rendered dashboard/terminal scraping, private endpoint, background service, tray, or legacy helper dependency is used. An existing user status-line command remains an independent delegate when Moira chaining is enabled.
+
+## Local history
+
+`history.py` defines typed domain objects separating quota observations (`QuotaObservation`) from optional exact-token observations (`TokenObservation`). Each record carries service, UTC time, source, and a `HistoryStatus`: `AVAILABLE_EXACT`, `UNSUPPORTED`, `TEMPORARILY_UNAVAILABLE`, or `INVALID`. Token fields support input, cached input, output, reasoning output, and total when exposed.
+
+`history_db.py` stores observations in a stdlib SQLite database at `$XDG_STATE_HOME/moira/history.sqlite3` (mode `0600`). Config and current-state JSON are unchanged. A transactional schema version (`schema_meta` table) guards future migrations. Quota changes are recorded immediately; otherwise at most one unchanged sample per service/quota per 15-minute bucket. Rows older than 90 days are purged after successful writes using an injected clock. Ordered read APIs cover 24h, 7d, 30d, and 90d with optional service/metric filters, plus a delete-all operation.
+
+History writes are integrated into refresh completion (`_record_history`) and run on the GTK thread with fast SQLite operations. History failure is caught and swallowed — quota state, display, and alerts remain operational. Only a sanitized diagnostic is produced. Missing token telemetry does not affect quota collection, display, alerts, or quota-history recording. No raw payloads, prompts, responses, transcript text, private paths, account identifiers, or secrets are stored.
+
+## Provider token capability matrix
+
+| Surface | Method/Source | Exact tokens? | Fields |
+|---|---|---|---|
+| Codex app-server | `account/rateLimits/read` | No | `usedPercent` (0–100), `resetsAt` (epoch), `windowDurationMins` |
+| Codex app-server | `account/usage/read` | Partial (aggregate) | `summary.lifetimeTokens`, `summary.peakDailyTokens`, `dailyUsageBuckets[].tokens` (no per-window input/output/cached/reasoning breakdown) |
+| Codex app-server | `thread/tokenUsage/updated` (notification) | Yes (turn-level) | `TokenUsageBreakdown`: `inputTokens`, `cachedInputTokens`, `outputTokens`, `reasoningOutputTokens`, `totalTokens`, `cacheWriteInputTokens` |
+| Claude status-line | `rate_limits` structure | No | `used_percentage` (0–100), `resets_at` (epoch/ISO) for `five_hour` and `seven_day` |
+| Claude CLI `--print --output-format json` | `usage` object | Yes (turn-level) | `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`, plus `server_tool_use`, `service_tier`, `cache_creation` sub-objects |
+
+Capability assessment (read-only probes, no message content read):
+- No structured surface currently provides exact per-window token counts alongside a matching quota window at refresh time. The Codex `account/usage/read` returns aggregate/lifetime tokens but not a per-window input/output breakdown. The Codex `thread/tokenUsage/updated` notification carries per-turn exact counts but is a per-thread event, not an account-wide refresh.
+- Claude's `--print --output-format json` exposes turn-level exact token counts but no per-window account quota token breakdown.
+- Therefore, `TokenObservation` records are stored as `UNSUPPORTED` until a future package wires a structured token surface. Quota history recording proceeds independently.
+
+Privacy decisions:
+- Only fresh AVAILABLE readings with percentage and reset_at are stored.
+- STALE, error, unavailable, and parse-error readings are never stored.
+- No raw payloads, prompts, responses, transcript text, private paths, account identifiers, or secrets are retained.
+- Token counts are never estimated or derived from percentages.

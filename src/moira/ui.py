@@ -404,9 +404,29 @@ class MainWindow(Adw.ApplicationWindow):
         self._next_refresh_time = time.monotonic() + self.settings.refresh_minutes * 60
         self.state.next_refresh = self._compute_next_refresh_str()
         save_state(self.state)
+        self._record_history(self.pending, now)
         self.refreshing = False
         self._render()
         return False
+
+    def _record_history(self, readings: list[QuotaReading], now: datetime) -> None:
+        """Record fresh quota observations into the local history database.
+
+        Runs on the GTK thread but uses only fast SQLite writes. History
+        failure must not disrupt quota state, display, or alerts. Only a
+        sanitized diagnostic is logged.
+        """
+        try:
+            from .history_db import _connect, init_schema, record_refresh
+
+            conn = _connect()
+            try:
+                init_schema(conn)
+                record_refresh(conn, readings, now=now)
+            finally:
+                conn.close()
+        except Exception:
+            pass
 
     def _compute_next_refresh_str(self) -> str:
         if self._next_refresh_time <= 0:
