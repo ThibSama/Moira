@@ -10,6 +10,10 @@ from moira.persistence import Settings
 NOW = datetime(2026, 8, 2, 12, tzinfo=UTC)
 RESET = NOW + timedelta(days=5)
 NEW_RESET = RESET + timedelta(days=7)
+# Real post-reset chronology: evaluation time is after the old reset
+OLD_RESET = NOW - timedelta(hours=1)
+AFTER_OLD_RESET = OLD_RESET + timedelta(hours=1)
+NEW_RESET_POST = OLD_RESET + timedelta(days=5)
 
 
 def reading(
@@ -287,24 +291,25 @@ def test_lower_thresholds_fire_normally_at_non_100_crossing() -> None:
 
 
 def test_recovery_after_new_window_deduplicated() -> None:
-    """Recovery when a new weekly window appears remains deduplicated."""
+    """Recovery when a new weekly window appears after the old reset has passed.
+    Uses realistic chronology: evaluation time is after the old reset_at."""
     settings = Settings(thresholds=[])
     sent: set[str] = set()
     first = evaluate_alerts(
-        [reading(pct=100, reset=RESET)],
-        [reading(pct=50, reset=NEW_RESET)],
+        [reading(pct=100, reset=OLD_RESET)],
+        [reading(pct=50, reset=NEW_RESET_POST)],
         settings,
         sent,
-        now=NOW,
+        now=AFTER_OLD_RESET,
     )
     sent.update(a.key for a in first)
     assert len(first) == 1
     second = evaluate_alerts(
-        [reading(pct=100, reset=RESET)],
-        [reading(pct=50, reset=NEW_RESET)],
+        [reading(pct=100, reset=OLD_RESET)],
+        [reading(pct=50, reset=NEW_RESET_POST)],
         settings,
         sent,
-        now=NOW,
+        now=AFTER_OLD_RESET,
     )
     assert len(second) == 0
 
@@ -348,3 +353,156 @@ def test_five_hour_100_pct_does_not_fire_exhaustion() -> None:
     )
     exh = [a for a in alerts if a.key.startswith("exhausted:")]
     assert len(exh) == 0
+
+
+# ── 0.2.2 regression: realistic post-reset recovery ──
+
+
+def test_real_post_reset_recovery_emits_one_event() -> None:
+    """Real chronology: the old weekly window reset 1 hour ago. The previous
+    reading was AVAILABLE weekly at 100% with that expired reset_at. The
+    current reading is AVAILABLE weekly at 50% with a new later reset.
+    Exactly one recovery event is emitted."""
+    settings = Settings(thresholds=[])
+    alerts = evaluate_alerts(
+        [reading(pct=100, reset=OLD_RESET)],
+        [reading(pct=50, reset=NEW_RESET_POST)],
+        settings,
+        set(),
+        now=AFTER_OLD_RESET,
+    )
+    rec = [a for a in alerts if a.key.startswith("recovered:")]
+    assert len(rec) == 1
+    # No exhaustion or reset alert for this transition
+    exh = [a for a in alerts if a.key.startswith("exhausted:")]
+    assert len(exh) == 0
+    resets = [a for a in alerts if a.key.startswith("reset:")]
+    assert len(resets) == 0
+
+
+def test_real_post_reset_recovery_deduplicated() -> None:
+    """The realistic post-reset recovery event is deduplicated per window."""
+    settings = Settings(thresholds=[])
+    sent: set[str] = set()
+    first = evaluate_alerts(
+        [reading(pct=100, reset=OLD_RESET)],
+        [reading(pct=50, reset=NEW_RESET_POST)],
+        settings,
+        sent,
+        now=AFTER_OLD_RESET,
+    )
+    sent.update(a.key for a in first)
+    assert len(first) == 1
+    second = evaluate_alerts(
+        [reading(pct=100, reset=OLD_RESET)],
+        [reading(pct=50, reset=NEW_RESET_POST)],
+        settings,
+        sent,
+        now=AFTER_OLD_RESET,
+    )
+    assert len(second) == 0
+
+
+def test_expired_100_prior_with_new_100_current_no_recovery() -> None:
+    """If the prior was exhausted and expired, but the current is still 100%
+    with a new reset, no recovery fires (no sub-100 fresh reading)."""
+    settings = Settings(thresholds=[])
+    alerts = evaluate_alerts(
+        [reading(pct=100, reset=OLD_RESET)],
+        [reading(pct=100, reset=NEW_RESET_POST)],
+        settings,
+        set(),
+        now=AFTER_OLD_RESET,
+    )
+    rec = [a for a in alerts if a.key.startswith("recovered:")]
+    assert len(rec) == 0
+
+
+# ── 0.2.2: was_weekly_exhausted domain rule ──
+
+
+def test_was_weekly_exhausted_available_100() -> None:
+    from moira.exhaustion import was_weekly_exhausted
+
+    assert was_weekly_exhausted(reading(pct=100, reset=RESET), now=NOW) is True
+
+
+def test_was_weekly_exhausted_expired_100() -> None:
+    """An expired 100% reading WAS exhausted at observation time."""
+    from moira.exhaustion import was_weekly_exhausted
+
+    past_reset = NOW - timedelta(hours=1)
+    assert was_weekly_exhausted(reading(pct=100, reset=past_reset), now=NOW) is True
+
+
+def test_was_weekly_exhausted_sub_100() -> None:
+    from moira.exhaustion import was_weekly_exhausted
+
+    assert was_weekly_exhausted(reading(pct=99), now=NOW) is False
+
+
+def test_was_weekly_exhausted_stale_100() -> None:
+    from moira.exhaustion import was_weekly_exhausted
+
+    assert was_weekly_exhausted(reading(pct=100, status=QuotaStatus.STALE), now=NOW) is False
+
+
+def test_was_weekly_exhausted_none() -> None:
+    from moira.exhaustion import was_weekly_exhausted
+
+    assert was_weekly_exhausted(None, now=NOW) is False
+
+
+def test_was_weekly_exhausted_five_hour() -> None:
+    """Five-hour readings must not be considered prior weekly exhaustion."""
+    from moira.exhaustion import was_weekly_exhausted
+
+    assert was_weekly_exhausted(reading(label="Five-hour", pct=100), now=NOW) is False
+
+
+def test_was_weekly_exhausted_error_reading() -> None:
+    from moira.exhaustion import was_weekly_exhausted
+
+    r = reading(pct=None, reset=None, status=QuotaStatus.ERROR)
+    assert was_weekly_exhausted(r, now=NOW) is False
+
+
+def test_was_weekly_exhausted_unavailable_reading() -> None:
+    from moira.exhaustion import was_weekly_exhausted
+
+    r = reading(pct=None, reset=None, status=QuotaStatus.UNAVAILABLE)
+    assert was_weekly_exhausted(r, now=NOW) is False
+
+
+def test_was_weekly_exhausted_parse_error_reading() -> None:
+    from moira.exhaustion import was_weekly_exhausted
+
+    r = reading(pct=None, reset=None, status=QuotaStatus.PARSE_ERROR)
+    assert was_weekly_exhausted(r, now=NOW) is False
+
+
+def test_was_weekly_exhausted_codex_service() -> None:
+    """Does not reject based on service — Codex prior exhaustion is valid."""
+    from moira.exhaustion import was_weekly_exhausted
+
+    r = reading(service=Service.CODEX, pct=100, reset=RESET)
+    assert was_weekly_exhausted(r, now=NOW) is True
+
+
+# ── 0.2.2: no duplicate recovery and reset for same transition ──
+
+
+def test_no_recovery_and_reset_for_same_transition() -> None:
+    """When a recovery fires, a reset alert must not also fire for the same transition."""
+    settings = Settings(thresholds=[], reset_alerts=True)
+    alerts = evaluate_alerts(
+        [reading(pct=100, reset=OLD_RESET)],
+        [reading(pct=50, reset=NEW_RESET_POST)],
+        settings,
+        set(),
+        now=AFTER_OLD_RESET,
+    )
+    rec = [a for a in alerts if a.key.startswith("recovered:")]
+    resets = [a for a in alerts if a.key.startswith("reset:")]
+    assert len(rec) == 1
+    assert len(resets) == 0

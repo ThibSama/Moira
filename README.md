@@ -33,7 +33,7 @@ Build and install the Debian package:
 
 ```sh
 ./scripts/build-deb.sh
-sudo apt install ./dist/moira_0.2.1_all.deb
+sudo apt install ./dist/moira_0.2.2_all.deb
 ```
 
 The package depends on Python 3, PyGObject, GTK4, Libadwaita, and libsecret GI. Run `moira` or launch **Moira** from the application menu. Install the same `.deb` on another PC and authenticate each provider CLI separately there.

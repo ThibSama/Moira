@@ -4,7 +4,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 
-from .exhaustion import is_weekly_exhausted
+from .exhaustion import is_weekly_exhausted, was_weekly_exhausted
 from .i18n import tr
 from .models import QuotaReading, QuotaStatus, Service
 from .ntfy import Notification
@@ -31,8 +31,8 @@ def _is_weekly(reading: QuotaReading) -> bool:
     return "week" in label or "seven" in label or "7" in label
 
 
-def _is_weekly_exhausted(reading: QuotaReading | None, *, now: datetime | None) -> bool:
-    """Canonical reset-aware exhaustion rule, scoped to weekly readings only."""
+def _currently_exhausted(reading: QuotaReading | None, *, now: datetime | None) -> bool:
+    """Canonical current-state exhaustion rule, scoped to weekly readings only."""
     if reading is None or not _is_weekly(reading):
         return False
     return is_weekly_exhausted(reading, now=now)
@@ -57,8 +57,8 @@ def evaluate_alerts(
             and reading.reset_at
         ):
             reset_key = reading.reset_at.isoformat()
-            exhausted = _is_weekly_exhausted(reading, now=now)
-            prior_exhausted = _is_weekly_exhausted(prior, now=now)
+            exhausted = _currently_exhausted(reading, now=now)
+            prior_exhausted = was_weekly_exhausted(prior, now=now)
             # Exhaustion/recovery events: dedup per service/window, independent from thresholds
             if exhausted:
                 exh_key = f"exhausted:{identity}:{reset_key}"
@@ -79,7 +79,12 @@ def evaluate_alerts(
                     )
                 # Fall through to threshold checks: lower thresholds still fire,
                 # only the generic 100% threshold is suppressed below.
-            elif prior_exhausted and not exhausted:
+            elif (
+                prior_exhausted
+                and not exhausted
+                and reading.percentage is not None
+                and reading.percentage < 100
+            ):
                 # Recovery: previously exhausted, now below 100% or reset
                 rec_key = f"recovered:{identity}:{reset_key}"
                 if rec_key not in sent_keys:

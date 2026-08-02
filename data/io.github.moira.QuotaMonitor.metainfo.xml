@@ -13,6 +13,11 @@
   <launchable type="desktop-id">io.github.moira.QuotaMonitor.desktop</launchable>
   <provides><binary>moira</binary></provides>
   <releases>
+    <release version="0.2.2" date="2026-08-02">
+      <description>
+        <p>Corrects post-reset recovery detection with a pure recovery-transition rule that distinguishes prior weekly exhaustion evidence from current non-exhausted state, enabling recovery events for real post-reset chronology.</p>
+      </description>
+    </release>
     <release version="0.2.1" date="2026-08-02">
       <description>
         <p>Preserves all valid refresh intervals during v1-to-v2 migration, unifies exhaustion semantics between UI and notifications with reset-aware canonical rule, suppresses only the duplicate generic 100% threshold alert, and corrects a French localization typo.</p>

@@ -86,7 +86,7 @@ class CodexCollector:
                 {
                     "id": 1,
                     "method": "initialize",
-                    "params": {"clientInfo": {"name": "moira", "version": "0.2.1"}},
+                    "params": {"clientInfo": {"name": "moira", "version": "0.2.2"}},
                 },
             )
             initialized = _read_response(process, 1, deadline)

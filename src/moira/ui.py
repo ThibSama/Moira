@@ -578,7 +578,7 @@ class MainWindow(Adw.ApplicationWindow):
         dialog = Adw.AboutDialog(
             application_name=_("Moira"),
             application_icon="io.github.moira.QuotaMonitor",
-            version="0.2.1",
+            version="0.2.2",
             developer_name="Moira contributors",
             license_type=Gtk.License.MIT_X11,
             comments=_("Claude and Codex quota monitor for Ubuntu"),

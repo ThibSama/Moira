@@ -55,6 +55,39 @@ def is_weekly_exhausted(
     return True
 
 
+def was_weekly_exhausted(
+    reading: QuotaReading | None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Return True iff a prior weekly reading constituted exhaustion at observation time.
+
+    This is the pure recovery-transition rule: it distinguishes prior evidence
+    that an old weekly window reached exhaustion from the current non-exhausted
+    state. Unlike is_weekly_exhausted (the canonical current-state rule),
+    this predicate does NOT check whether reset_at has passed. A reset that
+    has elapsed is exactly the recovery signal — the prior reading WAS
+    exhausted, and the current reading is NOT.
+
+    Requirements:
+      - reading must be an AVAILABLE weekly reading at >=100%
+      - STALE, error, parse-error, unavailable, sub-100, and five-hour
+        readings are rejected
+      - The optional now parameter is accepted for API symmetry but does
+        not affect the historical-evidence evaluation
+    """
+    if reading is None:
+        return False
+    if reading.status is not QuotaStatus.AVAILABLE:
+        return False
+    if reading.percentage is None or reading.percentage < 100:
+        return False
+    label = reading.quota_label.lower()
+    if "week" not in label and "seven" not in label and "7" not in label:
+        return False
+    return True
+
+
 def derive_service(
     service: Service,
     readings: list[QuotaReading],
