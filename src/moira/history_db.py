@@ -760,7 +760,15 @@ class HistoryCoordinator:
                         # status. The diagnostic is stored internally.
                         self._status = _DIAG_BACKLOG
                 # else: an older write completed — preserve current status
-                fire_callback = result.ok and self._write_success_callback is not None
+                # Publish writer success only when current enough: no callback
+                # from an older success while newer pending/replacement work
+                # or saturation exists.
+                fire_callback = (
+                    result.ok
+                    and self._write_success_callback is not None
+                    and gen >= self._saturation_gen
+                    and self._lifecycle == "running"
+                )
                 callback = self._write_success_callback
             # Fire write-success callback outside the lock
             if fire_callback and callback is not None:

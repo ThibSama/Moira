@@ -441,6 +441,7 @@ class MainWindow(Adw.ApplicationWindow):
         terminates before the join expires. Pending work is discarded
         with a sanitized status. Never blocks GTK for more than 3 seconds.
         """
+        self._history_page.shutdown()
         self._history_coordinator.shutdown()
         return False
 
@@ -454,15 +455,18 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._history_page.on_refresh_complete)
 
     def _on_stack_changed(self, *_: Any) -> None:
-        """Refresh History tab when it becomes visible."""
+        """Refresh History tab when it becomes visible; hide when not."""
         visible_child = self._stack.get_visible_child()
         if visible_child is not None:
-            # Check if the visible page is the history scroll
             page = visible_child
             if isinstance(page, Gtk.ScrolledWindow):
                 child = page.get_child()
                 if isinstance(child, HistoryPage):
                     child.on_visible()
+                else:
+                    self._history_page.on_hidden()
+            else:
+                self._history_page.on_hidden()
 
     def _compute_next_refresh_str(self) -> str:
         if self._next_refresh_time <= 0:

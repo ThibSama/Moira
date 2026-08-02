@@ -443,7 +443,12 @@ class HistoryReader:
         return _safe_read(db_path=db_path, **kwargs)
 
     def _on_done(self, future: Any) -> None:
-        """Callback when the read completes. Publishes only if newest."""
+        """Callback when the read completes. Publishes only if newest.
+
+        The request id is passed to the dispatcher so the GTK thread
+        can recheck at idle-dispatch time — cancelling after the worker
+        completed but before idle dispatch must still prevent delivery.
+        """
         try:
             result = future.result()
         except Exception:
@@ -459,14 +464,24 @@ class HistoryReader:
                 # Stale or cancelled — discard
                 self._maybe_submit_pending()
                 return
+            # Snapshot req_id for dispatch — recheck at dispatch time
+            dispatch_req_id = self._request_id
 
         if self._callback is not None:
             if self._dispatcher is not None:
-                self._dispatcher(self._callback, view)
+                self._dispatcher(self._callback, view, dispatch_req_id)
             else:
                 self._callback(view)
 
         self._maybe_submit_pending()
+
+    def is_current(self, req_id: int) -> bool:
+        """Return True if ``req_id`` matches the current request id.
+
+        Used by the GTK callback to recheck at idle-dispatch time.
+        """
+        with self._lock:
+            return not self._cancelled and req_id == self._request_id
 
     def cancel(self) -> None:
         """Cancel all pending and future reads. No callback will fire."""
