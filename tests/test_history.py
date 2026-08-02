@@ -1233,7 +1233,7 @@ def test_older_success_cannot_clear_saturation(tmp_path: Path) -> None:
         assert write_count[0] >= 2
     finally:
         history_db_module.write_history_safely = original
-        coord.shutdown(timeout=5.0)
+        coord.shutdown(timeout=3.0)
 
 
 def test_retained_failure_does_not_clear_saturation(tmp_path: Path) -> None:
@@ -1310,7 +1310,7 @@ def test_retained_failure_does_not_clear_saturation(tmp_path: Path) -> None:
         assert "sqlite3" not in coord.last_write_diagnostic.lower()
     finally:
         history_db_module.write_history_safely = original
-        coord.shutdown(timeout=5.0)
+        coord.shutdown(timeout=3.0)
 
 
 def test_later_successful_generation_clears_saturation(tmp_path: Path) -> None:
@@ -1378,7 +1378,7 @@ def test_later_successful_generation_clears_saturation(tmp_path: Path) -> None:
         assert coord.status == "ok"
     finally:
         history_db_module.write_history_safely = original
-        coord.shutdown(timeout=5.0)
+        coord.shutdown(timeout=3.0)
 
 
 def test_no_raw_diagnostic_leakage(tmp_path: Path) -> None:
@@ -1427,12 +1427,12 @@ def test_production_timeout_values_satisfy_invariant() -> None:
 
 
 def test_production_shutdown_terminates_blocked_worker(tmp_path: Path) -> None:
-    """With real SQLite and a locked database, the production coordinator
-    (db_timeout=1.0, shutdown_timeout=3.0) ensures the worker is not alive
-    when shutdown returns.
+    """Genuine locked-SQLite termination test.
 
-    The worker's SQLite write times out at 1.0s (db_timeout), well before
-    the 3.0s shutdown join. The captured thread is actually not alive.
+    The lock is held throughout shutdown. The worker's 1-second SQLite
+    timeout expires inside the 3-second join. The captured thread is
+    actually dead and _thread is None when shutdown returns. The lock
+    is released only after assertions.
     """
     db_path = tmp_path / "history.sqlite3"
     lock_conn = _connect(db_path)
@@ -1445,7 +1445,7 @@ def test_production_shutdown_terminates_blocked_worker(tmp_path: Path) -> None:
     # Enqueue so the worker starts a write and blocks on the lock
     coord.enqueue([_reading(pct=50.0)], now=NOW)
 
-    # Wait for the worker to be in-flight
+    # Wait for the worker to be in-flight (blocked on the lock)
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         with coord._cond:  # noqa: SLF001
@@ -1454,18 +1454,28 @@ def test_production_shutdown_terminates_blocked_worker(tmp_path: Path) -> None:
         time.sleep(0.05)
     assert coord._in_flight is not None  # noqa: SLF001
 
-    # Release the lock so the SQLite write can proceed once unlocked
-    lock_conn.execute("ROLLBACK")
-    lock_conn.close()
+    # Capture the thread before shutdown
+    with coord._cond:  # noqa: SLF001
+        thread = coord._thread  # noqa: SLF001
+    assert thread is not None
 
-    # Shutdown — the worker should terminate within the 3s join
+    # Call shutdown while the lock is STILL HELD.
+    # The worker's SQLite write times out at 1.0s, then the worker exits.
+    # The 3.0s join waits for that to happen.
     start = time.monotonic()
     coord.shutdown()
     elapsed = time.monotonic() - start
     assert elapsed < 4.0
 
-    # The thread is not alive and the reference is cleared
+    # The captured thread is actually dead
+    assert not thread.is_alive()
+    # And the coordinator cleared its reference
     assert coord._thread is None  # noqa: SLF001
+    assert coord.lifecycle_state == "terminated"
+
+    # Release the lock ONLY after assertions
+    lock_conn.execute("ROLLBACK")
+    lock_conn.close()
 
 
 def test_repeated_shutdown_and_post_shutdown_enqueue(tmp_path: Path) -> None:
@@ -1523,3 +1533,140 @@ def test_worker_wakes_on_notification_not_polling(tmp_path: Path) -> None:
     finally:
         history_db_module.write_history_safely = original
         coord.shutdown(timeout=3.0)
+
+
+# ── 1f: Lifecycle contract tests ──
+
+
+def test_no_argument_construction_succeeds() -> None:
+    """HistoryCoordinator() with no arguments must not raise."""
+    coord = HistoryCoordinator()
+    assert coord._db_timeout == 1.0  # noqa: SLF001
+    assert coord._shutdown_timeout == 3.0  # noqa: SLF001
+    assert coord.lifecycle_state == "new"
+
+
+def test_invalid_constructor_values_fail_closed() -> None:
+    """Invalid timeout relationships are rejected at construction."""
+    with pytest.raises(ValueError):
+        HistoryCoordinator(db_timeout=5.0, shutdown_timeout=3.0)
+    with pytest.raises(ValueError):
+        HistoryCoordinator(db_timeout=3.0, shutdown_timeout=3.0)
+    with pytest.raises(ValueError):
+        HistoryCoordinator(db_timeout=0.0, shutdown_timeout=3.0)
+    with pytest.raises(ValueError):
+        HistoryCoordinator(db_timeout=-1.0, shutdown_timeout=3.0)
+
+
+def test_enqueue_before_start_then_shutdown_rejects_later_work(tmp_path: Path) -> None:
+    """Enqueue before start places a batch in pending. Shutdown-before-start
+    transitions to TERMINATED and rejects later enqueues."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+
+    # Enqueue before start — accepted in NEW state
+    assert coord.enqueue([_reading(pct=50.0)], now=NOW)
+    assert coord.lifecycle_state == "new"
+
+    # Shutdown before start — terminates immediately
+    coord.shutdown()
+    assert coord.lifecycle_state == "terminated"
+
+    # Post-shutdown enqueue is rejected
+    assert coord.enqueue([_reading(pct=60.0)], now=NOW) is False
+
+
+def test_pending_before_start_disposal_yields_sanitized_status(tmp_path: Path) -> None:
+    """Pending work disposed during shutdown-before-start yields only a
+    sanitized 'backlog saturated' status."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+
+    # Enqueue two batches before start — second replaces first, saturates
+    assert coord.enqueue([_reading(pct=50.0)], now=NOW)
+    assert coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1)) is False
+    assert coord.status == "backlog saturated"
+
+    # Shutdown before start — disposes pending, preserves saturation
+    coord.shutdown()
+    assert coord.lifecycle_state == "terminated"
+    assert coord.status == "backlog saturated"
+    # No raw exception text in the status
+    assert "sqlite3" not in coord.status.lower()
+    assert "traceback" not in coord.status.lower()
+
+
+def test_shutdown_before_start_is_idempotent(tmp_path: Path) -> None:
+    """Shutdown before start is idempotent."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+    coord.shutdown()
+    assert coord.lifecycle_state == "terminated"
+    coord.shutdown()
+    assert coord.lifecycle_state == "terminated"
+    coord.shutdown()
+    assert coord.lifecycle_state == "terminated"
+
+
+def test_post_terminal_start_is_noop(tmp_path: Path) -> None:
+    """After terminal shutdown, start() is a documented no-op (restart rejected).
+    Does not create a thread."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+    coord.shutdown()
+    assert coord.lifecycle_state == "terminated"
+    coord.start()  # No-op
+    assert coord.lifecycle_state == "terminated"
+    assert coord._thread is None  # noqa: SLF001
+
+
+def test_shutdown_timeout_override_below_db_timeout_rejected(tmp_path: Path) -> None:
+    """An override <= db_timeout is rejected before mutating lifecycle state."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+    coord.start()
+
+    # Override at db_timeout — rejected
+    with pytest.raises(ValueError, match="shutdown timeout"):
+        coord.shutdown(timeout=1.0)
+    # Lifecycle must NOT have changed
+    assert coord.lifecycle_state == "running"
+
+    # Override below db_timeout — rejected
+    with pytest.raises(ValueError, match="shutdown timeout"):
+        coord.shutdown(timeout=0.5)
+    assert coord.lifecycle_state == "running"
+
+    # Override above shutdown_timeout — rejected
+    with pytest.raises(ValueError, match="shutdown timeout"):
+        coord.shutdown(timeout=5.0)
+    assert coord.lifecycle_state == "running"
+
+    # Now shutdown with valid default
+    coord.shutdown()
+    assert coord.lifecycle_state == "terminated"
+
+
+def test_shutdown_timeout_override_at_constructor_value_accepted(tmp_path: Path) -> None:
+    """An override equal to the constructor's shutdown_timeout is accepted."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+    coord.start()
+    coord.shutdown(timeout=3.0)
+    assert coord.lifecycle_state == "terminated"
+
+
+def test_lifecycle_new_state_before_start(tmp_path: Path) -> None:
+    """A freshly constructed coordinator is in the NEW state."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+    assert coord.lifecycle_state == "new"
+
+
+def test_lifecycle_running_after_start(tmp_path: Path) -> None:
+    """After start(), the coordinator is in RUNNING state."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+    coord.start()
+    assert coord.lifecycle_state == "running"
+    coord.shutdown()
+
+
+def test_lifecycle_terminated_after_shutdown(tmp_path: Path) -> None:
+    """After shutdown, the coordinator is in TERMINATED state."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+    coord.start()
+    coord.shutdown()
+    assert coord.lifecycle_state == "terminated"

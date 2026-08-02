@@ -221,7 +221,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._last_focus_time: float = 0.0
         self._focus_debounce_seconds = 2.0
         self._next_refresh_time: float = 0.0
-        self._history_coordinator = HistoryCoordinator(db_timeout=1.0, shutdown_timeout=3.0)
+        self._history_coordinator = HistoryCoordinator()
         self._history_coordinator.start()
         self._build()
         self._render()

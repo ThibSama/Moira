@@ -590,30 +590,39 @@ class HistoryCoordinator:
     saturation. Only successful completion of the retained generation,
     or a later successful generation, may clear the saturation latch.
 
-    Shutdown is idempotent: rejects new work, signals the worker via
-    the condition, and joins with a bounded timeout. The constructor
-    validates ``db_timeout < shutdown_timeout`` so a locked SQLite write
-    cannot outlive the join. ``_thread`` is never set to None while the
-    captured thread is still alive.
+    Lifecycle states (all transitions under the Condition):
+      - NEW: constructed but not started. enqueue() is accepted;
+        shutdown() atomically rejects future work and disposes pending.
+      - RUNNING: worker thread is active. Normal operation.
+      - SHUTTING_DOWN: shutdown() called while running. New work rejected;
+        worker drains or times out.
+      - TERMINATED: worker has exited or shutdown-before-start completed.
+        start() is a documented no-op (restart is rejected). enqueue()
+        returns False. shutdown() is idempotent.
+
+    Defaults: ``db_timeout=1.0``, ``shutdown_timeout=3.0`` (2-second margin).
+    The constructor validates ``0 < db_timeout < shutdown_timeout``.
+    ``shutdown(timeout=...)`` validates the effective timeout against
+    ``db_timeout`` before mutating lifecycle state. ``_thread`` is never
+    set to None while the captured thread is still alive.
     """
 
     def __init__(
         self,
         *,
         db_path: Path | None = None,
-        db_timeout: float = 5.0,
-        shutdown_timeout: float = 2.0,
+        db_timeout: float = 1.0,
+        shutdown_timeout: float = 3.0,
     ) -> None:
-        if db_timeout >= shutdown_timeout:
+        if not (0 < db_timeout < shutdown_timeout):
             raise ValueError(
-                f"db_timeout ({db_timeout}) must be strictly less than "
-                f"shutdown_timeout ({shutdown_timeout})"
+                f"db_timeout ({db_timeout}) must be strictly positive and "
+                f"strictly less than shutdown_timeout ({shutdown_timeout})"
             )
         self._db_path = db_path or history_path()
         self._db_timeout = db_timeout
         self._shutdown_timeout = shutdown_timeout
         self._cond = threading.Condition()
-        self._shutdown = False
         self._thread: threading.Thread | None = None
         self._in_flight: list[Any] | None = None
         self._in_flight_gen: int = 0
@@ -624,7 +633,8 @@ class HistoryCoordinator:
         self._saturation_gen: int = 0
         self._status = _DIAG_OK
         self._last_write_diagnostic = _DIAG_OK
-        self._started = False
+        # Lifecycle: "new", "running", "shutting_down", "terminated"
+        self._lifecycle = "new"
 
     @property
     def status(self) -> str:
@@ -648,12 +658,22 @@ class HistoryCoordinator:
         with self._cond:
             return self._last_write_diagnostic
 
-    def start(self) -> None:
-        """Start the worker thread if not already running."""
+    @property
+    def lifecycle_state(self) -> str:
+        """Return the current lifecycle state string."""
         with self._cond:
-            if self._started:
+            return self._lifecycle
+
+    def start(self) -> None:
+        """Start the worker thread if in the NEW state.
+
+        After terminal shutdown, start() is a no-op (restart is rejected).
+        Does not create an immediately dying untracked thread.
+        """
+        with self._cond:
+            if self._lifecycle != "new":
                 return
-            self._started = True
+            self._lifecycle = "running"
             self._thread = threading.Thread(target=self._run, name="moira-history", daemon=True)
             self._thread.start()
 
@@ -665,10 +685,12 @@ class HistoryCoordinator:
         is empty). Returns False (and latches ``backlog saturated``) only
         when the pending slot was already occupied — the newest batch
         replaces the older one. Never blocks.
+
+        After shutdown (from any state), returns False.
         """
         snapshot = list(readings)
         with self._cond:
-            if self._shutdown:
+            if self._lifecycle in ("shutting_down", "terminated"):
                 return False
             if self._pending is not None:
                 # Pending slot occupied — newest-wins, report saturation
@@ -692,9 +714,9 @@ class HistoryCoordinator:
         """Worker loop: drain pending batches until shutdown."""
         while True:
             with self._cond:
-                while self._pending is None and not self._shutdown:
+                while self._pending is None and self._lifecycle == "running":
                     self._cond.wait()
-                if self._shutdown:
+                if self._lifecycle in ("shutting_down", "terminated"):
                     return
                 # Pick up the pending batch atomically — no race window
                 batch = self._pending
@@ -732,17 +754,37 @@ class HistoryCoordinator:
     def shutdown(self, *, timeout: float | None = None) -> None:
         """Idempotent shutdown.
 
-        Rejects new work immediately. Signals the worker via the condition.
-        Joins with a bounded timeout (defaults to the constructor's
-        ``shutdown_timeout``). Pending work is discarded with
-        ``backlog saturated``. ``_thread`` is never set to None while the
-        captured thread is still alive.
+        Validates the effective timeout before mutating lifecycle state.
+        From NEW: atomically transitions to TERMINATED, rejects future work,
+        and disposes pending with the saturation policy. From RUNNING:
+        transitions to SHUTTING_DOWN, signals the worker, and joins.
+        ``_thread`` is never set to None while the captured thread is
+        still alive. From TERMINATED: no-op.
         """
         join_timeout = timeout if timeout is not None else self._shutdown_timeout
+        if not (0 < join_timeout <= self._shutdown_timeout) or join_timeout <= self._db_timeout:
+            raise ValueError(
+                f"shutdown timeout ({join_timeout}) must be positive, at most "
+                f"shutdown_timeout ({self._shutdown_timeout}), and strictly "
+                f"greater than db_timeout ({self._db_timeout})"
+            )
         with self._cond:
-            if not self._started:
+            if self._lifecycle == "terminated":
                 return
-            self._shutdown = True
+            if self._lifecycle == "new":
+                # Shutdown before start — terminate immediately
+                if self._pending is not None:
+                    if self._saturation_gen < self._pending_gen:
+                        self._saturation_gen = self._pending_gen
+                    if self._saturation_gen > 0:
+                        self._status = _DIAG_BACKLOG
+                self._pending = None
+                self._pending_time = None
+                self._pending_gen = 0
+                self._lifecycle = "terminated"
+                return
+            # RUNNING → SHUTTING_DOWN
+            self._lifecycle = "shutting_down"
             if self._pending is not None:
                 if self._saturation_gen < self._pending_gen:
                     self._saturation_gen = self._pending_gen
@@ -760,4 +802,4 @@ class HistoryCoordinator:
                 return
         with self._cond:
             self._thread = None
-            self._started = False
+            self._lifecycle = "terminated"
