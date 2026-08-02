@@ -46,7 +46,7 @@ def history_path() -> Path:
     return state_dir() / "history.sqlite3"
 
 
-def _connect(path: Path | None = None) -> sqlite3.Connection:
+def _connect(path: Path | None = None, *, timeout: float = 5.0) -> sqlite3.Connection:
     """Open a SQLite connection, creating the database with mode 0600."""
     db_path = path or history_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,7 +57,7 @@ def _connect(path: Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(
         str(db_path),
         isolation_level=None,  # autocommit; we manage transactions explicitly
-        timeout=5.0,
+        timeout=timeout,
     )
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -543,6 +543,7 @@ def write_history_safely(
     *,
     now: datetime | None = None,
     db_path: Path | None = None,
+    db_timeout: float = 5.0,
 ) -> HistoryWriteResult:
     """Write quota observations to the history database and return a sanitized result.
 
@@ -553,7 +554,7 @@ def write_history_safely(
     """
     clock = now or datetime.now(UTC)
     try:
-        conn = _connect(db_path)
+        conn = _connect(db_path, timeout=db_timeout)
         try:
             init_schema(conn)
             record_refresh(conn, readings, now=clock)
@@ -571,106 +572,159 @@ def write_history_safely(
 
 
 class HistoryCoordinator:
-    """Bounded, testable coordinator for off-thread history writes.
+    """Bounded, testable, race-free coordinator for off-thread history writes.
 
-    Encapsulates a single-worker queue with documented overflow policy:
-    when the queue (maxsize=1) is full, the newest pending batch replaces
-    the queued batch (newest-wins). A sanitized ``backlog saturated``
-    status is set whenever any batch is discarded, and cleared only after
-    a later successful write.
+    All shared state is guarded by a single ``Condition`` so that enqueue,
+    worker pickup, in-flight completion, and shutdown are mutually exclusive.
+    State tracked explicitly:
+      - one optional in-flight batch + its generation;
+      - one optional pending batch + its generation;
+      - shutdown state;
+      - monotonically increasing generation counter;
+      - the generation that must succeed before a saturation latch clears.
 
-    Shutdown is idempotent: rejects new work, signals the worker via its
-    stop event and None sentinel, and joins with a bounded timeout that
-    never exceeds the SQLite five-second lock. The worker is a daemon
-    thread so it never blocks process exit.
+    Overflow policy (newest-wins): when the pending slot is occupied or
+    the worker is in-flight, a second enqueue replaces the pending batch
+    with the newest, returns False, and latches ``backlog saturated``.
+    Saturation is cleared only when the retained newest generation has
+    completed successfully.
+
+    Shutdown is idempotent: rejects new work immediately, signals the
+    worker via the condition, and joins with a bounded timeout. The SQLite
+    write timeout is parameterized below the join bound so the worker
+    never blocks longer than the join. ``_thread`` is never set to None
+    while the captured thread is still alive.
     """
 
-    def __init__(self, *, db_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        db_path: Path | None = None,
+        db_timeout: float = 5.0,
+    ) -> None:
         self._db_path = db_path or history_path()
-        self._stop = threading.Event()
+        self._db_timeout = db_timeout
+        self._cond = threading.Condition()
+        self._shutdown = False
         self._thread: threading.Thread | None = None
+        self._in_flight: list[Any] | None = None
+        self._in_flight_gen: int = 0
         self._pending: list[Any] | None = None
         self._pending_time: datetime | None = None
-        self._pending_lock = threading.Lock()
-        self._busy = False
+        self._pending_gen: int = 0
+        self._generation = 0
+        self._saturation_gen: int = 0
         self._status = _DIAG_OK
         self._started = False
 
     @property
     def status(self) -> str:
         """Return the current sanitized history status string."""
-        return self._status
+        with self._cond:
+            return self._status
 
     def start(self) -> None:
         """Start the worker thread if not already running."""
-        if self._started:
-            return
-        self._started = True
-        self._thread = threading.Thread(target=self._run, name="moira-history", daemon=True)
-        self._thread.start()
+        with self._cond:
+            if self._started:
+                return
+            self._started = True
+            self._thread = threading.Thread(target=self._run, name="moira-history", daemon=True)
+            self._thread.start()
 
     def enqueue(self, readings: list[Any], now: datetime) -> bool:
         """Submit a batch for asynchronous writing.
 
-        Returns True if the batch was accepted. Returns False (and sets
-        ``backlog saturated``) if the worker was busy and the queue was
-        full. The newest batch is retained as pending and replaces any
-        older pending batch. Never blocks.
+        Returns True if the batch was accepted as the first pending entry.
+        Returns False (and latches ``backlog saturated``) if the pending
+        slot was already occupied (the worker may or may not have picked
+        it up yet). The newest batch replaces any older pending batch.
+        Never blocks.
         """
-        if self._stop.is_set():
-            return False
         snapshot = list(readings)
-        with self._pending_lock:
-            if self._busy:
-                # Worker is still busy — replace the pending batch with
-                # the newest (newest-wins policy), report saturation.
+        with self._cond:
+            if self._shutdown:
+                return False
+            if self._pending is not None or self._in_flight is not None:
+                # Pending slot occupied or worker in-flight — newest-wins
+                self._generation += 1
                 self._pending = snapshot
                 self._pending_time = now
+                self._pending_gen = self._generation
+                if self._saturation_gen < self._generation:
+                    self._saturation_gen = self._generation
                 self._status = _DIAG_BACKLOG
+                self._cond.notify_all()
                 return False
+            # First pending batch — accepted without saturation
+            self._generation += 1
             self._pending = snapshot
             self._pending_time = now
-        return True
+            self._pending_gen = self._generation
+            self._cond.notify_all()
+            return True
 
     def _run(self) -> None:
         """Worker loop: drain pending batches until shutdown."""
-        while not self._stop.is_set():
-            batch, when = self._take_pending()
-            if batch is None:
-                self._stop.wait(timeout=0.5)
-                continue
-            with self._pending_lock:
-                self._busy = True
-            result = write_history_safely(batch, now=when, db_path=self._db_path)
-            self._status = result.diagnostic
-            with self._pending_lock:
-                self._busy = False
-
-    def _take_pending(self) -> tuple[list[Any] | None, datetime | None]:
-        with self._pending_lock:
-            batch = self._pending
-            when = self._pending_time
-            self._pending = None
-            self._pending_time = None
-        return batch, when
+        while True:
+            with self._cond:
+                while self._pending is None and not self._shutdown:
+                    self._cond.wait(timeout=1.0)
+                if self._shutdown:
+                    return
+                # Pick up the pending batch atomically — no race window
+                batch = self._pending
+                when = self._pending_time
+                gen = self._pending_gen
+                self._pending = None
+                self._pending_time = None
+                self._in_flight = batch
+                self._in_flight_gen = gen
+            # batch is guaranteed non-None here (checked by the while loop)
+            assert batch is not None and when is not None
+            # Write outside the lock so enqueue can still proceed
+            result = write_history_safely(
+                batch, now=when, db_path=self._db_path, db_timeout=self._db_timeout
+            )
+            with self._cond:
+                self._in_flight = None
+                self._in_flight_gen = 0
+                # Only clear saturation if this generation is at or past
+                # the saturation generation. An older write must not clear
+                # saturation latched by a newer enqueue.
+                if gen >= self._saturation_gen:
+                    if result.ok:
+                        self._status = _DIAG_OK
+                        self._saturation_gen = 0
+                    else:
+                        self._status = result.diagnostic
+                # else: an older write completed — preserve current status
 
     def shutdown(self, *, timeout: float = 2.0) -> None:
-        """Idempotent shutdown. Rejects new work, signals the worker,
-        and joins with a bounded timeout. Never blocks longer than
-        ``timeout`` seconds (well under the SQLite five-second lock).
+        """Idempotent shutdown.
 
-        Pending work is discarded with a ``backlog saturated`` status.
+        Rejects new work immediately. Signals the worker via the condition.
+        Joins with a bounded timeout that never exceeds the SQLite write
+        timeout. Pending work is discarded with ``backlog saturated``.
+        ``_thread`` is never set to None while the captured thread is
+        still alive.
         """
-        if not self._started:
-            return
-        self._stop.set()
-        # Discard any pending batch
-        with self._pending_lock:
+        with self._cond:
+            if not self._started:
+                return
+            self._shutdown = True
             if self._pending is not None:
                 self._status = _DIAG_BACKLOG
             self._pending = None
             self._pending_time = None
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
+            self._pending_gen = 0
+            self._cond.notify_all()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                # Do not clear _thread while it is still alive
+                return
+        with self._cond:
             self._thread = None
-        self._started = False
+            self._started = False
