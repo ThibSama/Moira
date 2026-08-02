@@ -221,7 +221,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._last_focus_time: float = 0.0
         self._focus_debounce_seconds = 2.0
         self._next_refresh_time: float = 0.0
-        self._history_coordinator = HistoryCoordinator()
+        self._history_coordinator = HistoryCoordinator(db_timeout=1.0, shutdown_timeout=3.0)
         self._history_coordinator.start()
         self._build()
         self._render()
@@ -426,9 +426,10 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_close_request(self, *_: Any) -> bool:
         """Stop the history worker cleanly on window close.
 
-        The coordinator shutdown is bounded (joins with a 2-second timeout)
-        and never blocks GTK for the SQLite five-second lock. Pending work
-        is discarded with a sanitized status.
+        The coordinator shutdown is bounded (joins with a 3-second timeout,
+        strictly above the 1-second SQLite write timeout) so the worker
+        terminates before the join expires. Pending work is discarded
+        with a sanitized status. Never blocks GTK for more than 3 seconds.
         """
         self._history_coordinator.shutdown()
         return False

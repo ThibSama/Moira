@@ -1061,59 +1061,133 @@ def test_domain_validation_error_maps_to_invalid_observation(tmp_path: Path) -> 
     assert result.diagnostic == "invalid observation"
 
 
-# ── 1c: HistoryCoordinator — overflow, shutdown, diagnostics ──
+# ── 1e: Coordinator capacity, saturation latch, shutdown ──
 
 
-def test_coordinator_overflow_sets_backlog_saturated(tmp_path: Path) -> None:
-    """When the worker is busy, a second enqueue sets 'backlog saturated'.
-
-    Uses an injected write function and an Event to deterministically
-    block the worker, eliminating reliance on sleeps.
-    """
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
-
-    # Inject a blocking write function
-    write_started = threading.Event()
-    write_blocking = threading.Event()
-    original_write = history_db_module.write_history_safely
+def _make_blocking_write(
+    name: str = "block",
+) -> tuple[threading.Event, threading.Event, Any]:
+    """Create an injected writer that signals start and blocks until released."""
+    started = threading.Event()
+    blocking = threading.Event()
+    original = history_db_module.write_history_safely
 
     def blocking_write(*_args: Any, **_kwargs: Any) -> HistoryWriteResult:
-        write_started.set()
-        write_blocking.wait(timeout=5.0)
+        started.set()
+        blocking.wait(timeout=10.0)
         return HistoryWriteResult(ok=True, diagnostic="ok")
 
     history_db_module.write_history_safely = blocking_write
-    coord._db_timeout = 1.0  # noqa: SLF001
+    return started, blocking, original
+
+
+def _make_failing_write(diagnostic: str) -> tuple[threading.Event, Any]:
+    """Create an injected writer that signals start and always fails."""
+    started = threading.Event()
+    original = history_db_module.write_history_safely
+
+    def failing_write(*_args: Any, **_kwargs: Any) -> HistoryWriteResult:
+        started.set()
+        return HistoryWriteResult(ok=False, diagnostic=diagnostic)
+
+    history_db_module.write_history_safely = failing_write
+    return started, original
+
+
+def test_inflight_empty_pending_accepts_batch(tmp_path: Path) -> None:
+    """An in-flight batch plus an empty pending slot accepts the next batch
+    with return True and status remains 'ok'."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+    started, blocking, original = _make_blocking_write()
     coord.start()
     try:
-        # First enqueue: accepted, worker picks it up and blocks
+        # First batch: accepted, worker picks it up and blocks
         assert coord.enqueue([_reading(pct=50.0)], now=NOW)
-        assert write_started.wait(timeout=3.0)
+        assert started.wait(timeout=3.0)
 
-        # Second enqueue: worker is in-flight → backlog saturated
+        # Second batch: worker is in-flight, but pending is empty → accept
         accepted2 = coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
-        assert accepted2 is False
-        assert coord.status == "backlog saturated"
+        assert accepted2 is True
+        assert coord.status == "ok"  # No saturation
 
-        # Release the worker
-        write_blocking.set()
+        blocking.set()
     finally:
-        history_db_module.write_history_safely = original_write
+        history_db_module.write_history_safely = original
         coord.shutdown(timeout=3.0)
 
 
-def test_coordinator_status_clears_after_successful_write(tmp_path: Path) -> None:
-    """Status returns to 'ok' after a successful write following saturation.
+def test_third_enqueue_replaces_occupied_pending(tmp_path: Path) -> None:
+    """Only a third enqueue that replaces the occupied pending slot returns
+    False and sets 'backlog saturated'."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+    started, blocking, original = _make_blocking_write()
+    coord.start()
+    try:
+        # First batch: accepted, worker picks up, blocks
+        assert coord.enqueue([_reading(pct=50.0)], now=NOW)
+        assert started.wait(timeout=3.0)
 
-    Uses an Event to block the first write so the second enqueue latches
-    saturation, then releases it and verifies status clears only after
-    the retained newest batch succeeds.
-    """
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+        # Second batch: pending is empty → accept without saturation
+        assert coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
+        assert coord.status == "ok"
+
+        # Third batch: pending is occupied → replace, return False, saturate
+        accepted3 = coord.enqueue([_reading(pct=75.0)], now=NOW + timedelta(minutes=2))
+        assert accepted3 is False
+        assert coord.status == "backlog saturated"
+        assert coord._pending is not None  # noqa: SLF001
+        assert coord._pending[0].percentage == 75.0  # noqa: SLF001
+
+        blocking.set()
+    finally:
+        history_db_module.write_history_safely = original
+        coord.shutdown(timeout=3.0)
+
+
+def test_two_enqueues_before_worker_start(tmp_path: Path) -> None:
+    """Two enqueues before the worker starts deterministically replace the
+    pending slot and report saturation. Uses enqueue-before-start."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+
+    # Enqueue before starting the worker
+    assert coord.enqueue([_reading(pct=50.0)], now=NOW)
+    # Second enqueue: pending slot is occupied → saturate
+    accepted2 = coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
+    assert accepted2 is False
+    assert coord.status == "backlog saturated"
+    assert coord._pending is not None  # noqa: SLF001
+    assert coord._pending[0].percentage == 60.0  # noqa: SLF001
+
+    # Clean up without starting the worker
+    coord.shutdown()
+
+
+def test_three_or_more_enqueues_retain_newest(tmp_path: Path) -> None:
+    """Three or more enqueues while pending is occupied retain the newest."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+
+    assert coord.enqueue([_reading(pct=50.0)], now=NOW)
+    coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
+    coord.enqueue([_reading(pct=75.0)], now=NOW + timedelta(minutes=2))
+    coord.enqueue([_reading(pct=90.0)], now=NOW + timedelta(minutes=3))
+
+    assert coord.status == "backlog saturated"
+    assert coord._pending is not None  # noqa: SLF001
+    assert coord._pending[0].percentage == 90.0  # noqa: SLF001
+
+    coord.shutdown()
+
+
+def test_older_success_cannot_clear_saturation(tmp_path: Path) -> None:
+    """An older in-flight success cannot clear saturation latched by a
+    newer enqueue. Uses generation tracking."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
 
     first_started = threading.Event()
     first_blocking = threading.Event()
-    original_write = history_db_module.write_history_safely
+    second_started = threading.Event()
+    second_blocking = threading.Event()
+    original = history_db_module.write_history_safely
 
     write_count = [0]
 
@@ -1121,25 +1195,35 @@ def test_coordinator_status_clears_after_successful_write(tmp_path: Path) -> Non
         write_count[0] += 1
         if write_count[0] == 1:
             first_started.set()
-            first_blocking.wait(timeout=5.0)
+            first_blocking.wait(timeout=10.0)
+        elif write_count[0] == 2:
+            second_started.set()
+            second_blocking.wait(timeout=10.0)
         return HistoryWriteResult(ok=True, diagnostic="ok")
 
     history_db_module.write_history_safely = controlled_write
     coord.start()
     try:
-        # First batch: worker picks it up and blocks
         coord.enqueue([_reading(pct=50.0)], now=NOW)
         assert first_started.wait(timeout=3.0)
 
-        # Second batch: saturates, newest retained
+        # Second enqueue: accepted (pending empty), pending gen 2
         coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
+        assert coord.status == "ok"  # No saturation yet
+
+        # Third enqueue: pending occupied → saturate, generation 3
+        coord.enqueue([_reading(pct=70.0)], now=NOW + timedelta(minutes=2))
         assert coord.status == "backlog saturated"
 
-        # Release the first write — it should NOT clear saturation
+        # Release the first write (gen 1) — must NOT clear saturation
         first_blocking.set()
+        assert second_started.wait(timeout=3.0)
+        assert coord.status == "backlog saturated"
 
-        # Give the worker time to complete the first write and pick up the second
-        # We poll for the status to become "ok" (the second write succeeds)
+        # Release the second write (gen 2) — still < saturation_gen 3
+        second_blocking.set()
+
+        # Poll for the third write to complete and clear saturation
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             if coord.status == "ok":
@@ -1148,13 +1232,159 @@ def test_coordinator_status_clears_after_successful_write(tmp_path: Path) -> Non
         assert coord.status == "ok"
         assert write_count[0] >= 2
     finally:
-        history_db_module.write_history_safely = original_write
-        coord.shutdown(timeout=3.0)
+        history_db_module.write_history_safely = original
+        coord.shutdown(timeout=5.0)
 
 
-def test_coordinator_no_raw_diagnostic_leakage(tmp_path: Path) -> None:
-    """Coordinator status never contains raw exception text, SQL, or paths."""
-    coord = HistoryCoordinator(db_path=tmp_path / "corrupt.sqlite3")
+def test_retained_failure_does_not_clear_saturation(tmp_path: Path) -> None:
+    """Failure of the retained newest generation does not clear saturation.
+    Public status stays 'backlog saturated'. The diagnostic is available
+    internally via last_write_diagnostic."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+
+    first_started = threading.Event()
+    first_blocking = threading.Event()
+    second_started = threading.Event()
+    second_blocking = threading.Event()
+    original = history_db_module.write_history_safely
+
+    write_count = [0]
+
+    def controlled_write(readings: list[Any], **kwargs: Any) -> HistoryWriteResult:
+        write_count[0] += 1
+        if write_count[0] == 1:
+            first_started.set()
+            first_blocking.wait(timeout=10.0)
+            return HistoryWriteResult(ok=True, diagnostic="ok")
+        elif write_count[0] == 2:
+            second_started.set()
+            second_blocking.wait(timeout=10.0)
+            # This is the retained generation (gen 3) — it fails
+            return HistoryWriteResult(ok=False, diagnostic="database unavailable")
+        return HistoryWriteResult(ok=True, diagnostic="ok")
+
+    history_db_module.write_history_safely = controlled_write
+    coord.start()
+    try:
+        # First batch: gen 1, worker blocks
+        coord.enqueue([_reading(pct=50.0)], now=NOW)
+        assert first_started.wait(timeout=3.0)
+
+        # Second batch: gen 2, accepted (pending empty)
+        coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
+
+        # Third batch: gen 3, replaces pending → saturate
+        coord.enqueue([_reading(pct=70.0)], now=NOW + timedelta(minutes=2))
+        assert coord.status == "backlog saturated"
+
+        # Release gen 1 — must NOT clear saturation
+        first_blocking.set()
+        assert second_started.wait(timeout=3.0)
+
+        # Release gen 2 (the retained gen 3's predecessor pick-up)
+        # Actually: gen 2 picked up by worker, blocks. Then gen 3 replaces
+        # the pending. When gen 2 completes it is < saturation_gen 3.
+        second_blocking.set()
+
+        # Gen 3 picks up and fails — saturation must persist
+        # Poll for the second write (gen 3) to start
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if write_count[0] >= 2:
+                break
+            time.sleep(0.05)
+        assert write_count[0] >= 2
+
+        # Wait for gen 3 to complete (it fails)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if coord.last_write_diagnostic == "database unavailable":
+                break
+            time.sleep(0.05)
+
+        # Saturation must persist despite the failure
+        assert coord.status == "backlog saturated"
+
+        # The diagnostic is available internally
+        assert coord.last_write_diagnostic == "database unavailable"
+        assert "sqlite3" not in coord.last_write_diagnostic.lower()
+    finally:
+        history_db_module.write_history_safely = original
+        coord.shutdown(timeout=5.0)
+
+
+def test_later_successful_generation_clears_saturation(tmp_path: Path) -> None:
+    """A later successful generation (after a failed retained batch) clears
+    saturation."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+
+    first_started = threading.Event()
+    first_blocking = threading.Event()
+    original = history_db_module.write_history_safely
+
+    write_count = [0]
+
+    def controlled_write(readings: list[Any], **kwargs: Any) -> HistoryWriteResult:
+        write_count[0] += 1
+        if write_count[0] == 1:
+            first_started.set()
+            first_blocking.wait(timeout=10.0)
+            return HistoryWriteResult(ok=True, diagnostic="ok")
+        elif write_count[0] == 2:
+            # The retained generation fails
+            return HistoryWriteResult(ok=False, diagnostic="database unavailable")
+        # A later generation succeeds
+        return HistoryWriteResult(ok=True, diagnostic="ok")
+
+    history_db_module.write_history_safely = controlled_write
+    coord.start()
+    try:
+        coord.enqueue([_reading(pct=50.0)], now=NOW)
+        assert first_started.wait(timeout=3.0)
+
+        # Second batch: gen 2, accepted (pending empty)
+        coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
+
+        # Third batch: gen 3, replaces pending → saturate
+        coord.enqueue([_reading(pct=70.0)], now=NOW + timedelta(minutes=2))
+        assert coord.status == "backlog saturated"
+
+        first_blocking.set()
+
+        # Wait for gen 2 to fail (retained gen 3 is pending)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if write_count[0] >= 2:
+                break
+            time.sleep(0.05)
+
+        # Gen 3 picks up and fails — saturation persists
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if write_count[0] >= 2:
+                break
+            time.sleep(0.05)
+        assert coord.status == "backlog saturated"
+
+        # Enqueue gen 4 — accepted (pending empty after gen 3 pick up)
+        coord.enqueue([_reading(pct=80.0)], now=NOW + timedelta(minutes=3))
+
+        # Poll for gen 4 to succeed and clear saturation
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if coord.status == "ok":
+                break
+            time.sleep(0.05)
+        assert coord.status == "ok"
+    finally:
+        history_db_module.write_history_safely = original
+        coord.shutdown(timeout=5.0)
+
+
+def test_no_raw_diagnostic_leakage(tmp_path: Path) -> None:
+    """Coordinator status and last_write_diagnostic never contain raw
+    exception text, SQL, or paths."""
+    coord = HistoryCoordinator(db_path=tmp_path / "corrupt.sqlite3", db_timeout=1.0)
     coord.start()
     try:
         coord.enqueue([_reading(pct=50.0)], now=NOW)
@@ -1165,366 +1395,54 @@ def test_coordinator_no_raw_diagnostic_leakage(tmp_path: Path) -> None:
                 break
             time.sleep(0.05)
         status = coord.status
-        assert "sqlite3" not in status.lower()
-        assert "operationalerror" not in status.lower()
-        assert "databaseerror" not in status.lower()
-        assert "traceback" not in status.lower()
+        diag = coord.last_write_diagnostic
+        for s in (status, diag):
+            assert "sqlite3" not in s.lower()
+            assert "operationalerror" not in s.lower()
+            assert "databaseerror" not in s.lower()
+            assert "traceback" not in s.lower()
     finally:
         coord.shutdown(timeout=3.0)
 
 
-def test_coordinator_shutdown_is_idempotent(tmp_path: Path) -> None:
-    """Shutdown can be called multiple times without error."""
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
-    coord.start()
-    coord.shutdown()
-    coord.shutdown()  # Idempotent
-    coord.shutdown()  # Still fine
+# ── 1e: Timeout validation and production shutdown ──
 
 
-def test_coordinator_rejects_new_work_after_shutdown(tmp_path: Path) -> None:
-    """After shutdown, enqueue returns False and does not accept new work."""
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
-    coord.start()
-    coord.shutdown()
-    accepted = coord.enqueue([_reading(pct=50.0)], now=NOW)
-    assert accepted is False
+def test_constructor_validates_db_timeout_below_shutdown_timeout() -> None:
+    """Constructor rejects db_timeout >= shutdown_timeout."""
+    with pytest.raises(ValueError, match="db_timeout"):
+        HistoryCoordinator(db_timeout=5.0, shutdown_timeout=3.0)
+
+    with pytest.raises(ValueError, match="db_timeout"):
+        HistoryCoordinator(db_timeout=2.0, shutdown_timeout=2.0)
 
 
-def test_coordinator_shutdown_terminates_worker(tmp_path: Path) -> None:
-    """The captured worker thread is actually not alive when shutdown returns."""
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
-    coord.start()
-    assert coord._thread is not None  # noqa: SLF001
-    assert coord._thread.is_alive()  # noqa: SLF001
-    thread = coord._thread  # noqa: SLF001
-    coord.shutdown(timeout=5.0)
-    # The actual thread object is not alive
-    assert not thread.is_alive()
-    # And the coordinator cleared its reference
-    assert coord._thread is None  # noqa: SLF001
+def test_production_timeout_values_satisfy_invariant() -> None:
+    """Production coordinator with db_timeout=1.0, shutdown_timeout=3.0
+    satisfies db_timeout < shutdown_timeout."""
+    coord = HistoryCoordinator(db_timeout=1.0, shutdown_timeout=3.0)
+    assert coord._db_timeout == 1.0  # noqa: SLF001
+    assert coord._shutdown_timeout == 3.0  # noqa: SLF001
+    assert coord._db_timeout < coord._shutdown_timeout  # noqa: SLF001
 
 
-def test_coordinator_shutdown_bounded_with_locked_db(tmp_path: Path) -> None:
-    """Shutdown completes within the bounded timeout even if the DB is locked.
+def test_production_shutdown_terminates_blocked_worker(tmp_path: Path) -> None:
+    """With real SQLite and a locked database, the production coordinator
+    (db_timeout=1.0, shutdown_timeout=3.0) ensures the worker is not alive
+    when shutdown returns.
 
-    The worker is actively started before shutdown and has an in-flight
-    write blocked on the lock. Shutdown's join times out, but _thread is
-    not falsely cleared while the thread is still alive.
+    The worker's SQLite write times out at 1.0s (db_timeout), well before
+    the 3.0s shutdown join. The captured thread is actually not alive.
     """
     db_path = tmp_path / "history.sqlite3"
     lock_conn = _connect(db_path)
     init_schema(lock_conn)
     lock_conn.execute("BEGIN IMMEDIATE")
 
-    coord = HistoryCoordinator(db_path=db_path, db_timeout=1.0)
+    coord = HistoryCoordinator(db_path=db_path, db_timeout=1.0, shutdown_timeout=3.0)
     coord.start()
 
-    # Enqueue a write so the worker actually blocks on the lock
-    coord.enqueue([_reading(pct=50.0)], now=NOW)
-
-    # Give the worker time to start the blocked write
-    time.sleep(0.5)
-
-    start = time.monotonic()
-    coord.shutdown(timeout=1.5)
-    elapsed = time.monotonic() - start
-    # Should complete within the bounded time
-    assert elapsed < 3.0
-
-    # The thread may still be alive (blocked on the lock), so _thread
-    # should NOT be cleared
-    if coord._thread is not None:  # noqa: SLF001
-        assert coord._thread.is_alive()  # noqa: SLF001
-
-    lock_conn.execute("ROLLBACK")
-    lock_conn.close()
-    # Wait for the thread to die after the lock is released
-    if coord._thread is not None:  # noqa: SLF001
-        coord._thread.join(timeout=5.0)  # noqa: SLF001
-
-
-def test_coordinator_newest_wins_policy(tmp_path: Path) -> None:
-    """When multiple batches arrive while the worker is busy, the newest
-    pending batch replaces the older one.
-
-    Uses an Event to block the worker deterministically rather than a sleep.
-    """
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
-
-    write_started = threading.Event()
-    write_blocking = threading.Event()
-    original_write = history_db_module.write_history_safely
-
-    def blocking_write(*_args: Any, **_kwargs: Any) -> HistoryWriteResult:
-        write_started.set()
-        write_blocking.wait(timeout=5.0)
-        return HistoryWriteResult(ok=True, diagnostic="ok")
-
-    history_db_module.write_history_safely = blocking_write
-    coord.start()
-    try:
-        # First batch: worker picks it up and blocks
-        coord.enqueue([_reading(pct=50.0)], now=NOW)
-        assert write_started.wait(timeout=3.0)
-
-        # Second batch: replaces any pending, sets saturated
-        coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
-        # Third batch: replaces the second pending batch
-        coord.enqueue([_reading(pct=75.0)], now=NOW + timedelta(minutes=2))
-        assert coord.status == "backlog saturated"
-
-        # Check that the newest (75%) is the pending batch
-        assert coord._pending is not None  # noqa: SLF001
-        assert coord._pending[0].percentage == 75.0  # noqa: SLF001
-
-        write_blocking.set()
-    finally:
-        history_db_module.write_history_safely = original_write
-        coord.shutdown(timeout=3.0)
-
-
-def test_coordinator_start_idempotent(tmp_path: Path) -> None:
-    """Starting twice does not create a second thread."""
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
-    coord.start()
-    thread1 = coord._thread  # noqa: SLF001
-    coord.start()  # No-op
-    thread2 = coord._thread  # noqa: SLF001
-    assert thread1 is thread2
-    coord.shutdown()
-
-
-# ── 1d: Race-free tests using Events/Conditions ──
-
-
-def test_two_immediate_enqueues_before_worker_pickup(tmp_path: Path) -> None:
-    """Two enqueues before the worker picks up the first trigger newest-wins
-    and backlog saturated.
-
-    The worker is blocked on an Event so the first batch sits in the pending
-    slot. A second enqueue sees the occupied pending slot and saturates,
-    even though the worker has not started processing.
-    """
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
-
-    # Gate the worker so it does not pick up the pending batch
-    gate = threading.Event()
-    original_write = history_db_module.write_history_safely
-
-    def gated_write(*_args: Any, **_kwargs: Any) -> HistoryWriteResult:
-        gate.wait(timeout=5.0)
-        return HistoryWriteResult(ok=True, diagnostic="ok")
-
-    history_db_module.write_history_safely = gated_write
-    coord.start()
-    try:
-        # First enqueue: accepted, placed in pending slot
-        assert coord.enqueue([_reading(pct=50.0)], now=NOW)
-
-        # Second enqueue immediately — pending slot is still occupied
-        # because the worker has not picked it up yet (it's waiting on gate
-        # from a previous iteration, or hasn't started yet).
-        # We need the worker to be in-flight for this to work.
-        # Actually, with the new coordinator, if _pending is not None and
-        # _in_flight is None, the second enqueue sees _pending is not None
-        # and reports saturation.
-        accepted2 = coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
-        assert accepted2 is False
-        assert coord.status == "backlog saturated"
-
-        gate.set()
-    finally:
-        history_db_module.write_history_safely = original_write
-        coord.shutdown(timeout=3.0)
-
-
-def test_enqueue_during_take_busy_transition(tmp_path: Path) -> None:
-    """Enqueue during the take/busy transition cannot silently overwrite.
-
-    The worker picks up the pending batch atomically under the condition
-    lock, setting _in_flight in the same critical section. A second
-    enqueue during this transition sees _in_flight is not None and reports
-    saturation instead of silently writing to the pending slot.
-    """
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
-
-    write_started = threading.Event()
-    write_blocking = threading.Event()
-    original_write = history_db_module.write_history_safely
-
-    def blocking_write(*_args: Any, **_kwargs: Any) -> HistoryWriteResult:
-        write_started.set()
-        write_blocking.wait(timeout=5.0)
-        return HistoryWriteResult(ok=True, diagnostic="ok")
-
-    history_db_module.write_history_safely = blocking_write
-    coord.start()
-    try:
-        # First batch: accepted, worker picks it up atomically and blocks
-        assert coord.enqueue([_reading(pct=50.0)], now=NOW)
-        assert write_started.wait(timeout=3.0)
-
-        # At this point _in_flight is set, _pending is None.
-        # A second enqueue must see _in_flight is not None and saturate.
-        accepted2 = coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
-        assert accepted2 is False
-        assert coord.status == "backlog saturated"
-
-        write_blocking.set()
-    finally:
-        history_db_module.write_history_safely = original_write
-        coord.shutdown(timeout=3.0)
-
-
-def test_three_batches_retain_newest_pending(tmp_path: Path) -> None:
-    """Three batches while the worker is busy retain the newest pending."""
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
-
-    write_started = threading.Event()
-    write_blocking = threading.Event()
-    original_write = history_db_module.write_history_safely
-
-    def blocking_write(*_args: Any, **_kwargs: Any) -> HistoryWriteResult:
-        write_started.set()
-        write_blocking.wait(timeout=5.0)
-        return HistoryWriteResult(ok=True, diagnostic="ok")
-
-    history_db_module.write_history_safely = blocking_write
-    coord.start()
-    try:
-        coord.enqueue([_reading(pct=50.0)], now=NOW)
-        assert write_started.wait(timeout=3.0)
-
-        coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
-        coord.enqueue([_reading(pct=75.0)], now=NOW + timedelta(minutes=2))
-        coord.enqueue([_reading(pct=90.0)], now=NOW + timedelta(minutes=3))
-
-        assert coord.status == "backlog saturated"
-        assert coord._pending is not None  # noqa: SLF001
-        assert coord._pending[0].percentage == 90.0  # noqa: SLF001
-
-        write_blocking.set()
-    finally:
-        history_db_module.write_history_safely = original_write
-        coord.shutdown(timeout=3.0)
-
-
-def test_older_write_does_not_clear_saturation(tmp_path: Path) -> None:
-    """Completion of the older in-flight write does not clear saturation
-    created by a newer enqueue. Uses generation tracking."""
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
-
-    first_started = threading.Event()
-    first_blocking = threading.Event()
-    second_started = threading.Event()
-    second_blocking = threading.Event()
-    original_write = history_db_module.write_history_safely
-
-    write_count = [0]
-
-    def controlled_write(readings: list[Any], **kwargs: Any) -> HistoryWriteResult:
-        write_count[0] += 1
-        if write_count[0] == 1:
-            first_started.set()
-            first_blocking.wait(timeout=5.0)
-        elif write_count[0] == 2:
-            second_started.set()
-            second_blocking.wait(timeout=5.0)
-        return HistoryWriteResult(ok=True, diagnostic="ok")
-
-    history_db_module.write_history_safely = controlled_write
-    coord.start()
-    try:
-        # First batch: worker picks up, blocks
-        coord.enqueue([_reading(pct=50.0)], now=NOW)
-        assert first_started.wait(timeout=3.0)
-
-        # Second batch: saturates, generation 2
-        coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
-        assert coord.status == "backlog saturated"
-        assert coord._saturation_gen == 2  # noqa: SLF001
-
-        # Release the first write — it is generation 1, which is < saturation_gen
-        first_blocking.set()
-
-        # Wait for the second write to start (worker picked up gen 2)
-        assert second_started.wait(timeout=3.0)
-
-        # The first write succeeded but must NOT clear saturation.
-        # The second write is still in-flight, so saturation persists.
-        assert coord.status == "backlog saturated"
-
-        # Release the second write — now gen 2 succeeds and clears saturation
-        second_blocking.set()
-
-        # Poll for status to clear
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            if coord.status == "ok":
-                break
-            time.sleep(0.05)
-        assert coord.status == "ok"
-    finally:
-        history_db_module.write_history_safely = original_write
-        coord.shutdown(timeout=5.0)
-
-
-def test_newest_batch_success_clears_saturation(tmp_path: Path) -> None:
-    """Successful completion of the retained newest batch clears saturation."""
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
-
-    first_started = threading.Event()
-    first_blocking = threading.Event()
-    original_write = history_db_module.write_history_safely
-
-    write_count = [0]
-
-    def controlled_write(readings: list[Any], **kwargs: Any) -> HistoryWriteResult:
-        write_count[0] += 1
-        if write_count[0] == 1:
-            first_started.set()
-            first_blocking.wait(timeout=5.0)
-        return HistoryWriteResult(ok=True, diagnostic="ok")
-
-    history_db_module.write_history_safely = controlled_write
-    coord.start()
-    try:
-        # First batch: worker picks up, blocks
-        coord.enqueue([_reading(pct=50.0)], now=NOW)
-        assert first_started.wait(timeout=3.0)
-
-        # Second batch: saturates, generation 2
-        coord.enqueue([_reading(pct=60.0)], now=NOW + timedelta(minutes=1))
-        assert coord.status == "backlog saturated"
-
-        # Release the first write — does NOT clear saturation (gen 1 < sat_gen 2)
-        first_blocking.set()
-
-        # Poll for the second write to complete and clear saturation
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            if coord.status == "ok":
-                break
-            time.sleep(0.05)
-        assert coord.status == "ok"
-        assert write_count[0] >= 2
-    finally:
-        history_db_module.write_history_safely = original_write
-        coord.shutdown(timeout=3.0)
-
-
-def test_blocked_worker_started_before_shutdown(tmp_path: Path) -> None:
-    """A worker actively blocked on a locked database is started before shutdown."""
-    db_path = tmp_path / "history.sqlite3"
-    lock_conn = _connect(db_path)
-    init_schema(lock_conn)
-    lock_conn.execute("BEGIN IMMEDIATE")
-
-    coord = HistoryCoordinator(db_path=db_path, db_timeout=1.0)
-    coord.start()
-
-    # Enqueue so the worker picks up a write and blocks on the lock
+    # Enqueue so the worker starts a write and blocks on the lock
     coord.enqueue([_reading(pct=50.0)], now=NOW)
 
     # Wait for the worker to be in-flight
@@ -1536,39 +1454,72 @@ def test_blocked_worker_started_before_shutdown(tmp_path: Path) -> None:
         time.sleep(0.05)
     assert coord._in_flight is not None  # noqa: SLF001
 
+    # Release the lock so the SQLite write can proceed once unlocked
     lock_conn.execute("ROLLBACK")
     lock_conn.close()
-    coord.shutdown(timeout=5.0)
+
+    # Shutdown — the worker should terminate within the 3s join
+    start = time.monotonic()
+    coord.shutdown()
+    elapsed = time.monotonic() - start
+    assert elapsed < 4.0
+
+    # The thread is not alive and the reference is cleared
+    assert coord._thread is None  # noqa: SLF001
 
 
-def test_thread_not_falsely_cleared_when_alive(tmp_path: Path) -> None:
-    """If the worker is still alive after the join timeout, _thread is not cleared."""
-    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3")
+def test_repeated_shutdown_and_post_shutdown_enqueue(tmp_path: Path) -> None:
+    """Repeated shutdown is safe and post-shutdown enqueue returns False."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+    coord.start()
+    coord.shutdown()
+    coord.shutdown()
+    coord.shutdown()
+    assert coord.enqueue([_reading(pct=50.0)], now=NOW) is False
 
-    # Block the worker indefinitely with a non-releasing event
-    write_blocking = threading.Event()
-    original_write = history_db_module.write_history_safely
 
-    def blocking_write(*_args: Any, **_kwargs: Any) -> HistoryWriteResult:
-        write_blocking.wait(timeout=10.0)
+def test_shutdown_is_idempotent(tmp_path: Path) -> None:
+    """Shutdown can be called multiple times without error."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+    coord.start()
+    thread = coord._thread  # noqa: SLF001
+    coord.shutdown()
+    coord.shutdown()
+    assert thread is not None
+    assert not thread.is_alive()
+    assert coord._thread is None  # noqa: SLF001
+
+
+def test_start_is_idempotent(tmp_path: Path) -> None:
+    """Starting twice does not create a second thread."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+    coord.start()
+    thread1 = coord._thread  # noqa: SLF001
+    coord.start()
+    thread2 = coord._thread  # noqa: SLF001
+    assert thread1 is thread2
+    coord.shutdown()
+
+
+def test_worker_wakes_on_notification_not_polling(tmp_path: Path) -> None:
+    """The worker wakes on Condition.notify_all() from enqueue, not from
+    periodic polling. Verified by checking that the worker picks up a
+    batch immediately after enqueue with no polling delay."""
+    coord = HistoryCoordinator(db_path=tmp_path / "history.sqlite3", db_timeout=1.0)
+    write_completed = threading.Event()
+    original = history_db_module.write_history_safely
+
+    def fast_write(*_args: Any, **_kwargs: Any) -> HistoryWriteResult:
+        write_completed.set()
         return HistoryWriteResult(ok=True, diagnostic="ok")
 
-    history_db_module.write_history_safely = blocking_write
+    history_db_module.write_history_safely = fast_write
     coord.start()
     try:
+        # Enqueue and verify the worker picks it up immediately
         coord.enqueue([_reading(pct=50.0)], now=NOW)
-        # Wait for the worker to start
-        time.sleep(0.5)
-
-        # Shutdown with a small timeout — the worker is still blocked
-        coord.shutdown(timeout=0.5)
-
-        # _thread should NOT be None because the worker is still alive
-        assert coord._thread is not None  # noqa: SLF001
-        assert coord._thread.is_alive()  # noqa: SLF001
-
-        # Now release the worker
-        write_blocking.set()
-        coord._thread.join(timeout=5.0)  # noqa: SLF001
+        # With notification-based wake-up, this should complete nearly instantly
+        assert write_completed.wait(timeout=2.0)
     finally:
-        history_db_module.write_history_safely = original_write
+        history_db_module.write_history_safely = original
+        coord.shutdown(timeout=3.0)

@@ -574,26 +574,27 @@ def write_history_safely(
 class HistoryCoordinator:
     """Bounded, testable, race-free coordinator for off-thread history writes.
 
-    All shared state is guarded by a single ``Condition`` so that enqueue,
-    worker pickup, in-flight completion, and shutdown are mutually exclusive.
-    State tracked explicitly:
-      - one optional in-flight batch + its generation;
-      - one optional pending batch + its generation;
-      - shutdown state;
-      - monotonically increasing generation counter;
-      - the generation that must succeed before a saturation latch clears.
+    Capacity is exactly one in-flight batch plus one pending batch:
+      - if neither exists, accept the batch and return True;
+      - if a batch is in-flight but pending is empty, accept the new pending
+        batch, return True, and do not report saturation;
+      - if pending is already occupied, replace it with the newest generation,
+        return False, and latch ``backlog saturated``.
 
-    Overflow policy (newest-wins): when the pending slot is occupied or
-    the worker is in-flight, a second enqueue replaces the pending batch
-    with the newest, returns False, and latches ``backlog saturated``.
-    Saturation is cleared only when the retained newest generation has
-    completed successfully.
+    The saturation latch is separate from the latest write diagnostic.
+    While saturation remains unresolved, public status stays
+    ``backlog saturated`` even when the retained write fails. The sanitized
+    write diagnostic is stored internally for the future Diagnostic view.
 
-    Shutdown is idempotent: rejects new work immediately, signals the
-    worker via the condition, and joins with a bounded timeout. The SQLite
-    write timeout is parameterized below the join bound so the worker
-    never blocks longer than the join. ``_thread`` is never set to None
-    while the captured thread is still alive.
+    Generation policy: an old in-flight result cannot resolve a newer
+    saturation. Only successful completion of the retained generation,
+    or a later successful generation, may clear the saturation latch.
+
+    Shutdown is idempotent: rejects new work, signals the worker via
+    the condition, and joins with a bounded timeout. The constructor
+    validates ``db_timeout < shutdown_timeout`` so a locked SQLite write
+    cannot outlive the join. ``_thread`` is never set to None while the
+    captured thread is still alive.
     """
 
     def __init__(
@@ -601,9 +602,16 @@ class HistoryCoordinator:
         *,
         db_path: Path | None = None,
         db_timeout: float = 5.0,
+        shutdown_timeout: float = 2.0,
     ) -> None:
+        if db_timeout >= shutdown_timeout:
+            raise ValueError(
+                f"db_timeout ({db_timeout}) must be strictly less than "
+                f"shutdown_timeout ({shutdown_timeout})"
+            )
         self._db_path = db_path or history_path()
         self._db_timeout = db_timeout
+        self._shutdown_timeout = shutdown_timeout
         self._cond = threading.Condition()
         self._shutdown = False
         self._thread: threading.Thread | None = None
@@ -615,13 +623,30 @@ class HistoryCoordinator:
         self._generation = 0
         self._saturation_gen: int = 0
         self._status = _DIAG_OK
+        self._last_write_diagnostic = _DIAG_OK
         self._started = False
 
     @property
     def status(self) -> str:
-        """Return the current sanitized history status string."""
+        """Return the current sanitized history status string.
+
+        While saturation is active, returns ``backlog saturated``
+        regardless of the latest write diagnostic.
+        """
         with self._cond:
+            if self._saturation_gen > 0:
+                return _DIAG_BACKLOG
             return self._status
+
+    @property
+    def last_write_diagnostic(self) -> str:
+        """Return the sanitized diagnostic from the latest write attempt.
+
+        This is internal and for the future Diagnostic view. The public
+        ``status`` property always reflects saturation state first.
+        """
+        with self._cond:
+            return self._last_write_diagnostic
 
     def start(self) -> None:
         """Start the worker thread if not already running."""
@@ -635,28 +660,27 @@ class HistoryCoordinator:
     def enqueue(self, readings: list[Any], now: datetime) -> bool:
         """Submit a batch for asynchronous writing.
 
-        Returns True if the batch was accepted as the first pending entry.
-        Returns False (and latches ``backlog saturated``) if the pending
-        slot was already occupied (the worker may or may not have picked
-        it up yet). The newest batch replaces any older pending batch.
-        Never blocks.
+        Returns True if the batch was accepted (either as the first entry
+        or as a new pending batch while the worker is in-flight but pending
+        is empty). Returns False (and latches ``backlog saturated``) only
+        when the pending slot was already occupied — the newest batch
+        replaces the older one. Never blocks.
         """
         snapshot = list(readings)
         with self._cond:
             if self._shutdown:
                 return False
-            if self._pending is not None or self._in_flight is not None:
-                # Pending slot occupied or worker in-flight — newest-wins
+            if self._pending is not None:
+                # Pending slot occupied — newest-wins, report saturation
                 self._generation += 1
                 self._pending = snapshot
                 self._pending_time = now
                 self._pending_gen = self._generation
                 if self._saturation_gen < self._generation:
                     self._saturation_gen = self._generation
-                self._status = _DIAG_BACKLOG
                 self._cond.notify_all()
                 return False
-            # First pending batch — accepted without saturation
+            # Pending slot is empty — accept the batch
             self._generation += 1
             self._pending = snapshot
             self._pending_time = now
@@ -669,7 +693,7 @@ class HistoryCoordinator:
         while True:
             with self._cond:
                 while self._pending is None and not self._shutdown:
-                    self._cond.wait(timeout=1.0)
+                    self._cond.wait()
                 if self._shutdown:
                     return
                 # Pick up the pending batch atomically — no race window
@@ -689,39 +713,48 @@ class HistoryCoordinator:
             with self._cond:
                 self._in_flight = None
                 self._in_flight_gen = 0
-                # Only clear saturation if this generation is at or past
-                # the saturation generation. An older write must not clear
-                # saturation latched by a newer enqueue.
+                self._last_write_diagnostic = result.diagnostic
+                # Only resolve saturation if this generation is at or past
+                # the saturation generation.
                 if gen >= self._saturation_gen:
                     if result.ok:
-                        self._status = _DIAG_OK
+                        # Successful completion of the retained (or later)
+                        # generation clears the saturation latch.
                         self._saturation_gen = 0
+                        self._status = _DIAG_OK
                     else:
-                        self._status = result.diagnostic
+                        # Failure of the retained generation does NOT clear
+                        # saturation. Keep backlog saturated as the public
+                        # status. The diagnostic is stored internally.
+                        self._status = _DIAG_BACKLOG
                 # else: an older write completed — preserve current status
 
-    def shutdown(self, *, timeout: float = 2.0) -> None:
+    def shutdown(self, *, timeout: float | None = None) -> None:
         """Idempotent shutdown.
 
         Rejects new work immediately. Signals the worker via the condition.
-        Joins with a bounded timeout that never exceeds the SQLite write
-        timeout. Pending work is discarded with ``backlog saturated``.
-        ``_thread`` is never set to None while the captured thread is
-        still alive.
+        Joins with a bounded timeout (defaults to the constructor's
+        ``shutdown_timeout``). Pending work is discarded with
+        ``backlog saturated``. ``_thread`` is never set to None while the
+        captured thread is still alive.
         """
+        join_timeout = timeout if timeout is not None else self._shutdown_timeout
         with self._cond:
             if not self._started:
                 return
             self._shutdown = True
             if self._pending is not None:
-                self._status = _DIAG_BACKLOG
+                if self._saturation_gen < self._pending_gen:
+                    self._saturation_gen = self._pending_gen
+                if self._saturation_gen > 0:
+                    self._status = _DIAG_BACKLOG
             self._pending = None
             self._pending_time = None
             self._pending_gen = 0
             self._cond.notify_all()
             thread = self._thread
         if thread is not None:
-            thread.join(timeout=timeout)
+            thread.join(timeout=join_timeout)
             if thread.is_alive():
                 # Do not clear _thread while it is still alive
                 return
