@@ -38,9 +38,11 @@ select = ["E", "F", "I", "UP", "B"]
 "src/moira/app.py" = ["E402"]
 "src/moira/ui.py" = ["E402"]
 "src/moira/secrets.py" = ["E402"]
+"src/moira/history_chart.py" = ["E402"]
+"src/moira/history_page.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.11"
 strict = true
 files = ["src/moira", "tests"]
-exclude = ["src/moira/ui.py", "src/moira/app.py", "src/moira/secrets.py"]
+exclude = ["src/moira/ui.py", "src/moira/app.py", "src/moira/secrets.py", "src/moira/history_chart.py", "src/moira/history_page.py"]

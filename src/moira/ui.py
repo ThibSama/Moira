@@ -20,6 +20,7 @@ from .collectors import ClaudeCollector, CodexCollector
 from .desktop import create_shortcut, remove_shortcut
 from .exhaustion import derive_state
 from .history_db import HistoryCoordinator
+from .history_page import HistoryPage
 from .i18n import is_french, tr
 from .models import QuotaReading, QuotaStatus, Service
 from .ntfy import Notification, send
@@ -232,14 +233,16 @@ class MainWindow(Adw.ApplicationWindow):
             GLib.timeout_add_seconds(30, self._local_recompute)
             # Focus regain handler
             self.connect("notify::is-active", self._on_focus_change)
+        # Track stack visibility for History refresh
+        self._stack.connect("notify::visible-child", self._on_stack_changed)
         # Shutdown handler: stop the history worker cleanly on window close
         self.connect("close-request", self._on_close_request)
 
     def _build(self) -> None:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         header = Adw.HeaderBar()
-        stack = Adw.ViewStack()
-        switcher = Adw.ViewSwitcher(stack=stack)
+        self._stack = Adw.ViewStack()
+        switcher = Adw.ViewSwitcher(stack=self._stack)
         header.set_title_widget(switcher)
         refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text=_("Refresh now"))
         refresh.connect("clicked", lambda *_: self.refresh())
@@ -248,7 +251,7 @@ class MainWindow(Adw.ApplicationWindow):
         about.connect("clicked", self._about)
         header.pack_end(about)
         root.append(header)
-        root.append(stack)
+        root.append(self._stack)
         home = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         home.set_margin_top(18)
         home.set_margin_bottom(18)
@@ -261,8 +264,12 @@ class MainWindow(Adw.ApplicationWindow):
         self.refresh_info = Gtk.Label(xalign=0)
         self.refresh_info.add_css_class("dim-label")
         home.append(self.refresh_info)
-        stack.add_titled(home, "home", _("Quotas"))
-        stack.add_titled(self._settings_page(), "notifications", _("Notifications"))
+        self._stack.add_titled(home, "home", _("Quotas"))
+        self._stack.add_titled(self._settings_page(), "notifications", _("Notifications"))
+        self._history_page = HistoryPage(self.executor)
+        history_scroll = Gtk.ScrolledWindow()
+        history_scroll.set_child(self._history_page)
+        self._stack.add_titled(history_scroll, "history", _("History"))
         self.set_content(root)
 
     def _settings_page(self) -> Gtk.Widget:
@@ -412,6 +419,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._record_history(self.pending, now)
         self.refreshing = False
         self._render()
+        # Notify History page that new data may be available
+        self._history_page.on_refresh_complete()
         return False
 
     def _record_history(self, readings: list[QuotaReading], now: datetime) -> None:
@@ -433,6 +442,17 @@ class MainWindow(Adw.ApplicationWindow):
         """
         self._history_coordinator.shutdown()
         return False
+
+    def _on_stack_changed(self, *_: Any) -> None:
+        """Refresh History tab when it becomes visible."""
+        visible_child = self._stack.get_visible_child()
+        if visible_child is not None:
+            # Check if the visible page is the history scroll
+            page = visible_child
+            if isinstance(page, Gtk.ScrolledWindow):
+                child = page.get_child()
+                if isinstance(child, HistoryPage):
+                    child.on_visible()
 
     def _compute_next_refresh_str(self) -> str:
         if self._next_refresh_time <= 0:

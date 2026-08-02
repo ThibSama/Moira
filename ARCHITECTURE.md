@@ -21,7 +21,7 @@ Codex app-server ─> ordered JSON-RPC handshake ─> validator ──┘       
 - `secrets.py` is the only token boundary and uses libsecret/GNOME Keyring. Tokens never enter JSON state.
 - `ntfy.py` validates and constructs requests with the standard library.
 - `desktop.py` resolves the localized XDG desktop directory and idempotently copies/removes the installed desktop entry.
-- `ui.py` owns GTK widgets and schedules collectors on worker threads. A refresh guard prevents overlap. Refresh occurs at startup, on focus regain (monotonic debounce), and at the configured interval. Countdowns recompute locally every 30 seconds without collectors. Saving a new interval immediately replaces the GLib timer without restart or duplicates.
+- `ui.py` owns GTK widgets and schedules collectors on worker threads. A refresh guard prevents overlap. Refresh occurs at startup, on focus regain (monotonic debounce), and at the configured interval. Countdowns recompute locally every 30 seconds without collectors. Saving a new interval immediately replaces the GLib timer without restart or duplicates. The History tab (`history_page.py`) uses a bounded `HistoryReader` with monotonically increasing request identity so only the newest read publishes results to GTK. No SQLite work runs on GTK. The chart (`history_chart.py`) uses DrawingArea/Cairo with dash-pattern differentiation for non-color-only identification. The History tab refreshes when it becomes visible and after a successful history write.
 
 No database, rendered dashboard/terminal scraping, private endpoint, background service, tray, or legacy helper dependency is used. An existing user status-line command remains an independent delegate when Moira chaining is enabled.
 

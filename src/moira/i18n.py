@@ -116,6 +116,20 @@ _FRENCH: dict[str, str] = {
     "Usage reached ": "Utilisation atteinte ",
     "%.": "%.",
     " quota entered a new window.": " — le quota a entamé une nouvelle fenêtre.",
+    # ── History tab ──
+    "History": "Historique",
+    "Range": "Plage",
+    "Filter": "Filtre",
+    "All": "Tous",
+    "No history data for this range": "Aucune donnée d'historique pour cette plage",
+    "Database unavailable": "Base de données indisponible",
+    "Schema mismatch": "Incompatibilité de schéma",
+    "No observations": "Aucune observation",
+    "Latest": "Dernier",
+    "Min": "Min",
+    "Max": "Max",
+    "Count": "Nombre",
+    "Resets": "Réinitialisations",
 }
 
 
