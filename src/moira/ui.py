@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import queue
 import threading
 import time
 from datetime import UTC, datetime
@@ -220,6 +221,15 @@ class MainWindow(Adw.ApplicationWindow):
         self._last_focus_time: float = 0.0
         self._focus_debounce_seconds = 2.0
         self._next_refresh_time: float = 0.0
+        self._history_queue: queue.Queue[tuple[list[QuotaReading], datetime] | None] = queue.Queue(
+            maxsize=1
+        )
+        self._history_status = "ok"
+        self._history_worker_stop = threading.Event()
+        self._history_thread = threading.Thread(
+            target=self._history_worker, name="moira-history", daemon=True
+        )
+        self._history_thread.start()
         self._build()
         self._render()
         if not smoke_test:
@@ -410,23 +420,37 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _record_history(self, readings: list[QuotaReading], now: datetime) -> None:
-        """Record fresh quota observations into the local history database.
+        """Enqueue fresh quota observations for off-thread history writing.
 
-        Runs on the GTK thread but uses only fast SQLite writes. History
-        failure must not disrupt quota state, display, or alerts. Only a
-        sanitized diagnostic is logged.
+        Never blocks the GTK thread. If the previous write is still in
+        progress (queue full), the new batch is silently dropped — the next
+        refresh will enqueue again. History failure does not affect quota
+        state, display, or alerts.
         """
+        snapshot = list(readings)
         try:
-            from .history_db import _connect, init_schema, record_refresh
-
-            conn = _connect()
-            try:
-                init_schema(conn)
-                record_refresh(conn, readings, now=now)
-            finally:
-                conn.close()
-        except Exception:
+            self._history_queue.put_nowait((snapshot, now))
+        except queue.Full:
             pass
+
+    def _history_worker(self) -> None:
+        """Daemon thread that drains the history write queue.
+
+        Performs connect/schema/write/purge off the GTK thread. Stores a
+        sanitized status for the future Diagnostic view.
+        """
+        from .history_db import write_history_safely
+
+        while not self._history_worker_stop.is_set():
+            try:
+                item = self._history_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            readings, now = item
+            result = write_history_safely(readings, now=now)
+            self._history_status = result.diagnostic
 
     def _compute_next_refresh_str(self) -> str:
         if self._next_refresh_time <= 0:

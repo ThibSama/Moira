@@ -3,6 +3,11 @@
 Stores validated quota and optional token observations for at most 90 days.
 Uses stdlib sqlite3 with a transactional schema version. The database file
 is created with mode 0600. Config and current-state JSON are unchanged.
+
+Schema v2: Removes UNIQUE(service, quota_label, bucket) to preserve every
+distinct percentage or reset transition, including multiple changes inside
+one bucket. Unchanged values retain at most one periodic sample per
+service/quota/bucket via INSERT OR IGNORE on a periodic-sample index.
 """
 
 from __future__ import annotations
@@ -13,13 +18,19 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .history import HistoryStatus, QuotaObservation, TokenObservation
+from .history import HistoryStatus, HistoryWriteResult, QuotaObservation, TokenObservation
 from .models import Service
 from .persistence import state_dir
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RETENTION_DAYS = 90
 BUCKET_MINUTES = 15
+
+# Sanitized diagnostic strings — never contain exception text, SQL, or paths.
+_DIAG_OK = "ok"
+_DIAG_DB_ERROR = "database unavailable"
+_DIAG_SCHEMA_ERROR = "schema mismatch"
+_DIAG_VALIDATION_ERROR = "invalid observation"
 
 
 def history_path() -> Path:
@@ -32,7 +43,6 @@ def _connect(path: Path | None = None) -> sqlite3.Connection:
     db_path = path or history_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if not db_path.exists():
-        # Create with restrictive permissions before any data is written
         fd = os.open(str(db_path), os.O_CREAT | os.O_WRONLY, 0o600)
         os.close(fd)
     os.chmod(db_path, 0o600)
@@ -46,7 +56,45 @@ def _connect(path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
-SCHEMA_SQL = """\
+SCHEMA_SQL_V2 = """\
+CREATE TABLE IF NOT EXISTS schema_meta (
+    version INTEGER PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS quota_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    service         TEXT    NOT NULL,
+    quota_label     TEXT    NOT NULL,
+    percentage      REAL    NOT NULL,
+    reset_at        TEXT    NOT NULL,
+    observed_at     TEXT    NOT NULL,
+    source          TEXT    NOT NULL,
+    bucket          TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'available_exact',
+    is_change       INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (service, quota_label, bucket, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_quota_obs_time ON quota_observations (observed_at);
+CREATE INDEX IF NOT EXISTS idx_quota_obs_service ON quota_observations (service, quota_label);
+CREATE TABLE IF NOT EXISTS token_observations (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    service                 TEXT    NOT NULL,
+    observed_at             TEXT    NOT NULL,
+    source                  TEXT    NOT NULL,
+    status                  TEXT    NOT NULL,
+    input_tokens            INTEGER,
+    cached_input_tokens     INTEGER,
+    output_tokens           INTEGER,
+    reasoning_output_tokens INTEGER,
+    total_tokens            INTEGER,
+    bucket                  TEXT    NOT NULL,
+    UNIQUE (service, bucket)
+);
+CREATE INDEX IF NOT EXISTS idx_token_obs_time ON token_observations (observed_at);
+CREATE INDEX IF NOT EXISTS idx_token_obs_service ON token_observations (service);
+"""
+
+
+SCHEMA_SQL_V1 = """\
 CREATE TABLE IF NOT EXISTS schema_meta (
     version INTEGER PRIMARY KEY
 );
@@ -90,15 +138,74 @@ def _bucket(dt: datetime) -> str:
     return bucket_dt.isoformat()
 
 
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Transactionally migrate a v1 schema to v2.
+
+    Preserves all existing rows. Drops the old UNIQUE(service, quota_label,
+    bucket) constraint and adds status/is_change columns with defaults.
+    Rolls back on any failure.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Recreate quota_observations without the v1 UNIQUE constraint
+        conn.execute("ALTER TABLE quota_observations RENAME TO quota_observations_v1")
+        conn.execute(
+            """\
+CREATE TABLE quota_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    service         TEXT    NOT NULL,
+    quota_label     TEXT    NOT NULL,
+    percentage      REAL    NOT NULL,
+    reset_at        TEXT    NOT NULL,
+    observed_at     TEXT    NOT NULL,
+    source          TEXT    NOT NULL,
+    bucket          TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'available_exact',
+    is_change       INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (service, quota_label, bucket, observed_at)
+)"""
+        )
+        conn.execute(
+            """\
+INSERT INTO quota_observations
+    (id, service, quota_label, percentage, reset_at, observed_at, source, bucket, status, is_change)
+SELECT id, service, quota_label, percentage, reset_at, observed_at, source, bucket,
+       'available_exact', 1
+FROM quota_observations_v1"""
+        )
+        conn.execute("DROP TABLE quota_observations_v1")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quota_obs_time ON quota_observations (observed_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quota_obs_service "
+            "ON quota_observations (service, quota_label)"
+        )
+        conn.execute("UPDATE schema_meta SET version = 2 WHERE version = 1")
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
-    """Initialize or verify the schema version. Throws on version mismatch."""
-    # executescript implicitly commits, so run DDL outside the explicit transaction
-    conn.executescript(SCHEMA_SQL)
+    """Initialize or migrate the schema. Throws on irrecoverable mismatch."""
+    # For a fresh database, create v2 directly
+    conn.executescript(SCHEMA_SQL_V2)
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute("SELECT version FROM schema_meta").fetchone()
         if row is None:
             conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
+        elif row[0] == 1:
+            # Need to migrate v1 → v2. Rollback the current transaction first,
+            # then run the migration.
+            conn.execute("ROLLBACK")
+            _migrate_v1_to_v2(conn)
+            return
         elif row[0] != SCHEMA_VERSION:
             raise ValueError(
                 f"history database schema version {row[0]} does not match expected {SCHEMA_VERSION}"
@@ -118,14 +225,18 @@ def record_quota(
     *,
     now: datetime | None = None,
 ) -> bool:
-    """Record a quota observation, deduplicating within 15-minute buckets.
+    """Record a quota observation, preserving every distinct change point.
 
-    Records a change immediately. Otherwise, keeps at most one unchanged sample
-    per service/quota_label per 15-minute bucket. Returns True if a row was
-    inserted.
+    A new row is inserted when:
+    - No row exists for this service/quota_label/bucket, OR
+    - The latest row in this bucket has a different percentage or reset_at
+      (a change point). Earlier change points are never overwritten.
 
-    Purges rows older than 90 days after a successful write using the injected
-    clock.
+    Unchanged values (same percentage and reset_at as the latest row in the
+    bucket) are deduplicated: at most one periodic sample per bucket.
+
+    Returns True if a row was inserted. Purges rows older than 90 days after
+    a successful write using the injected clock.
     """
     clock = now or datetime.now(UTC)
     bucket = _bucket(obs.observed_at)
@@ -134,19 +245,22 @@ def record_quota(
 
     conn.execute("BEGIN IMMEDIATE")
     try:
-        # Check for an existing sample in this bucket
+        # Find the latest row in this bucket for this service/label
         existing = conn.execute(
-            "SELECT percentage FROM quota_observations "
-            "WHERE service = ? AND quota_label = ? AND bucket = ?",
+            "SELECT percentage, reset_at FROM quota_observations "
+            "WHERE service = ? AND quota_label = ? AND bucket = ? "
+            "ORDER BY observed_at DESC LIMIT 1",
             (obs.service.value, obs.quota_label, bucket),
         ).fetchone()
 
         inserted = False
         if existing is None:
+            # First sample in this bucket
             conn.execute(
-                "INSERT INTO quota_observations "
-                "(service, quota_label, percentage, reset_at, observed_at, source, bucket) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO quota_observations "
+                "(service, quota_label, percentage, reset_at, observed_at, source, bucket, "
+                "status, is_change) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
                 (
                     obs.service.value,
                     obs.quota_label,
@@ -155,32 +269,39 @@ def record_quota(
                     observed_iso,
                     obs.source,
                     bucket,
+                    obs.status.value,
                 ),
             )
-            inserted = True
-        elif existing[0] != obs.percentage:
-            # Change point: replace the existing sample in this bucket
+            inserted = conn.total_changes > 0
+        elif existing[0] != obs.percentage or existing[1] != reset_iso:
+            # Change point: always insert (or ignore if exact replay)
             conn.execute(
-                "UPDATE quota_observations "
-                "SET percentage = ?, reset_at = ?, observed_at = ?, source = ? "
-                "WHERE service = ? AND quota_label = ? AND bucket = ?",
+                "INSERT OR IGNORE INTO quota_observations "
+                "(service, quota_label, percentage, reset_at, observed_at, source, bucket, "
+                "status, is_change) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
                 (
+                    obs.service.value,
+                    obs.quota_label,
                     obs.percentage,
                     reset_iso,
                     observed_iso,
                     obs.source,
-                    obs.service.value,
-                    obs.quota_label,
                     bucket,
+                    obs.status.value,
                 ),
             )
-            inserted = True
+            inserted = conn.total_changes > 0
+        # else: unchanged → deduplicate (no insert)
 
         _purge(conn, clock)
         conn.execute("COMMIT")
         return inserted
     except Exception:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
         raise
 
 
@@ -224,7 +345,10 @@ def record_token(
         conn.execute("COMMIT")
         return True
     except Exception:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
         raise
 
 
@@ -259,7 +383,7 @@ def query_quota(
         params.append(metric)
     where = " AND ".join(clauses)
     rows = conn.execute(
-        f"SELECT service, quota_label, percentage, reset_at, observed_at, source "
+        f"SELECT service, quota_label, percentage, reset_at, observed_at, source, status "
         f"FROM quota_observations WHERE {where} ORDER BY observed_at ASC",
         params,
     ).fetchall()
@@ -271,6 +395,7 @@ def query_quota(
             reset_at=datetime.fromisoformat(row[3]),
             observed_at=datetime.fromisoformat(row[4]),
             source=row[5],
+            status=HistoryStatus(row[6]),
         )
         for row in rows
     ]
@@ -362,7 +487,10 @@ def delete_all(conn: sqlite3.Connection) -> int:
         conn.execute("COMMIT")
         return q + t
     except Exception:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
         raise
 
 
@@ -400,3 +528,33 @@ def record_refresh(
             source=reading.source,
         )
         record_quota(conn, obs, now=clock)
+
+
+def write_history_safely(
+    readings: list[Any],
+    *,
+    now: datetime | None = None,
+    db_path: Path | None = None,
+) -> HistoryWriteResult:
+    """Write quota observations to the history database and return a sanitized result.
+
+    This is the entry point for off-thread history writes. It performs
+    connect/schema/write/purge in one call and returns only a bounded
+    HistoryWriteResult. Never exposes exception text, SQL, payloads, paths,
+    account data, or secrets.
+    """
+    clock = now or datetime.now(UTC)
+    try:
+        conn = _connect(db_path)
+        try:
+            init_schema(conn)
+            record_refresh(conn, readings, now=clock)
+        finally:
+            conn.close()
+    except ValueError:
+        return HistoryWriteResult(ok=False, diagnostic=_DIAG_SCHEMA_ERROR)
+    except sqlite3.DatabaseError:
+        return HistoryWriteResult(ok=False, diagnostic=_DIAG_DB_ERROR)
+    except Exception:
+        return HistoryWriteResult(ok=False, diagnostic=_DIAG_VALIDATION_ERROR)
+    return HistoryWriteResult(ok=True, diagnostic=_DIAG_OK)
