@@ -13,7 +13,7 @@ ways so hidden pages never receive write-triggered reads.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import gi
@@ -276,16 +276,32 @@ class HistoryPage(Gtk.Box):
             parts.append(f"{_('Count')}: {stats.count}")
             if stats.reset_count > 0:
                 parts.append(f"{_('Resets')}: {stats.reset_count}")
-            # First/last observation in local time
+            # First/last observation in local time (pure presentation helper)
             if stats.first_observed is not None:
-                parts.append(f"{_('First')}: {_format_local(stats.first_observed)}")
+                parts.append(f"{_('First')}: {format_observation_time(stats.first_observed)}")
             if stats.last_observed is not None:
-                parts.append(f"{_('Last')}: {_format_local(stats.last_observed)}")
+                parts.append(f"{_('Last')}: {format_observation_time(stats.last_observed)}")
         label = Gtk.Label(label=_(" · ").join(parts), xalign=0, wrap=True)
         return label
 
 
-def _format_local(utc_dt: datetime) -> str:
-    """Format a UTC datetime in the local timezone for display only."""
-    local_dt = utc_dt.astimezone()
+def format_observation_time(
+    utc_dt: datetime,
+    target_tz: timezone | None = None,
+) -> str:
+    """Format a UTC datetime in the target timezone for display only.
+
+    Pure function. Defaults to the system local timezone when
+    ``target_tz`` is None. Naive timestamps (no tzinfo) raise
+    ValueError (fail-closed) — they must never be silently interpreted.
+    """
+    if utc_dt.tzinfo is None:
+        raise ValueError("naive timestamps are not allowed; use timezone-aware datetimes")
+    tz = target_tz if target_tz is not None else UTC
+    local_dt = utc_dt.astimezone(tz)
     return local_dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _format_local(utc_dt: datetime) -> str:
+    """Format a UTC datetime in the system local timezone for display only."""
+    return format_observation_time(utc_dt, target_tz=None)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -853,75 +853,268 @@ def test_visibility_transitions_block_reread() -> None:
     assert refreshed[0] == 1
 
 
-def test_old_generation_suppresses_callback(tmp_path: Path) -> None:
-    """An older successful write must not fire the callback while newer
-    saturated work is unresolved."""
-    # Use a real coordinator with a blocking writer
+def test_gen1_in_flight_gen2_pending_gen1_success_no_callback(tmp_path: Path) -> None:
+    """Gen1 in flight + gen2 pending (free slot): gen1 success → 0 callbacks.
+
+    Gen2 was accepted in the free pending slot (no saturation), so
+    _latest_accepted_gen >= 2 when gen1 completes. The publication
+    invariant suppresses the callback.
+    """
     import moira.history_db as hdb
     from moira.history_db import HistoryCoordinator
 
     original_write = hdb.write_history_safely
-    block = threading.Event()
-    call_count = [0]
-    callback_fired = [0]
+    gen1_started = threading.Event()
+    gen1_block = threading.Event()
+    gen1_done = threading.Event()
+    write_count = [0]
+    callback_count = [0]
 
-    def blocking_write(*args: Any, **kwargs: Any) -> Any:
-        call_count[0] += 1
-        if call_count[0] == 1:
-            block.wait(timeout=5.0)
+    def controlled_write(*args: Any, **kwargs: Any) -> Any:
+        write_count[0] += 1
+        if write_count[0] == 1:
+            gen1_started.set()
+            gen1_block.wait(timeout=5.0)
+            result = original_write(*args, **kwargs)
+            gen1_done.set()
+            return result
         return original_write(*args, **kwargs)
 
     coord = HistoryCoordinator(db_path=tmp_path / "test.sqlite3")
-    coord.set_write_success_callback(lambda: callback_fired.__setitem__(0, callback_fired[0] + 1))
+    coord.set_write_success_callback(lambda: callback_count.__setitem__(0, callback_count[0] + 1))
     coord.start()
 
-    hdb.write_history_safely = blocking_write
+    hdb.write_history_safely = controlled_write
     try:
-        # Enqueue two batches rapidly — second replaces pending (saturates)
+        # Enqueue gen1 — worker picks it up and blocks
         coord.enqueue([], NOW)
+        assert gen1_started.wait(timeout=3.0)
+
+        # Enqueue gen2 — accepted in free pending slot (no saturation)
         coord.enqueue([], NOW)
 
-        # Release the blocked first write
-        block.set()
-        time.sleep(0.5)
+        # Release gen1 — it succeeds while gen2 is pending
+        gen1_block.set()
+        assert gen1_done.wait(timeout=3.0)
 
-        # The callback should NOT have fired for the first (old) write
-        # because saturation was active when it completed.
-        # It may have fired for the second (newest) write if it succeeded.
+        # Gen1 success must NOT fire callback (gen2 is newer, still pending)
+        assert callback_count[0] == 0
     finally:
         hdb.write_history_safely = original_write
         coord.shutdown()
 
 
-def test_latest_success_publishes(tmp_path: Path) -> None:
-    """A successful write with no saturation fires the callback."""
+def test_gen2_success_emits_exactly_one_callback(tmp_path: Path) -> None:
+    """Gen1 success suppressed; gen2 success → exactly 1 callback."""
+    import moira.history_db as hdb
     from moira.history_db import HistoryCoordinator
 
-    callback_fired = [0]
+    original_write = hdb.write_history_safely
+    gen1_started = threading.Event()
+    gen1_block = threading.Event()
+    write_count = [0]
+    callback_count = [0]
+
+    def controlled_write(*args: Any, **kwargs: Any) -> Any:
+        write_count[0] += 1
+        if write_count[0] == 1:
+            gen1_started.set()
+            gen1_block.wait(timeout=5.0)
+        return original_write(*args, **kwargs)
+
     coord = HistoryCoordinator(db_path=tmp_path / "test.sqlite3")
-    coord.set_write_success_callback(lambda: callback_fired.__setitem__(0, callback_fired[0] + 1))
+    coord.set_write_success_callback(lambda: callback_count.__setitem__(0, callback_count[0] + 1))
     coord.start()
 
-    # Single successful write — no saturation
+    hdb.write_history_safely = controlled_write
+    try:
+        coord.enqueue([], NOW)
+        assert gen1_started.wait(timeout=3.0)
+        coord.enqueue([], NOW)
+
+        # Release gen1 — succeeds, but gen2 is pending → no callback
+        gen1_block.set()
+
+        # Wait for gen2 to complete
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and callback_count[0] == 0:
+            time.sleep(0.05)
+
+        # Gen2 success → exactly 1 callback
+        assert callback_count[0] == 1
+    finally:
+        hdb.write_history_safely = original_write
+        coord.shutdown()
+
+
+def test_gen2_failure_emits_zero_callbacks(tmp_path: Path) -> None:
+    """Gen2 (latest accepted) failure → 0 callbacks."""
+    import moira.history_db as hdb
+    from moira.history import HistoryWriteResult
+    from moira.history_db import HistoryCoordinator
+
+    original_write = hdb.write_history_safely
+    gen1_started = threading.Event()
+    gen1_block = threading.Event()
+    write_count = [0]
+    callback_count = [0]
+
+    def controlled_write(*args: Any, **kwargs: Any) -> Any:
+        write_count[0] += 1
+        if write_count[0] == 1:
+            gen1_started.set()
+            gen1_block.wait(timeout=5.0)
+            return original_write(*args, **kwargs)
+        # Gen2 fails
+        return HistoryWriteResult(ok=False, diagnostic="database unavailable")
+
+    coord = HistoryCoordinator(db_path=tmp_path / "test.sqlite3")
+    coord.set_write_success_callback(lambda: callback_count.__setitem__(0, callback_count[0] + 1))
+    coord.start()
+
+    hdb.write_history_safely = controlled_write
+    try:
+        coord.enqueue([], NOW)
+        assert gen1_started.wait(timeout=3.0)
+        coord.enqueue([], NOW)
+
+        gen1_block.set()
+
+        # Wait for both writes to complete
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and write_count[0] < 2:
+            time.sleep(0.05)
+
+        # Gen1 success suppressed (gen2 pending), gen2 failure → 0 callbacks
+        assert callback_count[0] == 0
+    finally:
+        hdb.write_history_safely = original_write
+        coord.shutdown()
+
+
+def test_retained_saturated_gen3_success_one_callback(tmp_path: Path) -> None:
+    """Retained saturated gen3 success → exactly 1 callback.
+
+    Gen1 in flight; gen2 pending (free slot); gen3 replaces gen2 (saturates).
+    Gen1 success suppressed; gen3 success clears saturation → 1 callback.
+    """
+    import moira.history_db as hdb
+    from moira.history_db import HistoryCoordinator
+
+    original_write = hdb.write_history_safely
+    gen1_started = threading.Event()
+    gen1_block = threading.Event()
+    write_count = [0]
+    callback_count = [0]
+
+    def controlled_write(*args: Any, **kwargs: Any) -> Any:
+        write_count[0] += 1
+        if write_count[0] == 1:
+            gen1_started.set()
+            gen1_block.wait(timeout=5.0)
+        return original_write(*args, **kwargs)
+
+    coord = HistoryCoordinator(db_path=tmp_path / "test.sqlite3")
+    coord.set_write_success_callback(lambda: callback_count.__setitem__(0, callback_count[0] + 1))
+    coord.start()
+
+    hdb.write_history_safely = controlled_write
+    try:
+        coord.enqueue([], NOW)  # gen1
+        assert gen1_started.wait(timeout=3.0)
+        coord.enqueue([], NOW)  # gen2 (free pending slot)
+        coord.enqueue([], NOW)  # gen3 (replaces gen2, saturates)
+
+        gen1_block.set()
+
+        # Wait for gen3 to complete
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and callback_count[0] == 0:
+            time.sleep(0.05)
+
+        # Gen3 success → exactly 1 callback
+        assert callback_count[0] == 1
+    finally:
+        hdb.write_history_safely = original_write
+        coord.shutdown()
+
+
+def test_clearing_during_in_flight_prevents_delivery(tmp_path: Path) -> None:
+    """Clearing the callback during an in-flight write prevents delivery."""
+    import moira.history_db as hdb
+    from moira.history_db import HistoryCoordinator
+
+    original_write = hdb.write_history_safely
+    write_started = threading.Event()
+    write_block = threading.Event()
+    callback_count = [0]
+
+    def controlled_write(*args: Any, **kwargs: Any) -> Any:
+        write_started.set()
+        write_block.wait(timeout=5.0)
+        return original_write(*args, **kwargs)
+
+    coord = HistoryCoordinator(db_path=tmp_path / "test.sqlite3")
+    coord.set_write_success_callback(lambda: callback_count.__setitem__(0, callback_count[0] + 1))
+    coord.start()
+
+    hdb.write_history_safely = controlled_write
+    try:
+        coord.enqueue([], NOW)
+        assert write_started.wait(timeout=3.0)
+
+        # Clear callback while write is in-flight
+        coord.clear_write_success_callback()
+
+        # Release the write — it succeeds but callback is detached
+        write_block.set()
+        time.sleep(0.3)
+
+        assert callback_count[0] == 0
+    finally:
+        hdb.write_history_safely = original_write
+        coord.shutdown()
+
+
+def test_shutdown_clears_callback_ownership(tmp_path: Path) -> None:
+    """Shutdown clears the callback; no further invocations."""
+    from moira.history_db import HistoryCoordinator
+
+    callback_count = [0]
+    coord = HistoryCoordinator(db_path=tmp_path / "test.sqlite3")
+    coord.set_write_success_callback(lambda: callback_count.__setitem__(0, callback_count[0] + 1))
+    coord.start()
+
+    coord.shutdown()
+    assert callback_count[0] == 0
+
+    # Verify callback is cleared
+    with coord._cond:  # noqa: SLF001
+        assert coord._write_success_callback is None  # noqa: SLF001
+
+
+def test_callback_exception_isolated(tmp_path: Path) -> None:
+    """Callback exceptions do not crash the worker or affect state."""
+    from moira.history_db import HistoryCoordinator
+
+    callback_count = [0]
+
+    def exploding_callback() -> None:
+        callback_count[0] += 1
+        raise RuntimeError("boom")
+
+    coord = HistoryCoordinator(db_path=tmp_path / "test.sqlite3")
+    coord.set_write_success_callback(exploding_callback)
+    coord.start()
+
     coord.enqueue([], NOW)
     time.sleep(0.3)
 
-    assert callback_fired[0] >= 1
+    # Callback fired (and exception swallowed)
+    assert callback_count[0] >= 1
+    # Coordinator is still alive and functional
+    assert coord.lifecycle_state in ("running",)
     coord.shutdown()
-
-
-def test_writer_callback_detached_on_shutdown(tmp_path: Path) -> None:
-    """After shutdown, the write-success callback is not fired."""
-    from moira.history_db import HistoryCoordinator
-
-    callback_fired = [0]
-    coord = HistoryCoordinator(db_path=tmp_path / "test.sqlite3")
-    coord.set_write_success_callback(lambda: callback_fired.__setitem__(0, callback_fired[0] + 1))
-    coord.start()
-
-    coord.shutdown()
-    # Even if a write somehow completed after shutdown, no callback
-    assert callback_fired[0] == 0
 
 
 # ── 2c: Token availability note ──
@@ -1004,3 +1197,53 @@ def test_chart_set_dark_live() -> None:
 
     assert hasattr(chart_module.QuotaChart, "set_dark")
     assert hasattr(chart_module.QuotaChart, "set_series")
+
+
+# ── 2d: Timezone contract ──
+
+
+def test_format_observation_time_utc() -> None:
+    """Exact first/last text in UTC."""
+    from moira.history_page import format_observation_time
+
+    utc_dt = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
+    result = format_observation_time(utc_dt, target_tz=UTC)
+    assert result == "2026-08-02 12:00"
+
+
+def test_format_observation_time_utc_plus_2() -> None:
+    """Exact first/last text in UTC+02:00."""
+    from moira.history_page import format_observation_time
+
+    utc_dt = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
+    tz_plus_2 = timezone(timedelta(hours=2))
+    result = format_observation_time(utc_dt, target_tz=tz_plus_2)
+    assert result == "2026-08-02 14:00"
+
+
+def test_format_observation_time_naive_rejected() -> None:
+    """Naive timestamps raise ValueError (fail-closed)."""
+    from moira.history_page import format_observation_time
+
+    naive_dt = datetime(2026, 8, 2, 12, 0, 0)
+    with pytest.raises(ValueError, match="naive"):
+        format_observation_time(naive_dt)
+
+
+def test_series_stats_text_exact_values() -> None:
+    """Build first/last statistics text through pure presentation helper
+    and test exact values in UTC and UTC+02:00."""
+    from moira.history_page import format_observation_time
+
+    # Simulate SeriesStats with known timestamps
+    first = datetime(2026, 8, 2, 10, 0, 0, tzinfo=UTC)
+    last = datetime(2026, 8, 2, 14, 0, 0, tzinfo=UTC)
+
+    # UTC formatting
+    assert format_observation_time(first, target_tz=UTC) == "2026-08-02 10:00"
+    assert format_observation_time(last, target_tz=UTC) == "2026-08-02 14:00"
+
+    # UTC+02:00 formatting
+    tz_plus_2 = timezone(timedelta(hours=2))
+    assert format_observation_time(first, target_tz=tz_plus_2) == "2026-08-02 12:00"
+    assert format_observation_time(last, target_tz=tz_plus_2) == "2026-08-02 16:00"

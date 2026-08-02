@@ -635,8 +635,15 @@ class HistoryCoordinator:
         self._last_write_diagnostic = _DIAG_OK
         # Lifecycle: "new", "running", "shutting_down", "terminated"
         self._lifecycle = "new"
-        # Write-success callback for History refresh
+        # Write-success callback for History refresh.
+        # Thread-safe: set/cleared under self._cond.
+        # Revalidated immediately before invocation outside the lock.
         self._write_success_callback: Any = None
+        # Latest accepted generation (across in-flight and pending).
+        # Used by the publication invariant: a callback fires only when
+        # the completing generation equals _latest_accepted_gen, meaning
+        # no newer accepted generation exists.
+        self._latest_accepted_gen = 0
 
     @property
     def status(self) -> str:
@@ -669,10 +676,22 @@ class HistoryCoordinator:
     def set_write_success_callback(self, callback: Any) -> None:
         """Set a callback fired after a successful history write.
 
-        The callback is called outside the condition lock. It receives no
-        arguments. Use this to trigger a History tab refresh.
+        Thread-safe: registered under the Condition. Revalidated
+        immediately before invocation outside the lock. The callback
+        receives no arguments. Use this to trigger a History tab refresh.
         """
-        self._write_success_callback = callback
+        with self._cond:
+            self._write_success_callback = callback
+
+    def clear_write_success_callback(self) -> None:
+        """Detach the write-success callback. Thread-safe.
+
+        After this call, no further callbacks fire even if a write
+        completes that was in-flight before detachment. MainWindow
+        should call this before page and coordinator shutdown.
+        """
+        with self._cond:
+            self._write_success_callback = None
 
     def start(self) -> None:
         """Start the worker thread if in the NEW state.
@@ -708,6 +727,7 @@ class HistoryCoordinator:
                 self._pending = snapshot
                 self._pending_time = now
                 self._pending_gen = self._generation
+                self._latest_accepted_gen = self._generation
                 if self._saturation_gen < self._generation:
                     self._saturation_gen = self._generation
                 self._cond.notify_all()
@@ -717,6 +737,7 @@ class HistoryCoordinator:
             self._pending = snapshot
             self._pending_time = now
             self._pending_gen = self._generation
+            self._latest_accepted_gen = self._generation
             self._cond.notify_all()
             return True
 
@@ -750,32 +771,34 @@ class HistoryCoordinator:
                 # the saturation generation.
                 if gen >= self._saturation_gen:
                     if result.ok:
-                        # Successful completion of the retained (or later)
-                        # generation clears the saturation latch.
                         self._saturation_gen = 0
                         self._status = _DIAG_OK
                     else:
-                        # Failure of the retained generation does NOT clear
-                        # saturation. Keep backlog saturated as the public
-                        # status. The diagnostic is stored internally.
                         self._status = _DIAG_BACKLOG
-                # else: an older write completed — preserve current status
-                # Publish writer success only when current enough: no callback
-                # from an older success while newer pending/replacement work
-                # or saturation exists.
-                fire_callback = (
+                # Publication invariant: notify History only after a
+                # successful generation when no newer accepted generation
+                # is pending or in flight, no saturation is unresolved,
+                # and lifecycle is RUNNING.
+                publish = (
                     result.ok
-                    and self._write_success_callback is not None
-                    and gen >= self._saturation_gen
+                    and gen == self._latest_accepted_gen
+                    and self._saturation_gen == 0
                     and self._lifecycle == "running"
                 )
                 callback = self._write_success_callback
-            # Fire write-success callback outside the lock
-            if fire_callback and callback is not None:
-                try:
-                    callback()
-                except Exception:
-                    pass
+            # Fire write-success callback outside the lock.
+            # Revalidate callback identity immediately before invocation
+            # to prevent a callback captured before detachment from
+            # reaching the UI.
+            if publish and callback is not None:
+                with self._cond:
+                    if self._write_success_callback is not callback:
+                        callback = None
+                if callback is not None:
+                    try:
+                        callback()
+                    except Exception:
+                        pass
 
     def shutdown(self, *, timeout: float | None = None) -> None:
         """Idempotent shutdown.
@@ -829,3 +852,4 @@ class HistoryCoordinator:
         with self._cond:
             self._thread = None
             self._lifecycle = "terminated"
+            self._write_success_callback = None

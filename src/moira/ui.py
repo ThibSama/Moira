@@ -442,6 +442,7 @@ class MainWindow(Adw.ApplicationWindow):
         with a sanitized status. Never blocks GTK for more than 3 seconds.
         """
         self._history_page.shutdown()
+        self._history_coordinator.clear_write_success_callback()
         self._history_coordinator.shutdown()
         return False
 
