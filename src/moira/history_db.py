@@ -341,28 +341,46 @@ CREATE TABLE IF NOT EXISTS token_events (
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
-    """Initialize or migrate the schema. Throws on irrecoverable mismatch."""
-    # For a fresh database, create v3 directly
-    conn.executescript(SCHEMA_SQL_V3)
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    """Initialize or migrate the schema. Throws on irrecoverable mismatch.
+
+    Inspects the existing schema version BEFORE any v3 DDL. If the database
+    is fresh (no schema_meta table), creates v3 directly. If at v1 or v2,
+    runs the incremental migration path. The v3 DDL is never applied to a
+    non-v3 database — migrations run their own targeted DDL inside explicit
+    transactions. Failed migration leaves version, tables, indexes and rows
+    exactly as they were before.
+    """
+    # Detect the existing version before creating anything
+    has_meta = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'"
+        ).fetchone()
+        is not None
+    )
+    if has_meta:
         row = conn.execute("SELECT version FROM schema_meta").fetchone()
         if row is None:
+            # Table exists but no version row — insert for a fresh v3
             conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
-        elif row[0] == 1:
-            conn.execute("ROLLBACK")
+            return
+        if row[0] == 1:
             _migrate_v1_to_v2(conn)
-            # Now at v2, continue to v3
             _migrate_v2_to_v3(conn)
             return
-        elif row[0] == 2:
-            conn.execute("ROLLBACK")
+        if row[0] == 2:
             _migrate_v2_to_v3(conn)
             return
-        elif row[0] != SCHEMA_VERSION:
+        if row[0] != SCHEMA_VERSION:
             raise SchemaVersionError(
                 f"history database schema version {row[0]} does not match expected {SCHEMA_VERSION}"
             )
+        return  # Already at v3
+
+    # Fresh database: create v3 directly
+    conn.executescript(SCHEMA_SQL_V3)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
         conn.execute("COMMIT")
     except Exception:
         try:
@@ -468,6 +486,9 @@ def record_token(
 
     Generates a stable event key from (service, bucket) for deduplication.
     Returns True. Purges old rows after a successful write.
+
+    Only total_tokens is populated; breakdown columns are NULL (schema v3
+    columns retained for backward compatibility but no longer written).
     """
     clock = now or datetime.now(UTC)
     bucket = _bucket(obs.observed_at)
@@ -481,7 +502,7 @@ def record_token(
             "(event_key, service, period_start, period_kind, observed_at, source, "
             "status, input_tokens, cached_input_tokens, output_tokens, "
             "reasoning_output_tokens, total_tokens) "
-            "VALUES (?, ?, ?, 'bucket', ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, 'bucket', ?, ?, ?, NULL, NULL, NULL, NULL, ?)",
             (
                 event_key,
                 obs.service.value,
@@ -489,11 +510,7 @@ def record_token(
                 observed_iso,
                 obs.source,
                 obs.status.value,
-                obs.input_tokens,
-                obs.cached_input_tokens,
-                obs.output_tokens,
-                obs.reasoning_output_tokens,
-                obs.total_tokens,
+                obs.tokens,
             ),
         )
         _purge(conn, clock)
@@ -519,8 +536,9 @@ def record_token_events(
     derived from (service, day, source). Idempotent: replay of the same
     (service, day, source) upserts the values via INSERT OR REPLACE.
 
-    Only AVAILABLE readings with total_tokens are stored. Non-available,
-    error, and empty readings are skipped silently.
+    Only readings with status ``available_exact`` and a non-None tokens
+    value are stored. Non-available, error, and empty readings are skipped
+    silently.
 
     Returns the number of events written. Purges old rows after write.
     """
@@ -533,9 +551,9 @@ def record_token_events(
         for reading in readings:
             if not isinstance(reading, TokenReading):
                 continue
-            if reading.status.value not in ("available",):
+            if reading.status != "available_exact":
                 continue
-            if reading.total_tokens is None:
+            if reading.tokens is None:
                 continue
 
             event_key = _make_usage_event_key(reading.service, reading.day, reading.source)
@@ -545,18 +563,14 @@ def record_token_events(
                 "(event_key, service, period_start, period_kind, observed_at, source, "
                 "status, input_tokens, cached_input_tokens, output_tokens, "
                 "reasoning_output_tokens, total_tokens) "
-                "VALUES (?, ?, ?, 'day', ?, ?, 'available_exact', ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, 'day', ?, ?, 'available_exact', NULL, NULL, NULL, NULL, ?)",
                 (
                     event_key,
                     reading.service.value,
                     reading.day.isoformat(),
                     observed_iso,
                     reading.source,
-                    reading.input_tokens,
-                    reading.cached_input_tokens,
-                    reading.output_tokens,
-                    reading.reasoning_output_tokens,
-                    reading.total_tokens,
+                    reading.tokens,
                 ),
             )
             written += 1
@@ -573,13 +587,17 @@ def record_token_events(
 
 
 def _purge(conn: sqlite3.Connection, now: datetime) -> int:
-    """Delete rows older than 90 days. Returns count of deleted rows."""
+    """Delete rows older than 90 days. Returns count of deleted rows.
+
+    Token events use period_start (logical day), not observed_at
+    (retrieval time), as the retention boundary.
+    """
     boundary = (now - timedelta(days=RETENTION_DAYS)).isoformat()
     quota_deleted = conn.execute(
         "DELETE FROM quota_observations WHERE observed_at < ?", (boundary,)
     ).rowcount
     token_deleted = conn.execute(
-        "DELETE FROM token_events WHERE observed_at < ?", (boundary,)
+        "DELETE FROM token_events WHERE period_start < ?", (boundary,)
     ).rowcount
     return quota_deleted + token_deleted
 
@@ -630,18 +648,20 @@ def query_token(
 ) -> list[TokenObservation]:
     """Return token observations since a given UTC time, optionally filtered.
 
-    Reads from token_events (v3) table.
+    Range filtering uses period_start (the logical day boundary), not
+    observed_at (retrieval time). Reads from token_events (v3) table.
+    Only total_tokens is populated; breakdown columns exist in the schema
+    but are no longer written.
     """
     since_iso = since.isoformat()
-    clauses = ["observed_at >= ?"]
+    clauses = ["period_start >= ?"]
     params: list[object] = [since_iso]
     if service is not None:
         clauses.append("service = ?")
         params.append(service.value)
     where = " AND ".join(clauses)
     rows = conn.execute(
-        f"SELECT service, observed_at, source, status, input_tokens, "
-        f"cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens "
+        f"SELECT service, observed_at, source, status, total_tokens "
         f"FROM token_events WHERE {where} ORDER BY period_start ASC, observed_at ASC",
         params,
     ).fetchall()
@@ -651,11 +671,7 @@ def query_token(
             observed_at=datetime.fromisoformat(row[1]),
             source=row[2],
             status=HistoryStatus(row[3]),
-            input_tokens=row[4],
-            cached_input_tokens=row[5],
-            output_tokens=row[6],
-            reasoning_output_tokens=row[7],
-            total_tokens=row[8],
+            tokens=row[4],
         )
         for row in rows
     ]
@@ -747,9 +763,9 @@ def record_refresh(
                 continue
             quota_readings.append(reading)
         elif isinstance(reading, TokenReading):
-            if reading.status is not QuotaStatus.AVAILABLE:
+            if reading.status != "available_exact":
                 continue
-            if reading.total_tokens is None:
+            if reading.tokens is None:
                 continue
             token_readings.append(reading)
 

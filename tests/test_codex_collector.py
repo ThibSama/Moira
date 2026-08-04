@@ -57,26 +57,24 @@ def usage_response() -> dict[str, object]:
     return {
         "id": 3,
         "result": {
-            "usage": [
-                {
-                    "day": "2026-08-04",
-                    "inputTokens": 1000,
-                    "cachedInputTokens": 200,
-                    "outputTokens": 500,
-                    "reasoningOutputTokens": 0,
-                    "totalTokens": 1700,
-                }
-            ]
+            "summary": {"lifetime": 50000, "peak": 3000, "streak": 7, "longestTurn": 1500},
+            "dailyUsageBuckets": [
+                {"startDate": "2026-08-04", "tokens": 1700},
+            ],
         },
     }
 
 
 def test_handshake_requests_both_surfaces_independently() -> None:
+    """Both rate limits and usage are requested independently with separate deadlines."""
     events: list[str] = []
     process = FakeProcess(events)
 
+    requests_seen: list[int] = []
+
     def response(_process: object, request_id: int, _deadline: float) -> dict[str, object]:
         events.append(f"read:{request_id}")
+        requests_seen.append(request_id)
         if request_id == 1:
             return {"id": 1, "result": {}}
         if request_id == 2:
@@ -104,25 +102,24 @@ def test_handshake_requests_both_surfaces_independently() -> None:
     assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
     assert result.quota_readings[0].quota_label == "Weekly"
     assert len(result.token_readings) == 1
-    assert result.token_readings[0].total_tokens == 1700
-    assert result.token_readings[0].input_tokens == 1000
+    assert result.token_readings[0].tokens == 1700
+    assert result.token_readings[0].status == "available_exact"
+    # codex_summary is populated
+    assert result.codex_summary is not None
+    assert result.codex_summary["lifetime"] == 50000
 
 
 def test_usage_failure_preserves_quota() -> None:
-    """When usage request fails, quota readings still survive."""
+    """When usage request fails, quota survives with a TEMPORARILY_UNAVAILABLE token."""
     events: list[str] = []
     process = FakeProcess(events)
 
-    call_count = 0
-
     def response(_process: object, request_id: int, _deadline: float) -> dict[str, object]:
-        nonlocal call_count
-        call_count += 1
         if request_id == 1:
             return {"id": 1, "result": {}}
         if request_id == 2:
             return weekly_response()
-        # request_id == 3: simulate failure
+        # request_id == 3: simulate transport failure
         raise TimeoutError("usage timeout")
 
     with (
@@ -135,7 +132,63 @@ def test_usage_failure_preserves_quota() -> None:
 
     assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
     assert result.quota_readings[0].quota_label == "Weekly"
-    assert len(result.token_readings) == 0
+    # Usage failure produces a temporarily_unavailable token reading
+    assert len(result.token_readings) == 1
+    assert result.token_readings[0].status == "temporarily_unavailable"
+    assert result.token_readings[0].detail == "Codex usage request failed"
+
+
+def test_usage_rpc_error_preserves_quota() -> None:
+    """When usage returns an RPC error, quota survives with temporarily_unavailable token."""
+    events: list[str] = []
+    process = FakeProcess(events)
+
+    def response(_process: object, request_id: int, _deadline: float) -> dict[str, object]:
+        if request_id == 1:
+            return {"id": 1, "result": {}}
+        if request_id == 2:
+            return weekly_response()
+        # RPC-level error
+        return {"id": 3, "error": {"code": -32000, "message": "not authorized"}}
+
+    with (
+        patch("moira.collectors.shutil.which", return_value="/usr/bin/codex"),
+        patch("moira.collectors.subprocess.Popen", return_value=process),
+        patch("moira.collectors._read_response", side_effect=response),
+        patch("moira.collectors.os.killpg"),
+    ):
+        result = CodexCollector().collect()
+
+    assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
+    assert len(result.token_readings) == 1
+    assert result.token_readings[0].status == "temporarily_unavailable"
+
+
+def test_usage_parse_error_produces_invalid() -> None:
+    """Malformed usage response body produces an INVALID token reading."""
+    events: list[str] = []
+    process = FakeProcess(events)
+
+    def response(_process: object, request_id: int, _deadline: float) -> dict[str, object]:
+        if request_id == 1:
+            return {"id": 1, "result": {}}
+        if request_id == 2:
+            return weekly_response()
+        # Malformed success body
+        return {"id": 3, "result": {"dailyUsageBuckets": "not-a-list"}}
+
+    with (
+        patch("moira.collectors.shutil.which", return_value="/usr/bin/codex"),
+        patch("moira.collectors.subprocess.Popen", return_value=process),
+        patch("moira.collectors._read_response", side_effect=response),
+        patch("moira.collectors.os.killpg"),
+    ):
+        result = CodexCollector().collect()
+
+    assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
+    assert len(result.token_readings) == 1
+    assert result.token_readings[0].status == "invalid"
+    assert result.token_readings[0].detail == "Codex usage response malformed"
 
 
 def test_timeout_terminates_process_group_and_sanitizes_error() -> None:
@@ -150,7 +203,9 @@ def test_timeout_terminates_process_group_and_sanitizes_error() -> None:
         result = CodexCollector().collect()
     assert result.quota_readings[0].status is QuotaStatus.ERROR
     assert result.quota_readings[0].detail == "Codex app-server request failed"
-    assert len(result.token_readings) == 0
+    # Token reading shows temporarily unavailable
+    assert len(result.token_readings) == 1
+    assert result.token_readings[0].status == "temporarily_unavailable"
     kill.assert_called_once_with(4242, signal.SIGTERM)
 
 
@@ -179,4 +234,50 @@ def test_rate_limit_parse_error_preserves_tokens() -> None:
     assert result.quota_readings[0].status is QuotaStatus.PARSE_ERROR
     # Token readings survive
     assert len(result.token_readings) == 1
-    assert result.token_readings[0].total_tokens == 1700
+    assert result.token_readings[0].tokens == 1700
+    assert result.token_readings[0].status == "available_exact"
+
+
+def test_independent_deadlines() -> None:
+    """Rate limits and usage get independent deadlines — neither can consume the other."""
+    events: list[str] = []
+    process = FakeProcess(events)
+
+    rate_deadlines: list[float] = []
+    usage_deadlines: list[float] = []
+
+    def response(_process: object, request_id: int, deadline: float) -> dict[str, object]:
+        if request_id == 1:
+            return {"id": 1, "result": {}}
+        if request_id == 2:
+            rate_deadlines.append(deadline)
+            return weekly_response()
+        usage_deadlines.append(deadline)
+        return usage_response()
+
+    with (
+        patch("moira.collectors.shutil.which", return_value="/usr/bin/codex"),
+        patch("moira.collectors.subprocess.Popen", return_value=process),
+        patch("moira.collectors._read_response", side_effect=response),
+        patch("moira.collectors.os.killpg"),
+        patch("moira.collectors.time.monotonic", side_effect=[0.0, 0.0, 0.1, 0.1, 0.2, 0.2]),
+    ):
+        result = CodexCollector().collect()
+
+    assert len(rate_deadlines) == 1
+    assert len(usage_deadlines) == 1
+    # Each surface has its own independent deadline
+    assert rate_deadlines[0] != usage_deadlines[0]
+    assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
+    assert result.token_readings[0].status == "available_exact"
+
+
+def test_codex_not_found_produces_unsupported() -> None:
+    """When codex CLI is not found, quota is UNAVAILABLE and tokens are UNSUPPORTED."""
+    with patch("moira.collectors.shutil.which", return_value=None):
+        result = CodexCollector().collect()
+
+    assert len(result.quota_readings) == 1
+    assert result.quota_readings[0].status is QuotaStatus.UNAVAILABLE
+    assert len(result.token_readings) == 1
+    assert result.token_readings[0].status == "unsupported"

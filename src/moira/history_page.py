@@ -283,20 +283,24 @@ class HistoryPage(Gtk.Box):
 
     @staticmethod
     def _token_summary_label(ts: TokenSummary) -> Gtk.Widget:
-        """Build a label showing token activity for one service."""
+        """Build a label showing token activity and summary for one service."""
         _ = tr
         parts: list[str] = [f"{ts.service.value.title()} {_('token activity')}"]
-        parts.append(f"{_('Total')}: {ts.total_tokens:,}")
-        if ts.total_input_tokens:
-            parts.append(f"{_('Input')}: {ts.total_input_tokens:,}")
-        if ts.total_cached_input_tokens:
-            parts.append(f"{_('Cached')}: {ts.total_cached_input_tokens:,}")
-        if ts.total_output_tokens:
-            parts.append(f"{_('Output')}: {ts.total_output_tokens:,}")
-        if ts.total_reasoning_output_tokens:
-            parts.append(f"{_('Reasoning')}: {ts.total_reasoning_output_tokens:,}")
+        parts.append(f"{_('Daily total')}: {ts.total_tokens:,}")
         if ts.earliest_day:
             parts.append(f"{ts.earliest_day}–{ts.latest_day}")
+        # Official summary fields shown separately
+        summary_fields: list[str] = []
+        if ts.summary_lifetime is not None:
+            summary_fields.append(f"{_('Lifetime')}: {ts.summary_lifetime:,}")
+        if ts.summary_peak is not None:
+            summary_fields.append(f"{_('Peak')}: {ts.summary_peak:,}")
+        if ts.summary_streak is not None:
+            summary_fields.append(f"{_('Streak')}: {ts.summary_streak:,}")
+        if ts.summary_longest_turn is not None:
+            summary_fields.append(f"{_('Longest turn')}: {ts.summary_longest_turn:,}")
+        if summary_fields:
+            parts.append(f"{_('Summary')}: " + " · ".join(summary_fields))
         parts.append(f"{_('Source')}: {ts.source}")
         return Gtk.Label(label=_(" · ").join(parts), xalign=0, wrap=True)
 

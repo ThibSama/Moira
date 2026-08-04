@@ -86,24 +86,28 @@ def utc_now() -> datetime:
 
 @dataclass(frozen=True, slots=True)
 class TokenReading:
-    """A validated daily token-usage reading from a structured provider surface.
+    """A validated daily token-usage reading from the Codex account/usage/read surface.
 
-    Represents account-level daily activity, never quota-window or per-thread.
-    Token counts are non-negative integers sourced from structured fields only.
-    When the provider does not expose exact counts, status is UNAVAILABLE and
-    token fields are None.
+    Represents one daily bucket (``dailyUsageBuckets[{startDate,tokens}]``).
+    The single ``tokens`` field is the official daily total — no input/output/
+    cache/reasoning breakdown is exposed. Summary fields (lifetime, peak, streak,
+    longest-turn) are provider aggregates stored separately from daily buckets.
+
+    Token availability is independent of quota percentage status.
+    AVAILABLE_EXACT carries a non-negative integer tokens value.
+    Other statuses carry no counts.
     """
 
     service: Service
     day: date
     retrieved_at: datetime
     source: str
-    status: QuotaStatus
-    input_tokens: int | None = None
-    cached_input_tokens: int | None = None
-    output_tokens: int | None = None
-    reasoning_output_tokens: int | None = None
-    total_tokens: int | None = None
+    status: str  # HistoryStatus value
+    tokens: int | None = None
+    summary_lifetime: int | None = None
+    summary_peak: int | None = None
+    summary_streak: int | None = None
+    summary_longest_turn: int | None = None
     detail: str = ""
 
     def __post_init__(self) -> None:
@@ -111,31 +115,36 @@ class TokenReading:
             raise ValueError("retrieved_at must be timezone-aware")
         if not self.source.strip():
             raise ValueError("source must not be empty")
-        if self.status in {QuotaStatus.AVAILABLE, QuotaStatus.STALE}:
-            if self.total_tokens is None:
-                raise ValueError("available and stale token readings require total_tokens")
+        if self.status == "available_exact":
+            if self.tokens is None:
+                raise ValueError("AVAILABLE_EXACT token readings require tokens")
         else:
             if any(
                 v is not None
                 for v in (
-                    self.input_tokens,
-                    self.cached_input_tokens,
-                    self.output_tokens,
-                    self.reasoning_output_tokens,
-                    self.total_tokens,
+                    self.tokens,
+                    self.summary_lifetime,
+                    self.summary_peak,
+                    self.summary_streak,
+                    self.summary_longest_turn,
                 )
             ):
                 raise ValueError("non-available token readings must not carry counts")
         for name, value in (
-            ("input_tokens", self.input_tokens),
-            ("cached_input_tokens", self.cached_input_tokens),
-            ("output_tokens", self.output_tokens),
-            ("reasoning_output_tokens", self.reasoning_output_tokens),
-            ("total_tokens", self.total_tokens),
+            ("tokens", self.tokens),
+            ("summary_lifetime", self.summary_lifetime),
+            ("summary_peak", self.summary_peak),
+            ("summary_streak", self.summary_streak),
+            ("summary_longest_turn", self.summary_longest_turn),
         ):
             if value is not None:
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                     raise ValueError(f"{name} must be a non-negative integer")
+
+    @property
+    def available(self) -> bool:
+        """Return True when exact tokens are available."""
+        return self.status == "available_exact" and self.tokens is not None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -143,15 +152,15 @@ class TokenReading:
             "day": self.day.isoformat(),
             "retrieved_at": self.retrieved_at.isoformat(),
             "source": self.source,
-            "status": self.status.value,
+            "status": self.status,
             "detail": self.detail,
         }
         for field in (
-            "input_tokens",
-            "cached_input_tokens",
-            "output_tokens",
-            "reasoning_output_tokens",
-            "total_tokens",
+            "tokens",
+            "summary_lifetime",
+            "summary_peak",
+            "summary_streak",
+            "summary_longest_turn",
         ):
             value = getattr(self, field)
             if value is not None:
@@ -165,12 +174,12 @@ class TokenReading:
             day=date.fromisoformat(data["day"]),
             retrieved_at=datetime.fromisoformat(data["retrieved_at"]),
             source=str(data["source"]),
-            status=QuotaStatus(data["status"]),
-            input_tokens=data.get("input_tokens"),
-            cached_input_tokens=data.get("cached_input_tokens"),
-            output_tokens=data.get("output_tokens"),
-            reasoning_output_tokens=data.get("reasoning_output_tokens"),
-            total_tokens=data.get("total_tokens"),
+            status=str(data["status"]),
+            tokens=data.get("tokens"),
+            summary_lifetime=data.get("summary_lifetime"),
+            summary_peak=data.get("summary_peak"),
+            summary_streak=data.get("summary_streak"),
+            summary_longest_turn=data.get("summary_longest_turn"),
             detail=str(data.get("detail", "")),
         )
 
@@ -181,7 +190,10 @@ class CollectorResult:
 
     Carries both quota readings and token readings. Token readings are only
     present when the provider exposes a structured token surface.
+    codex_summary carries the official aggregate summary (lifetime, peak,
+    streak, longest-turn) when available from the usage surface.
     """
 
     quota_readings: tuple[QuotaReading, ...]
     token_readings: tuple[TokenReading, ...]
+    codex_summary: dict[str, object] | None = None

@@ -66,18 +66,20 @@ class TokenSummary:
 
     Empty when no exact token data is available. Totals are the sum of all
     token events in the range. Provenance is the source string.
+    Summary fields (lifetime, peak, streak, longest_turn) come from the
+    official Codex summary block and are displayed separately.
     """
 
     service: Service
     source: str
-    total_input_tokens: int
-    total_cached_input_tokens: int
-    total_output_tokens: int
-    total_reasoning_output_tokens: int
     total_tokens: int
     event_count: int
     earliest_day: str | None
     latest_day: str | None
+    summary_lifetime: int | None = None
+    summary_peak: int | None = None
+    summary_streak: int | None = None
+    summary_longest_turn: int | None = None
 
     @property
     def has_data(self) -> bool:
@@ -256,7 +258,12 @@ def _group_observations(
 def _build_token_summaries(
     token_observations: list[TokenObservation],
 ) -> tuple[TokenSummary, ...]:
-    """Build TokenSummary objects from token observations, grouped by service+source."""
+    """Build TokenSummary objects from token observations, grouped by service+source.
+
+    Only AVAILABLE_EXACT observations contribute to totals. Summary fields
+    (lifetime, peak, streak, longest_turn) come from observations that carry
+    them.
+    """
     if not token_observations:
         return ()
 
@@ -270,34 +277,39 @@ def _build_token_summaries(
 
     summaries: list[TokenSummary] = []
     for (service, source), obs_list in sorted(groups.items()):
-        input_sum = 0
-        cached_sum = 0
-        output_sum = 0
-        reasoning_sum = 0
         total_sum = 0
         days: list[datetime] = []
+        # Collect summary fields from the first observation that has them
+        summary_lifetime: int | None = None
+        summary_peak: int | None = None
+        summary_streak: int | None = None
+        summary_longest_turn: int | None = None
 
         for obs in obs_list:
-            input_sum += obs.input_tokens or 0
-            cached_sum += obs.cached_input_tokens or 0
-            output_sum += obs.output_tokens or 0
-            reasoning_sum += obs.reasoning_output_tokens or 0
-            total_sum += obs.total_tokens or 0
+            total_sum += obs.tokens or 0
             days.append(obs.observed_at)
+            if summary_lifetime is None:
+                summary_lifetime = obs.summary_lifetime
+            if summary_peak is None:
+                summary_peak = obs.summary_peak
+            if summary_streak is None:
+                summary_streak = obs.summary_streak
+            if summary_longest_turn is None:
+                summary_longest_turn = obs.summary_longest_turn
 
         days.sort()
         summaries.append(
             TokenSummary(
                 service=service,
                 source=source,
-                total_input_tokens=input_sum,
-                total_cached_input_tokens=cached_sum,
-                total_output_tokens=output_sum,
-                total_reasoning_output_tokens=reasoning_sum,
                 total_tokens=total_sum,
                 event_count=len(obs_list),
                 earliest_day=days[0].strftime("%Y-%m-%d") if days else None,
                 latest_day=days[-1].strftime("%Y-%m-%d") if days else None,
+                summary_lifetime=summary_lifetime,
+                summary_peak=summary_peak,
+                summary_streak=summary_streak,
+                summary_longest_turn=summary_longest_turn,
             )
         )
 

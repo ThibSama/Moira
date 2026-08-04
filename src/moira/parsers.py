@@ -166,12 +166,11 @@ def parse_codex_rate_limits(payload: dict[str, Any], retrieved_at: datetime) -> 
     ]
 
 
-def _validate_usage_token_field(value: Any, name: str) -> int | None:
-    """Validate a single token field from structured usage data.
+def _validate_single_token(value: Any, name: str) -> int | None:
+    """Validate a single integer token field from the usage surface.
 
-    Returns the integer value, or raises ParseError.
-    None is accepted (field absent). Booleans, floats, strings, negatives,
-    and overflow values all fail closed.
+    Returns the integer, or None if the field is absent. Booleans, floats,
+    strings, negatives, and overflow values all fail closed.
     """
     if value is None:
         return None
@@ -190,82 +189,85 @@ def _validate_usage_token_field(value: Any, name: str) -> int | None:
     return int(value)
 
 
-def parse_codex_usage(payload: dict[str, Any], retrieved_at: datetime) -> list[TokenReading]:
+def _parse_codex_summary(summary: dict[str, Any]) -> dict[str, int | None]:
+    """Parse the optional summary block from account/usage/read.
+
+    All summary fields are nullable integers. Missing keys → None.
+    Booleans, floats, negatives → ParseError.
+    """
+    fields: dict[str, int | None] = {}
+    for key in ("lifetime", "peak", "streak", "longestTurn"):
+        raw = summary.get(key)
+        if raw is None:
+            fields[key] = None
+        else:
+            fields[key] = _validate_single_token(raw, f"summary.{key}")
+    return fields
+
+
+def parse_codex_usage(
+    payload: dict[str, Any], retrieved_at: datetime
+) -> tuple[list[TokenReading], dict[str, int | None] | None]:
     """Parse Codex app-server's documented account/usage/read response.
 
-    Returns one TokenReading per daily bucket. Only structured fields are
-    parsed — no terminal scraping or private-endpoint access.
-    Fails closed on malformed, contradictory, or absent data.
+    Parses the official ``summary`` and ``dailyUsageBuckets[{startDate,tokens}]``
+    contract. Each bucket becomes one TokenReading with a single ``tokens``
+    field — no input/output/cache/reasoning breakdown. Summary fields
+    (lifetime, peak, streak, longestTurn) are returned separately.
+
+    Returns (daily_readings, summary_dict). summary_dict is None when the
+    summary block is absent or null. Fails closed on malformed, contradictory,
+    or absent data: malformed success → INVALID TokenReading, transport/provider
+    failure → handled by caller.
     """
     result = payload.get("result")
     if not isinstance(result, dict):
         raise ParseError("Codex usage result missing")
-    usage = result.get("usage")
-    if not isinstance(usage, list):
-        raise ParseError("Codex usage array missing or not a list")
-    if not usage:
-        raise ParseError("Codex usage array is empty")
+
+    # ── Parse summary (optional) ──
+    summary_raw = result.get("summary")
+    summary: dict[str, int | None] | None = None
+    if isinstance(summary_raw, dict):
+        try:
+            summary = _parse_codex_summary(summary_raw)
+        except ParseError:
+            # Summary malformed → still parse daily buckets, but note the error
+            summary = None
+
+    # ── Parse dailyUsageBuckets ──
+    buckets = result.get("dailyUsageBuckets")
+    if buckets is None:
+        # Null buckets → no daily data, but summary may still exist
+        return ([], summary)
+    if not isinstance(buckets, list):
+        raise ParseError("Codex usage dailyUsageBuckets is not a list")
+    if not buckets:
+        return ([], summary)
 
     source = "codex-app-server:account/usage/read"
     readings: list[TokenReading] = []
     seen_days: set[date] = set()
 
-    for entry in usage:
+    for i, entry in enumerate(buckets):
         if not isinstance(entry, dict):
-            raise ParseError("Codex usage entry is not a dict")
+            raise ParseError(f"Codex usage bucket[{i}] is not a dict")
 
-        # Parse and validate the day field
-        day_raw = entry.get("day")
-        if not isinstance(day_raw, str):
-            raise ParseError("Codex usage day field missing or wrong type")
+        # Parse and validate startDate
+        date_raw = entry.get("startDate")
+        if not isinstance(date_raw, str):
+            raise ParseError(f"Codex usage bucket[{i}] startDate missing or wrong type")
         try:
-            day = date.fromisoformat(day_raw)
+            day = date.fromisoformat(date_raw)
         except (ValueError, TypeError) as exc:
-            raise ParseError("Codex usage day format invalid") from exc
+            raise ParseError(f"Codex usage bucket[{i}] startDate format invalid") from exc
         if day in seen_days:
-            raise ParseError("Codex usage contains duplicate days")
+            raise ParseError(f"Codex usage contains duplicate date {date_raw}")
         seen_days.add(day)
 
-        # Parse token fields with fail-closed validation
-        input_tokens = _validate_usage_token_field(entry.get("inputTokens"), "inputTokens")
-        cached_input_tokens = _validate_usage_token_field(
-            entry.get("cachedInputTokens"), "cachedInputTokens"
-        )
-        output_tokens = _validate_usage_token_field(entry.get("outputTokens"), "outputTokens")
-        reasoning_output_tokens = _validate_usage_token_field(
-            entry.get("reasoningOutputTokens"), "reasoningOutputTokens"
-        )
-        total_tokens = _validate_usage_token_field(entry.get("totalTokens"), "totalTokens")
-
-        # Enforce total invariant when both total and breakdown are present
-        has_breakdown = any(
-            v is not None
-            for v in (input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens)
-        )
-        if total_tokens is not None:
-            if has_breakdown:
-                computed: int = 0
-                for v in (
-                    input_tokens,
-                    cached_input_tokens,
-                    output_tokens,
-                    reasoning_output_tokens,
-                ):
-                    if v is not None:
-                        computed += v
-                if computed != total_tokens:
-                    raise ParseError(
-                        f"Codex usage total ({total_tokens}) does not match breakdown sum "
-                        f"({computed}) for day {day_raw}"
-                    )
-        elif has_breakdown:
-            # Breakdown fields present but no total — can't verify, fail closed
-            raise ParseError(
-                f"Codex usage has breakdown fields but no total_tokens for day {day_raw}"
-            )
-
-        if total_tokens is None and not has_breakdown:
-            raise ParseError(f"Codex usage entry for {day_raw} has no token fields")
+        # Parse and validate tokens
+        tokens = _validate_single_token(entry.get("tokens"), f"bucket[{i}].tokens")
+        if tokens is None:
+            raise ParseError(f"Codex usage bucket[{i}] tokens field missing")
 
         readings.append(
             TokenReading(
@@ -273,13 +275,9 @@ def parse_codex_usage(payload: dict[str, Any], retrieved_at: datetime) -> list[T
                 day=day,
                 retrieved_at=retrieved_at,
                 source=source,
-                status=QuotaStatus.AVAILABLE,
-                input_tokens=input_tokens,
-                cached_input_tokens=cached_input_tokens,
-                output_tokens=output_tokens,
-                reasoning_output_tokens=reasoning_output_tokens,
-                total_tokens=total_tokens,
+                status="available_exact",
+                tokens=tokens,
             )
         )
 
-    return readings
+    return (readings, summary)

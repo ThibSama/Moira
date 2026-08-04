@@ -137,11 +137,12 @@ _FRENCH: dict[str, str] = {
     "Last": "Dernier",
     # ── Token display ──
     "token activity": "activité des jetons",
-    "Total": "Total",
-    "Input": "Entrée",
-    "Cached": "Cache",
-    "Output": "Sortie",
-    "Reasoning": "Raisonnement",
+    "Daily total": "Total journalier",
+    "Lifetime": "Durée de vie",
+    "Peak": "Pic",
+    "Streak": "Série",
+    "Longest turn": "Tour le plus long",
+    "Summary": "Résumé",
     "Source": "Source",
 }
 

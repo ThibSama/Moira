@@ -8,6 +8,7 @@ import signal
 import subprocess
 import time
 
+from .history import HistoryStatus
 from .models import CollectorResult, QuotaReading, QuotaStatus, Service, TokenReading, utc_now
 from .parsers import ParseError, parse_codex_rate_limits, parse_codex_usage
 
@@ -53,10 +54,14 @@ def _read_response(
 class CodexCollector:
     """Collects both quota and token data from the Codex app-server.
 
-    Reuses one initialized app-server process per refresh. Requests rate
-    limits and usage independently — failure of one surface does not
-    discard valid data from the other.
+    Reuses one initialized app-server process per refresh. Each surface
+    (rate limits, usage) gets an independent bounded deadline — one timeout
+    cannot consume or corrupt the other. Quota output survives usage failure.
+    Token availability is mapped from RPC/auth/transport outcomes.
     """
+
+    USAGE_SOURCE = "codex-app-server:account/usage/read"
+    RATE_SOURCE = "codex-app-server:account/rateLimits/read"
 
     def __init__(self) -> None:
         self.binary = "codex"
@@ -78,7 +83,16 @@ class CodexCollector:
                         "codex CLI not found",
                     ),
                 ),
-                token_readings=(),
+                token_readings=(
+                    TokenReading(
+                        service=Service.CODEX,
+                        day=now.date(),
+                        retrieved_at=now,
+                        source="codex-app-server",
+                        status=HistoryStatus.UNSUPPORTED.value,
+                        detail="codex CLI not found",
+                    ),
+                ),
             )
 
         process: subprocess.Popen[str] | None = None
@@ -94,9 +108,8 @@ class CodexCollector:
             if process.stdin is None or process.stdout is None:
                 raise OSError("Codex app-server pipes unavailable")
 
-            deadline = time.monotonic() + 12
-
-            # Initialize the app-server
+            # Initialize the app-server with a dedicated deadline
+            init_deadline = time.monotonic() + 8
             _send_message(
                 process,
                 {
@@ -105,19 +118,20 @@ class CodexCollector:
                     "params": {"clientInfo": {"name": "moira", "version": "0.2.2"}},
                 },
             )
-            initialized = _read_response(process, 1, deadline)
+            initialized = _read_response(process, 1, init_deadline)
             if "error" in initialized or not isinstance(initialized.get("result"), dict):
                 raise OSError("Codex app-server initialization rejected")
             _send_message(process, {"method": "initialized", "params": {}})
 
-            # Request rate limits and usage independently
             quota_readings: list[QuotaReading] = []
             token_readings: list[TokenReading] = []
+            codex_summary: dict[str, object] | None = None
 
-            # Rate limits request
+            # ── Rate limits (quota) — independent deadline ──
+            rate_deadline = time.monotonic() + 10
             _send_message(process, {"id": 2, "method": "account/rateLimits/read", "params": None})
             try:
-                rate_response = _read_response(process, 2, deadline)
+                rate_response = _read_response(process, 2, rate_deadline)
                 if "error" not in rate_response:
                     quota_readings.extend(parse_codex_rate_limits(rate_response, now))
                 else:
@@ -128,7 +142,7 @@ class CodexCollector:
                             None,
                             None,
                             now,
-                            "codex-app-server:account/rateLimits/read",
+                            self.RATE_SOURCE,
                             QuotaStatus.ERROR,
                             "Codex app-server rate-limit request rejected",
                         )
@@ -141,7 +155,7 @@ class CodexCollector:
                         None,
                         None,
                         now,
-                        "codex-app-server:account/rateLimits/read",
+                        self.RATE_SOURCE,
                         QuotaStatus.PARSE_ERROR,
                         "Codex rate-limit response malformed",
                     )
@@ -154,29 +168,63 @@ class CodexCollector:
                         None,
                         None,
                         now,
-                        "codex-app-server:account/rateLimits/read",
+                        self.RATE_SOURCE,
                         QuotaStatus.ERROR,
                         "Codex rate-limit request failed",
                     )
                 )
 
-            # Usage request (token data)
+            # ── Usage (token data) — independent deadline ──
+            usage_deadline = time.monotonic() + 10
             _send_message(process, {"id": 3, "method": "account/usage/read", "params": None})
             try:
-                usage_response = _read_response(process, 3, deadline)
-                if "error" not in usage_response:
-                    token_readings.extend(parse_codex_usage(usage_response, now))
-                # On error, silently produce no token readings (not a quota failure)
+                usage_response = _read_response(process, 3, usage_deadline)
+                if "error" in usage_response:
+                    # Auth/RPC-level rejection → temporarily unavailable
+                    token_readings.append(
+                        TokenReading(
+                            service=Service.CODEX,
+                            day=now.date(),
+                            retrieved_at=now,
+                            source=self.USAGE_SOURCE,
+                            status=HistoryStatus.TEMPORARILY_UNAVAILABLE.value,
+                            detail="Codex usage request rejected",
+                        )
+                    )
+                else:
+                    daily, summary_parsed = parse_codex_usage(usage_response, now)
+                    token_readings.extend(daily)
+                    if summary_parsed is not None:
+                        codex_summary = {k: v for k, v in summary_parsed.items() if v is not None}
             except ParseError:
-                # Malformed usage data — no token readings, but quotas survive
-                pass
+                # Malformed success body → invalid
+                token_readings.append(
+                    TokenReading(
+                        service=Service.CODEX,
+                        day=now.date(),
+                        retrieved_at=now,
+                        source=self.USAGE_SOURCE,
+                        status=HistoryStatus.INVALID.value,
+                        detail="Codex usage response malformed",
+                    )
+                )
             except (OSError, TimeoutError, json.JSONDecodeError):
-                # Usage request failed — no token readings, quotas survive
-                pass
+                # Transport/provider failure → temporarily unavailable
+                token_readings.append(
+                    TokenReading(
+                        service=Service.CODEX,
+                        day=now.date(),
+                        retrieved_at=now,
+                        source=self.USAGE_SOURCE,
+                        status=HistoryStatus.TEMPORARILY_UNAVAILABLE.value,
+                        detail="Codex usage request failed",
+                    )
+                )
 
             return CollectorResult(
                 quota_readings=tuple(quota_readings),
                 token_readings=tuple(token_readings),
+                codex_summary=codex_summary,
             )
 
         except (OSError, TimeoutError, subprocess.SubprocessError, json.JSONDecodeError):
@@ -193,7 +241,16 @@ class CodexCollector:
                         "Codex app-server request failed",
                     ),
                 ),
-                token_readings=(),
+                token_readings=(
+                    TokenReading(
+                        service=Service.CODEX,
+                        day=now.date(),
+                        retrieved_at=now,
+                        source="codex-app-server",
+                        status=HistoryStatus.TEMPORARILY_UNAVAILABLE.value,
+                        detail="Codex app-server request failed",
+                    ),
+                ),
             )
         finally:
             if process is not None and process.poll() is None:

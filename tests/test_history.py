@@ -537,8 +537,7 @@ def test_corrupt_table_raises_on_record(tmp_path: Path) -> None:
 def test_token_unsupported_factory() -> None:
     obs = TokenObservation.unsupported(Service.CLAUDE, NOW, "fixture")
     assert obs.status is HistoryStatus.UNSUPPORTED
-    assert obs.input_tokens is None
-    assert obs.total_tokens is None
+    assert obs.tokens is None
     assert not obs.has_exact_tokens
 
 
@@ -560,11 +559,7 @@ def test_token_available_exact_has_tokens() -> None:
         observed_at=NOW,
         source="fixture",
         status=HistoryStatus.AVAILABLE_EXACT,
-        input_tokens=100,
-        cached_input_tokens=50,
-        output_tokens=200,
-        reasoning_output_tokens=30,
-        total_tokens=380,
+        tokens=380,
     )
     assert obs.has_exact_tokens
 
@@ -576,7 +571,7 @@ def test_token_record_unsupported(tmp_path: Path) -> None:
     rows = query_token(conn, since=NOW - timedelta(hours=1))
     assert len(rows) == 1
     assert rows[0].status is HistoryStatus.UNSUPPORTED
-    assert rows[0].total_tokens is None
+    assert rows[0].tokens is None
     conn.close()
 
 
@@ -587,18 +582,13 @@ def test_token_record_exact(tmp_path: Path) -> None:
         observed_at=NOW,
         source="codex-app-server",
         status=HistoryStatus.AVAILABLE_EXACT,
-        input_tokens=100,
-        cached_input_tokens=50,
-        output_tokens=200,
-        reasoning_output_tokens=30,
-        total_tokens=380,
+        tokens=380,
     )
     record_token(conn, obs, now=NOW)
     rows = query_token(conn, since=NOW - timedelta(hours=1))
     assert len(rows) == 1
     assert rows[0].has_exact_tokens
-    assert rows[0].input_tokens == 100
-    assert rows[0].total_tokens == 380
+    assert rows[0].tokens == 380
     conn.close()
 
 
@@ -678,19 +668,18 @@ def test_token_available_exact_requires_total() -> None:
             observed_at=NOW,
             source="fixture",
             status=HistoryStatus.AVAILABLE_EXACT,
-            input_tokens=100,
-            total_tokens=None,
+            tokens=None,
         )
 
 
-def test_token_available_exact_requires_breakdown() -> None:
-    with pytest.raises(ValueError, match="breakdown"):
+def test_token_available_exact_requires_tokens() -> None:
+    """AVAILABLE_EXACT requires a non-None tokens value (the one daily total)."""
+    with pytest.raises(ValueError, match="total_tokens"):
         TokenObservation(
             service=Service.CLAUDE,
             observed_at=NOW,
             source="fixture",
             status=HistoryStatus.AVAILABLE_EXACT,
-            total_tokens=100,
         )
 
 
@@ -701,7 +690,7 @@ def test_token_non_available_must_not_carry_counts() -> None:
             observed_at=NOW,
             source="fixture",
             status=HistoryStatus.UNSUPPORTED,
-            total_tokens=100,
+            tokens=100,
         )
 
 
@@ -712,8 +701,7 @@ def test_token_rejects_negative_count() -> None:
             observed_at=NOW,
             source="fixture",
             status=HistoryStatus.AVAILABLE_EXACT,
-            input_tokens=-1,
-            total_tokens=100,
+            tokens=-1,
         )
 
 
@@ -1729,7 +1717,7 @@ def test_v2_to_v3_migration_preserves_token_rows(tmp_path: Path) -> None:
     assert row[0] == 3
     rows = query_token(conn, since=NOW - timedelta(hours=2))
     assert len(rows) == 2
-    total = sum(r.total_tokens or 0 for r in rows)
+    total = sum(r.tokens or 0 for r in rows)
     assert total == 425  # 300 + 125
     conn.close()
 

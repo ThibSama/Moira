@@ -109,69 +109,64 @@ class QuotaObservation:
 
 @dataclass(frozen=True, slots=True)
 class TokenObservation:
-    """An optional exact-token observation from a structured provider surface.
+    """An optional exact-token observation from the Codex structured surface.
 
-    Token counts are never estimated or derived from percentages. When the
-    provider does not expose exact counts, status is UNSUPPORTED and all
-    token fields are None. AVAILABLE_EXACT requires total_tokens;
-    non-available statuses carry no counts.
+    Represents one daily bucket (``dailyUsageBuckets[{startDate,tokens}]``).
+    Only ``tokens`` is stored — the API exposes no input/output/cache/reasoning
+    breakdown. Summary fields (lifetime, peak, streak, longest-turn) are provider
+    aggregates stored separately. Token counts are never estimated or derived from
+    percentages.
+
+    AVAILABLE_EXACT requires total_tokens. Non-available statuses carry no counts.
     """
 
     service: Service
     observed_at: datetime
     source: str
     status: HistoryStatus
-    input_tokens: int | None = None
-    cached_input_tokens: int | None = None
-    output_tokens: int | None = None
-    reasoning_output_tokens: int | None = None
-    total_tokens: int | None = None
+    tokens: int | None = None
+    summary_lifetime: int | None = None
+    summary_peak: int | None = None
+    summary_streak: int | None = None
+    summary_longest_turn: int | None = None
 
     def __post_init__(self) -> None:
         _validate_non_empty(self.source, "source")
         object.__setattr__(self, "observed_at", _ensure_utc(self.observed_at))
+        object.__setattr__(self, "tokens", _validate_non_negative_int(self.tokens, "tokens"))
         object.__setattr__(
-            self, "input_tokens", _validate_non_negative_int(self.input_tokens, "input_tokens")
+            self,
+            "summary_lifetime",
+            _validate_non_negative_int(self.summary_lifetime, "summary_lifetime"),
         )
         object.__setattr__(
             self,
-            "cached_input_tokens",
-            _validate_non_negative_int(self.cached_input_tokens, "cached_input_tokens"),
-        )
-        object.__setattr__(
-            self, "output_tokens", _validate_non_negative_int(self.output_tokens, "output_tokens")
+            "summary_peak",
+            _validate_non_negative_int(self.summary_peak, "summary_peak"),
         )
         object.__setattr__(
             self,
-            "reasoning_output_tokens",
-            _validate_non_negative_int(self.reasoning_output_tokens, "reasoning_output_tokens"),
+            "summary_streak",
+            _validate_non_negative_int(self.summary_streak, "summary_streak"),
         )
         object.__setattr__(
-            self, "total_tokens", _validate_non_negative_int(self.total_tokens, "total_tokens")
+            self,
+            "summary_longest_turn",
+            _validate_non_negative_int(self.summary_longest_turn, "summary_longest_turn"),
         )
 
         if self.status is HistoryStatus.AVAILABLE_EXACT:
-            if self.total_tokens is None:
+            if self.tokens is None:
                 raise ValueError("AVAILABLE_EXACT requires total_tokens")
-            if all(
-                v is None
-                for v in (
-                    self.input_tokens,
-                    self.cached_input_tokens,
-                    self.output_tokens,
-                    self.reasoning_output_tokens,
-                )
-            ):
-                raise ValueError("AVAILABLE_EXACT requires at least one token breakdown field")
         else:
             if any(
                 v is not None
                 for v in (
-                    self.input_tokens,
-                    self.cached_input_tokens,
-                    self.output_tokens,
-                    self.reasoning_output_tokens,
-                    self.total_tokens,
+                    self.tokens,
+                    self.summary_lifetime,
+                    self.summary_peak,
+                    self.summary_streak,
+                    self.summary_longest_turn,
                 )
             ):
                 raise ValueError("non-available statuses must not carry token counts")
@@ -211,7 +206,7 @@ class TokenObservation:
     @property
     def has_exact_tokens(self) -> bool:
         """Return True if this observation carries exact token counts."""
-        return self.status is HistoryStatus.AVAILABLE_EXACT and self.total_tokens is not None
+        return self.status is HistoryStatus.AVAILABLE_EXACT and self.tokens is not None
 
 
 class HistoryWriteResult:
