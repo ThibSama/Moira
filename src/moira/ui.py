@@ -38,10 +38,17 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from . import __version__ as APP_VERSION
+from .activity import ActivityState, ActivityStore, AgentRuntime, derive_runtime_activity
+from .activity_view import ActivityPanel, ActivityWatcher, latest_terminal_event
+from .agent_integration import (
+    CapabilityReport,
+    probe_capability,
+    remove_runtime,
+    setup_runtime,
+    test_runtime,
+)
 from .alerts import CHANNEL_NATIVE, CHANNEL_NTFY, evaluate_alerts, merge_with_stale
 from .autostart import set_enabled as set_autostart
-from .claude_integration import remove as remove_claude_integration
-from .claude_integration import setup as setup_claude_integration
 from .collectors import ClaudeCollector, CodexCollector
 from .desktop import create_shortcut, remove_shortcut
 from .diagnostics import (  # noqa: F401  (re-exported for compatibility)
@@ -332,6 +339,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._history_coordinator = HistoryCoordinator()
         self._history_coordinator.start()
         self._history_coordinator.set_write_success_callback(self._on_history_write_success)
+        # Agent activity: store + watcher (FileMonitor + bounded timers).
+        self._activity_store = ActivityStore()
+        self._activity_watcher = ActivityWatcher(self._activity_store, self._update_activity_panel)
+        self._capabilities: dict[AgentRuntime, CapabilityReport] = {}
         self._restore_geometry()
         self._build()
         self._render()
@@ -342,6 +353,9 @@ class MainWindow(Adw.ApplicationWindow):
             GLib.timeout_add_seconds(30, self._local_recompute)
             # Focus regain handler
             self.connect("notify::is-active", self._on_focus_change)
+            # Probe agent capabilities off the GTK thread (bounded probes).
+            for runtime in AgentRuntime:
+                self.executor.submit(self._probe_capability_async, runtime)
         # Track stack visibility for History refresh
         self._stack.connect("notify::visible-child", self._on_stack_changed)
         # Shutdown handler: stop the history worker cleanly on window close
@@ -396,6 +410,10 @@ class MainWindow(Adw.ApplicationWindow):
         self.codex_card.set_compact(self.settings.compact_mode)
         home.append(self.claude_card)
         home.append(self.codex_card)
+        # Agent activity panel: below the quota cards, separate from quotas,
+        # present in both full and compact modes.
+        self._activity_panel = ActivityPanel()
+        home.append(self._activity_panel)
         self.refresh_info = Gtk.Label(xalign=0)
         self.refresh_info.add_css_class("dim-label")
         home.append(self.refresh_info)
@@ -515,14 +533,37 @@ class MainWindow(Adw.ApplicationWindow):
         update_row.append(self.update_status)
         update_box.append(update_row)
         box.append(update_box)
-        integration_buttons = Gtk.Box(spacing=8)
-        setup_claude = Gtk.Button(label=_("Set up Claude integration"))
-        setup_claude.connect("clicked", self._setup_claude)
-        remove_claude = Gtk.Button(label=_("Remove Claude integration"))
-        remove_claude.connect("clicked", self._remove_claude)
-        integration_buttons.append(setup_claude)
-        integration_buttons.append(remove_claude)
-        box.append(integration_buttons)
+        integration_heading = Gtk.Label(label=_("Agent integrations"), xalign=0)
+        integration_heading.add_css_class("heading")
+        box.append(integration_heading)
+        self._integration_status: dict[AgentRuntime, Gtk.Label] = {}
+        for runtime in AgentRuntime:
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            buttons = Gtk.Box(spacing=8)
+            runtime_name = (
+                _("Claude Code")
+                if runtime is AgentRuntime.CLAUDE
+                else _("Codex CLI")
+                if runtime is AgentRuntime.CODEX
+                else _("Hermes")
+            )
+            buttons.append(Gtk.Label(label=runtime_name, xalign=0, hexpand=True))
+            setup_btn = Gtk.Button(label=_("Set up"))
+            setup_btn.connect("clicked", self._setup_agent, runtime)
+            remove_btn = Gtk.Button(label=_("Remove"))
+            remove_btn.connect("clicked", self._remove_agent, runtime)
+            test_btn = Gtk.Button(label=_("Test"))
+            test_btn.connect("clicked", self._test_agent, runtime)
+            buttons.append(setup_btn)
+            buttons.append(remove_btn)
+            buttons.append(test_btn)
+            row.append(buttons)
+            status = Gtk.Label(label="", xalign=0)
+            status.set_wrap(True)
+            status.add_css_class("dim-label")
+            row.append(status)
+            box.append(row)
+            self._integration_status[runtime] = status
         shortcut_buttons = Gtk.Box(spacing=8)
         create_desktop = Gtk.Button(label=_("Create desktop shortcut"))
         create_desktop.connect("clicked", self._create_desktop_shortcut)
@@ -579,8 +620,19 @@ class MainWindow(Adw.ApplicationWindow):
             history_status=self._history_coordinator.status,
             history_lifecycle=self._history_coordinator.lifecycle_state,
             translator=tr,
+            activity=self._activity_summary(),
         )
         self._diagnostics_page.update(text)
+
+    def _activity_summary(self) -> str:
+        """Sanitized activity summary for diagnostics (levels only)."""
+        capabilities = getattr(self, "_capabilities", {})
+        parts: list[str] = []
+        for runtime in AgentRuntime:
+            report = capabilities.get(runtime)
+            level = report.level if report is not None else "unknown"
+            parts.append(f"{runtime.value}: {level}")
+        return " · ".join(parts)
 
     def _update_refresh_info(self) -> None:
         parts: list[str] = []
@@ -718,6 +770,7 @@ class MainWindow(Adw.ApplicationWindow):
         with a sanitized status. Never blocks GTK for more than 3 seconds.
         """
         self._persist_geometry()
+        self._activity_watcher.shutdown()
         self._history_coordinator.clear_write_success_callback()
         self._history_page.shutdown()
         self._history_coordinator.shutdown()
@@ -1019,27 +1072,74 @@ class MainWindow(Adw.ApplicationWindow):
         self.get_clipboard().set_text(text)
         self.refresh_info.set_text(_("Quota status copied."))
 
-    def _setup_claude(self, *_args: Any) -> None:
-        try:
-            changed = setup_claude_integration()
-            self.settings_status.set_text(
-                _("Claude integration installed. Complete one Claude response to populate quotas.")
-                if changed
-                else _("Claude integration is already installed.")
-            )
-        except Exception as exc:
-            self.settings_status.set_text(f"{_('Claude integration was not changed: ')}{exc}")
+    # ── Agent activity (independent from quotas) ──
 
-    def _remove_claude(self, *_args: Any) -> None:
+    def _update_activity_panel(self) -> None:
+        """Re-render the activity panel from the store (GTK thread)."""
+        views = derive_runtime_activity(self._activity_store.snapshot())
+        self._activity_panel.update(views)
+
+    def _probe_capability_async(self, runtime: AgentRuntime) -> None:
+        """Probe one runtime's capability off the GTK thread; never raises."""
         try:
-            changed = remove_claude_integration()
-            self.settings_status.set_text(
-                _("Claude integration removed and the previous status line restored.")
-                if changed
-                else _("Claude integration is not installed.")
+            report = probe_capability(runtime)
+        except Exception:
+            report = CapabilityReport("unsupported", _("Agent activity is unavailable."))
+        GLib.idle_add(self._apply_capability, runtime, report)
+
+    def _apply_capability(self, runtime: AgentRuntime, report: CapabilityReport) -> bool:
+        self._capabilities[runtime] = report
+        self._update_integration_status(runtime)
+        return False
+
+    def _update_integration_status(self, runtime: AgentRuntime) -> None:
+        """Show capability and last sanitized event for one runtime."""
+        label = self._integration_status.get(runtime)
+        if label is None:
+            return
+        report = self._capabilities.get(runtime)
+        parts = [report.detail] if report is not None else [_("Checking…")]
+        terminal = latest_terminal_event(self._activity_store.snapshot(), runtime)
+        if terminal is not None:
+            state, at, _model = terminal
+            state_text = _(
+                {
+                    ActivityState.COMPLETED: "Completed",
+                    ActivityState.FAILED: "Failed",
+                    ActivityState.INTERRUPTED: "Interrupted",
+                    ActivityState.RUNNING: "Active",
+                }[state]
             )
-        except Exception as exc:
-            self.settings_status.set_text(f"{_('Claude integration was not changed: ')}{exc}")
+            parts.append(f"{_('Last event: ')}{state_text} {at.astimezone():%H:%M:%S}")
+        label.set_text(_(" · ").join(parts))
+
+    def _setup_agent(self, _button: Any, runtime: AgentRuntime) -> None:
+        try:
+            result = setup_runtime(runtime)
+        except Exception:
+            self._update_integration_status(runtime)
+            return
+        self._capabilities[runtime] = result.capability
+        self._update_integration_status(runtime)
+
+    def _remove_agent(self, _button: Any, runtime: AgentRuntime) -> None:
+        try:
+            result = remove_runtime(runtime)
+        except Exception:
+            self._update_integration_status(runtime)
+            return
+        self._capabilities[runtime] = result.capability
+        self._update_integration_status(runtime)
+
+    def _test_agent(self, _button: Any, runtime: AgentRuntime) -> None:
+        """Prove the callbacks fire; fake events never persist."""
+        try:
+            result = test_runtime(runtime)
+        except Exception:
+            self._update_integration_status(runtime)
+            return
+        self._capabilities[runtime] = result.capability
+        self._update_integration_status(runtime)
 
     def _create_desktop_shortcut(self, *_args: Any) -> None:
         try:

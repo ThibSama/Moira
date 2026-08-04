@@ -10,9 +10,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .agent_hooks import AGENT_HOOK_COMMAND
 from .models import QuotaReading, QuotaStatus, Service
 
 STATUS_LINE_COMMAND = "/usr/bin/moira-claude-statusline"
+#: The packaged agent-hook binary, reused for the Claude Code lifecycle
+#: hooks Moira owns (UserPromptSubmit/Stop/StopFailure/SessionEnd).
+CLAUDE_HOOK_COMMAND = f"{AGENT_HOOK_COMMAND} claude"
+#: Claude Code hook events Moira owns, in canonical order.
+CLAUDE_HOOK_EVENTS = ("UserPromptSubmit", "Stop", "StopFailure", "SessionEnd")
 CACHE_MAX_AGE_SECONDS = 15 * 60
 WINDOWS = (("five_hour", "Five-hour"), ("seven_day", "Weekly"))
 
@@ -185,10 +191,122 @@ def load_cached_readings(now: datetime | None = None) -> list[QuotaReading]:
     ]
 
 
+def _hook_command(entry: Any) -> Any:
+    """Extract the command from a Claude Code hook entry, or None."""
+    if not isinstance(entry, dict):
+        return None
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list) or not hooks:
+        return None
+    first = hooks[0]
+    if isinstance(first, dict) and isinstance(first.get("command"), str):
+        return first["command"]
+    return None
+
+
+def _is_owned_hook_entry(entry: Any, command: str) -> bool:
+    """True when the entry has Moira's exact owned shape.
+
+    Owned shape: a match-all matcher (``""`` or ``"*"``) with exactly one
+    command-type hook running the Moira command. Anything else with the
+    Moira command is ambiguous ownership and refuses setup/removal.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("matcher") not in ("", "*", None):
+        return False
+    if _hook_command(entry) != command:
+        return False
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list) or len(hooks) != 1:
+        return False
+    first = hooks[0]
+    return isinstance(first, dict) and first.get("type") == "command"
+
+
+def _owned_hook_entry(command: str) -> dict[str, Any]:
+    return {"matcher": "", "hooks": [{"type": "command", "command": command}]}
+
+
+def _merge_owned_hooks(settings: dict[str, Any], command: str) -> dict[str, bool]:
+    """Merge the Moira-owned Claude hook entries into settings.
+
+    Preserves unrelated events and entries; refuses when an entry with the
+    Moira command exists outside Moira's exact owned shape (ambiguous
+    ownership). Returns the events Moira owns (for the metadata record).
+    """
+    raw = settings.get("hooks")
+    if raw is None:
+        hooks: dict[str, Any] = {}
+    elif isinstance(raw, dict):
+        hooks = dict(raw)
+    else:
+        raise ClaudeIntegrationError("existing Claude hooks configuration cannot be safely merged")
+    owned: dict[str, bool] = {}
+    for event in CLAUDE_HOOK_EVENTS:
+        entries = hooks.get(event)
+        if entries is None:
+            entries = []
+        elif not isinstance(entries, list):
+            raise ClaudeIntegrationError(f"existing Claude {event} hooks cannot be safely merged")
+        entries = list(entries)
+        moira = [entry for entry in entries if _hook_command(entry) == command]
+        if moira:
+            if not all(_is_owned_hook_entry(entry, command) for entry in moira):
+                raise ClaudeIntegrationError("Moira Claude hook ownership is ambiguous")
+        else:
+            entries.append(_owned_hook_entry(command))
+        hooks[event] = entries
+        owned[event] = True
+    settings["hooks"] = hooks
+    return owned
+
+
+def _remove_owned_hooks(settings: dict[str, Any], owned: dict[str, bool], command: str) -> bool:
+    """Remove ONLY the Moira-owned Claude hook entries.
+
+    Refuses when an owned event holds a Moira-command entry outside the
+    exact owned shape (changed after setup). Events emptied by the removal
+    are dropped; the whole ``hooks`` key is dropped when nothing remains.
+    """
+    raw = settings.get("hooks")
+    if not owned or raw is None:
+        return False
+    if not isinstance(raw, dict):
+        raise ClaudeIntegrationError("existing Claude hooks configuration cannot be safely merged")
+    changed = False
+    for event in CLAUDE_HOOK_EVENTS:
+        if not owned.get(event):
+            continue
+        entries = raw.get(event)
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            raise ClaudeIntegrationError(f"existing Claude {event} hooks cannot be safely merged")
+        moira = [entry for entry in entries if _hook_command(entry) == command]
+        if not moira:
+            continue
+        if not all(_is_owned_hook_entry(entry, command) for entry in moira):
+            raise ClaudeIntegrationError("Claude hooks changed after Moira setup; removal stopped")
+        kept = [entry for entry in entries if _hook_command(entry) != command]
+        if kept:
+            raw[event] = kept
+        else:
+            del raw[event]
+        changed = True
+    if changed:
+        if raw:
+            settings["hooks"] = raw
+        else:
+            settings.pop("hooks", None)
+    return changed
+
+
 def setup(
     claude_settings: Path | None = None,
     metadata: Path | None = None,
     command: str = STATUS_LINE_COMMAND,
+    hook_command: str = CLAUDE_HOOK_COMMAND,
 ) -> bool:
     target = claude_settings or settings_path()
     record_path = metadata or integration_path()
@@ -197,7 +315,19 @@ def setup(
     if isinstance(current, dict) and current.get("command") == command:
         if not record_path.exists():
             raise ClaudeIntegrationError("Moira status line exists without restoration metadata")
-        return False
+        record = _read_object(record_path, "Moira Claude integration metadata")
+        hooks = settings.get("hooks")
+        owned_events = record.get("hooks") if isinstance(record.get("hooks"), dict) else None
+        if _hooks_installed(hooks, hook_command, owned_events):
+            return False
+        backup = target.with_name(f"{target.name}.moira-backup")
+        _atomic_json(backup, dict(settings))
+        owned = _merge_owned_hooks(settings, hook_command)
+        record = dict(record)
+        record["hooks"] = owned
+        _atomic_json(record_path, record)
+        _atomic_json(target, settings)
+        return True
     if current is not None and (
         not isinstance(current, dict)
         or current.get("type") != "command"
@@ -207,7 +337,10 @@ def setup(
         raise ClaudeIntegrationError("existing Claude status line cannot be safely chained")
     backup = target.with_name(f"{target.name}.moira-backup")
     _atomic_json(backup, settings)
-    _atomic_json(record_path, {"original_status_line": current, "moira_command": command})
+    owned = _merge_owned_hooks(settings, hook_command)
+    _atomic_json(
+        record_path, {"original_status_line": current, "moira_command": command, "hooks": owned}
+    )
     replacement = dict(current) if isinstance(current, dict) else {"type": "command"}
     replacement["type"] = "command"
     replacement["command"] = command
@@ -216,10 +349,32 @@ def setup(
     return True
 
 
+def _hooks_installed(hooks: Any, command: str, owned_events: dict[str, bool] | None) -> bool:
+    """True when every Moira-owned hook event is present in owned shape."""
+    if not isinstance(hooks, dict) or not owned_events:
+        return False
+    for event in CLAUDE_HOOK_EVENTS:
+        if not owned_events.get(event):
+            return False
+        entries = hooks.get(event)
+        if not isinstance(entries, list) or not entries:
+            return False
+        if not all(
+            isinstance(entry, dict)
+            and (_hook_command(entry) != command or _is_owned_hook_entry(entry, command))
+            for entry in entries
+        ):
+            return False
+        if not any(_hook_command(entry) == command for entry in entries):
+            return False
+    return True
+
+
 def remove(
     claude_settings: Path | None = None,
     metadata: Path | None = None,
     command: str = STATUS_LINE_COMMAND,
+    hook_command: str = CLAUDE_HOOK_COMMAND,
 ) -> bool:
     target = claude_settings or settings_path()
     record_path = metadata or integration_path()
@@ -232,6 +387,10 @@ def remove(
         raise ClaudeIntegrationError(
             "Claude status line changed after Moira setup; removal stopped"
         )
+    owned_record = record.get("hooks")
+    _remove_owned_hooks(
+        settings, owned_record if isinstance(owned_record, dict) else {}, hook_command
+    )
     original = record.get("original_status_line")
     if original is None:
         settings.pop("statusLine", None)

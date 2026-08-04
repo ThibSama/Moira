@@ -1,0 +1,6 @@
+#!/bin/sh
+# Moira agent hook: invoked by Claude Code and Hermes with the runtime as
+# the first argument (claude | hermes). Reads a bounded JSON payload on
+# stdin and records privacy-minimal activity events; always exits 0 with
+# empty output so the agent is never affected.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/usr/lib/moira exec /usr/bin/python3 -m moira.agent_hooks "$@"

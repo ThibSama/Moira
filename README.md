@@ -43,6 +43,18 @@ Configuration is versioned JSON (**config v3**) at `$XDG_CONFIG_HOME/moira/confi
 
 Claude's separate `$XDG_STATE_HOME/moira/claude-rate-limits.json` cache contains only `five_hour` and `seven_day` objects. Each has `service`, `percentage`, `reset_epoch`, and `retrieved_at`; status-line input, prompts, transcript paths, workspaces, model names, account data, and secrets are never written by Moira. Chained third-party status-line commands still receive the original input and retain responsibility for their own privacy behavior. The History database holds only typed quota, token, availability, and summary records — never secrets, raw payloads, exceptions, or paths.
 
+## Agent activity
+
+An **Agent activity** panel below the quota cards shows, independently from quotas, whether Claude Code, Codex CLI or Hermes is working: a spinner while a session is active (with a count when more than one session runs and the latest sanitized model label), then the correct symbolic state — completed, failed or interrupted — for exactly five minutes after the last active turn ends, then nothing. Missing terminal events expire through a watchdog to **interrupted**, never to success.
+
+Activity is recorded through Moira-owned, reversible integrations configured in the Settings view (Set up / Remove / Test per agent):
+
+- **Claude Code**: Moira installs `UserPromptSubmit` (start), `Stop` (completed), `StopFailure` (failed) and `SessionEnd` (interrupted) hook entries alongside the existing status line. Existing hooks and settings are preserved exactly, backups are atomic, and removal deletes only Moira-owned entries — ambiguous ownership is refused instead of guessed.
+- **Hermes**: a shell-hook adapter installs `pre_llm_call` (start), `post_llm_call` (completed) and `on_session_end` (interrupt/complete) entries in `$HERMES_HOME/config.yaml` (by default `~/.hermes`), merged without a YAML dependency by a strict subset editor that fails closed outside the supported shape; the installed version is probed first and unsupported versions fail closed with a translated status. Hermes hooks fire after their first-use consent prompt.
+- **Codex CLI**: only the documented app-server turn events are used. A full `turn/started` → `turn/completed` sequence is valid only for an app-server session Moira owns; terminal notifications for other sessions are recorded as completions and never synthesize RUNNING. The capability probe reports full, completion-only or unsupported.
+
+Hooks are network-free, bounded-input (≤256 KiB), fixed-output (empty stdout, exit 0) and nonblocking — a failure never touches the agent. The store at `$XDG_STATE_HOME/moira/activity.json` (mode 0600, atomic, process-safe locking) holds only the runtime, sanitized model labels, SHA-256 hashed session identities and UTC timestamps — never prompts, responses, transcripts, paths, raw errors, accounts or secrets. The panel watches the file live with `Gio.FileMonitor` (bursts coalesced, deletion/corruption tolerated) and bounded self-cancelling timers; there is no polling, `pgrep`, terminal scraping, daemon or tray.
+
 ## Notifications
 
 The Notifications view configures **native desktop notifications** (via GNOME) and/or an HTTP(S) NTFY server with one topic segment, enabled state, thresholds, reset alerts, error alerts, refresh interval, and login autostart. **Send test notification** performs the explicit live delivery test on the selected channel. A non-empty NTFY token field updates GNOME Keyring; leaving it blank preserves the existing token.

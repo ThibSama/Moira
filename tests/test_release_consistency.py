@@ -157,10 +157,16 @@ def test_appstream_release_notes_cover_0_3_0_features() -> None:
         "csv/json",
         "deletion",
         "update checks",
+        "activity",
+        "spinner",
+        "hooks",
     ):
         assert keyword in description, keyword
     # Exact token statistics are Codex-only; Claude token support is never claimed.
     assert "claude remains percentage-only" in description
+    # Activity claims are privacy-minimal and never overclaim Codex capability.
+    assert "hashed session identities" in description
+    assert "no polling or terminal scraping" in description
 
 
 # ── Runtime derivation (no circular imports, correct values) ──

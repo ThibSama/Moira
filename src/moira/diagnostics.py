@@ -120,12 +120,14 @@ def build_diagnostics_text(
     history_status: str,
     history_lifecycle: str,
     translator: Callable[[str], str],
+    activity: str = "",
 ) -> str:
     """Build the sanitized diagnostics report.
 
     Shows provider state, last/next refresh, History writer status, channel
-    state, and the app version. Never shows server URLs, topics, tokens,
-    paths, raw errors, or exception text.
+    state, the app version and (when provided) the sanitized agent-activity
+    capability summary. Never shows server URLs, topics, tokens, paths,
+    raw errors, or exception text.
     """
     _ = translator
     lines: list[str] = [f"Moira {version}"]
@@ -149,4 +151,6 @@ def build_diagnostics_text(
     lines.append(f"NTFY {_('channel')}: {ntfy_state}")
     native_state = _("enabled") if settings.native_notifications else _("disabled")
     lines.append(f"{_('Native channel')}: {native_state}")
+    if activity:
+        lines.append(f"{_('Agent activity')}: {activity}")
     return "\n".join(lines)

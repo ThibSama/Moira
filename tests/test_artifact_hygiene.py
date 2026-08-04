@@ -47,7 +47,12 @@ _FORBIDDEN_PATTERNS = (
     re.compile(r"(^|/)(\.mypy_cache|\.pytest_cache|\.ruff_cache)(/|$)"),
     re.compile(r"(^|/)(build|dist)(/|$)"),
     re.compile(r"(^|/)(\.env|.*\.pem|.*\.key|.*\.p12)$"),
-    re.compile(r"(^|/)(config\.json|state\.json|history\.sqlite3|claude-rate-limits\.json)$"),
+    re.compile(
+        r"(^|/)(config\.json|state\.json|history\.sqlite3|claude-rate-limits\.json|activity\.json)$"
+    ),
+    re.compile(
+        r"(^|/)(config\.yaml|shell-hooks-allowlist\.json|settings\.json|claude-integration\.json)$"
+    ),
     re.compile(r"/home/|/Users/"),
 )
 
@@ -134,6 +139,17 @@ def test_wheel_hygiene_and_metadata(artifacts: dict[str, Path]) -> None:
         entry_points = zf.read(f"{DIST_INFO}/entry_points.txt").decode("utf-8")
         assert "moira = moira.app:main" in entry_points
         assert "moira-claude-statusline = moira.claude_integration:statusline_main" in entry_points
+        assert "moira-agent-hook = moira.agent_hooks:agent_hook_main" in entry_points
+        # Package 6c modules ship in the wheel.
+        for module in (
+            "activity.py",
+            "agent_hooks.py",
+            "agent_integration.py",
+            "hermes_hooks.py",
+            "codex_activity.py",
+            "activity_view.py",
+        ):
+            assert f"moira/{module}" in modules, module
         wheel = zf.read(f"{DIST_INFO}/WHEEL").decode("utf-8")
         assert "Wheel-Version: 1.0" in wheel
         assert "Tag: py3-none-any" in wheel
@@ -203,6 +219,7 @@ def test_deb_hygiene_metadata_and_modes(artifacts: dict[str, Path]) -> None:
     # Launchers are executable; everything else is 0644.
     assert entries["./usr/bin/moira"][0] == "-rwxr-xr-x"
     assert entries["./usr/bin/moira-claude-statusline"][0] == "-rwxr-xr-x"
+    assert entries["./usr/bin/moira-agent-hook"][0] == "-rwxr-xr-x"
     deb_modules = sorted(
         p for p in paths if p.startswith("./usr/lib/moira/moira/") and p.endswith(".py")
     )
