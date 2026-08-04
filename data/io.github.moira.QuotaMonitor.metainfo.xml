@@ -8,11 +8,17 @@
   <developer id="io.github.thibsama"><name>Moira contributors</name></developer>
   <url type="homepage">https://github.com/ThibSama/moira</url>
   <description>
-    <p>Moira displays Claude five-hour and weekly usage plus Codex weekly usage, reset times, and optional NTFY alerts.</p>
+    <p>Moira displays Claude five-hour and weekly usage plus Codex weekly usage, reset times, optional native and NTFY notifications, and a History tab with selectable ranges, exact Codex token statistics, and CSV/JSON export.</p>
   </description>
   <launchable type="desktop-id">io.github.moira.QuotaMonitor.desktop</launchable>
   <provides><binary>moira</binary></provides>
   <releases>
+    <release version="0.3.0" date="2026-08-04">
+      <description>
+        <p>Adds the History tab with selectable 24h/7d/30d/90d ranges and per-service filters, quota series with reset transitions, availability states, and exact daily token statistics computed from official Codex account usage (Claude remains percentage-only).</p>
+        <p>Adds per-provider collection toggles and alert rules, native desktop and NTFY notification channels with deduplicated exhaustion, recovery, reset and error events, compact mode, sanitized diagnostics with copy actions, deterministic CSV/JSON export, history deletion, and manual update checks.</p>
+      </description>
+    </release>
     <release version="0.2.2" date="2026-08-02">
       <description>
         <p>Corrects post-reset recovery detection with a pure recovery-transition rule that distinguishes prior weekly exhaustion evidence from current non-exhausted state, enabling recovery events for real post-reset chronology.</p>

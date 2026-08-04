@@ -8,6 +8,7 @@ import signal
 import subprocess
 import time
 
+from . import __version__
 from .history import HistoryStatus
 from .models import (
     CodexSummary,
@@ -134,7 +135,7 @@ class CodexCollector:
                 {
                     "id": 1,
                     "method": "initialize",
-                    "params": {"clientInfo": {"name": "moira", "version": "0.2.2"}},
+                    "params": {"clientInfo": {"name": "moira", "version": __version__}},
                 },
             )
             initialized = _read_response(process, 1, init_deadline)

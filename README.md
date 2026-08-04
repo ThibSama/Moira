@@ -1,14 +1,22 @@
 # Moira
 
-Moira is a compact Ubuntu GTK4/Libadwaita utility for Claude and Codex quotas. It shows Claude five-hour and weekly usage, Codex weekly usage, local reset times, countdowns, refresh state, weekly exhaustion semantics, and optional deduplicated NTFY alerts including exhaustion and recovery events.
+Moira is a compact Ubuntu GTK4/Libadwaita utility for Claude and Codex quotas. It shows Claude five-hour and weekly usage, Codex weekly usage, local reset times, countdowns, refresh state, weekly exhaustion semantics, optional native and NTFY notifications, and a History tab with selectable ranges, exact Codex token statistics, sanitized diagnostics, and CSV/JSON export.
 
-## Data sources and behavior
+## Quotas
 
 - Claude Code sends structured `rate_limits.five_hour` and `rate_limits.seven_day` data to its configured status-line command after a response. Moira chains the existing command and reads its own minimal cache; it never scrapes the rendered `/usage` screen.
 - The installed `codex app-server` read-only `account/rateLimits/read` method returns structured windows. Moira completes the initialize handshake first and accepts only a window declared as exactly 10,080 minutes (seven days). It intentionally does not model or display a Codex five-hour quota.
 - Missing data produces **Unavailable**. Invalid provider data produces **Parse error**. When a refresh fails after a success, Moira retains the last successful values as **Stale**.
 
 Provider interfaces can change. Validation fails closed instead of treating changed or missing data as 0%.
+
+## Exact token usage
+
+Exact daily token statistics are computed **only from official Codex account usage** (`codex app-server` `account/usage/read`): typed daily totals, reported days, average per reported day, and range peak day, always labeled per service and range. The official Codex account summary is displayed separately and labeled account-wide; it is never duplicated onto daily buckets. Claude remains percentage-only — Moira never derives, renders, or sums token values for Claude.
+
+## History
+
+The History tab shows quota series with reset transitions and availability states over selectable ranges (**24h, 7d, 30d, 90d**) filtered by service (**All, Claude, Codex**). Exact daily token statistics and the official Codex summary appear when the selected range contains exact Codex data. History is stored locally in a versioned SQLite database (schema **v4**) at `$XDG_STATE_HOME/moira/history.sqlite3` (normally `~/.local/state/moira/history.sqlite3`) and written by a bounded background writer that never blocks the UI. **Delete all history…** (with confirmation) clears the stored rows.
 
 ## Weekly exhaustion
 
@@ -19,30 +27,56 @@ An AVAILABLE weekly reading at ≥100% means the service is exhausted until its 
 
 ## Internationalization
 
-Moira detects the locale from the environment (LANG/LC_ALL/LC_MESSAGES) and displays French for French locales with English fallback for all other locales. All visible strings — UI labels, error messages, About dialog, NTFY notifications, dates, and countdowns — are localized. No manual language selector is needed.
+Moira detects the locale from the environment (LANG/LC_ALL/LC_MESSAGES) and displays French for French locales with English fallback for all other locales. All visible strings — UI labels, error messages, About dialog, native and NTFY notifications, dates, and countdowns — are localized. No manual language selector is needed.
 
-## Refresh
+## Refresh and display
 
 Moira refreshes at startup, on focus regain (with a monotonic debounce and overlap guard), and at a configurable interval. Refresh choices are 1, 2, 5, 10, 15, or 30 minutes. New configurations default to 2 minutes. The v1-to-v2 migration preserves every valid refresh value including 10; the 2-minute default is used only when the value is absent or invalid. Saving a new interval immediately replaces the GLib provider timer without a restart or duplicates. The last and next refresh times are displayed.
 
 Countdowns and next-refresh times are recomputed locally every 30 seconds without collectors. Claude data changes only after a Claude Code response; cache rereads are not fresh provider events.
 
-## Install on Ubuntu
+**Compact mode** keeps provider, status, exhaustion and reset visible while dropping the per-reading progress bars. Quota cards show used/remaining percentages (100 − used) plus a reset countdown.
+
+## Configuration and privacy
+
+Configuration is versioned JSON (**config v3**) at `$XDG_CONFIG_HOME/moira/config.json` (normally `~/.config/moira/config.json`). Last readings and alert deduplication keys are at `$XDG_STATE_HOME/moira/state.json`. Both are written with mode `0600`. Enabling autostart creates `$XDG_CONFIG_HOME/autostart/io.github.moira.QuotaMonitor.desktop` at runtime. Versionless (v1) and v2 configuration files migrate automatically to v3 on load, preserving every user setting; invalid persisted versions fail closed to complete defaults without partial preservation.
+
+Claude's separate `$XDG_STATE_HOME/moira/claude-rate-limits.json` cache contains only `five_hour` and `seven_day` objects. Each has `service`, `percentage`, `reset_epoch`, and `retrieved_at`; status-line input, prompts, transcript paths, workspaces, model names, account data, and secrets are never written by Moira. Chained third-party status-line commands still receive the original input and retain responsibility for their own privacy behavior. The History database holds only typed quota, token, availability, and summary records — never secrets, raw payloads, exceptions, or paths.
+
+## Notifications
+
+The Notifications view configures **native desktop notifications** (via GNOME) and/or an HTTP(S) NTFY server with one topic segment, enabled state, thresholds, reset alerts, error alerts, refresh interval, and login autostart. **Send test notification** performs the explicit live delivery test on the selected channel. A non-empty NTFY token field updates GNOME Keyring; leaving it blank preserves the existing token.
+
+Alert rules are typed **per provider** (config v3): each of Claude and Codex carries its own thresholds, reset alerts, and error alerts, and each provider has its own collection toggle. Disabled providers are never started, never alert, never write fresh history, and show a translated *Disabled* state while old History stays readable.
+
+Exhaustion and recovery events are deduplicated once per service/window and are independent from threshold alerts. Only the generic 100% threshold alert is suppressed when an exhaustion event fires; lower-threshold crossings are governed normally. Threshold notifications require a crossing from below to at-or-above a threshold in the same quota window. Reset and parse/error notifications are deduplicated. NTFY and native channels are deduplicated independently per channel, and a key is persisted only after the channel reports success. Delivery failures are not marked sent and may retry after the next qualifying refresh.
+
+## Diagnostics and copy
+
+A sanitized diagnostics report shows provider state, channels, refresh and History-writer status — with no secrets, server URLs, topics, paths, or raw errors. **Copy** actions export quota status, diagnostics, and History summaries to the clipboard, all sanitized.
+
+## Export
+
+History can be exported as deterministic **CSV or JSON** to a chosen destination (atomic UTF-8 writes, stable column order, rows sorted by observed time). Only sanitized typed fields are exported — never secrets, raw payloads, exceptions, or paths. Failures return a fixed sanitized outcome.
+
+## Manual update checks
+
+The Settings view offers a manual **Check for updates** action that queries the configured repository's latest GitHub release (default `ThibSama/moira`). There is no startup check, no telemetry, no token, and no auto-download or install. Comparison is strict SemVer 2.0; an invalid current version fails the check closed, and every outcome is a fixed sanitized status string.
+
+## Install, upgrade, and uninstall on Ubuntu
 
 Build and install the Debian package:
 
 ```sh
 ./scripts/build-deb.sh
-sudo apt install ./dist/moira_0.2.2_all.deb
+sudo apt install ./dist/moira_0.3.0_all.deb
 ```
 
 The package depends on Python 3, PyGObject, GTK4, Libadwaita, and libsecret GI. Run `moira` or launch **Moira** from the application menu. Install the same `.deb` on another PC and authenticate each provider CLI separately there.
 
-In Notifications, select **Set up Claude integration**. Moira first validates `~/.claude/settings.json`. If a command status line already exists, Moira stores its complete status-line object and substitutes `/usr/bin/moira-claude-statusline`; the wrapper passes the original JSON input to the old command and preserves its output and exit status. Setup writes atomically and creates `settings.json.moira-backup`. **Remove Claude integration** restores only the saved status-line field, preserving unrelated settings changed since setup. Removal refuses to act if another program changed the status line in the meantime.
+**Upgrading from 0.2.2**: installing `dist/moira_0.3.0_all.deb` over the previous release upgrades in place. User files are preserved: `~/.config/moira`, `~/.local/state/moira` (including the History database) and the keyring item are untouched, and older v1/v2 configuration files migrate to config v3 automatically on first load.
 
-Complete one minimal Claude response after setup if no recent status-line event exists. Until both structured limits arrive, Moira shows waiting/unavailable (or retains an older successful reading as stale), never 0%.
-
-Uninstall without deleting per-user settings:
+**Uninstalling** without deleting per-user settings:
 
 ```sh
 sudo apt remove moira
@@ -50,15 +84,11 @@ sudo apt remove moira
 
 Optional user data can be removed manually from `~/.config/moira` and `~/.local/state/moira`. The NTFY token is a GNOME Keyring item named "Moira NTFY token" and is not in those directories.
 
-## Notifications, privacy, and desktop integration
+### Claude integration setup
 
-The Notifications view configures an HTTP(S) NTFY server, one topic segment, enabled state, comma-separated thresholds, reset alerts, error alerts, refresh interval, and login autostart. **Send test notification** performs the explicit live delivery test. A non-empty token field updates GNOME Keyring; leaving it blank preserves the existing token.
+In Notifications, select **Set up Claude integration**. Moira first validates `~/.claude/settings.json`. If a command status line already exists, Moira stores its complete status-line object and substitutes `/usr/bin/moira-claude-statusline`; the wrapper passes the original JSON input to the old command and preserves its output and exit status. Setup writes atomically and creates `settings.json.moira-backup`. **Remove Claude integration** restores only the saved status-line field, preserving unrelated settings changed since setup. Removal refuses to act if another program changed the status line in the meantime.
 
-Exhaustion and recovery NTFY events are deduplicated once per service/window and are independent from threshold alerts. Only the generic 100% threshold alert is suppressed when an exhaustion event fires; lower-threshold crossings are governed normally. Threshold notifications require a crossing from below to at-or-above a threshold in the same quota window. Reset and parse/error notifications are deduplicated. Delivery failures are not marked sent and may retry after the next qualifying refresh.
-
-Configuration is versioned JSON at `$XDG_CONFIG_HOME/moira/config.json` (normally `~/.config/moira/config.json`). Last readings and alert deduplication keys are at `$XDG_STATE_HOME/moira/state.json`. Both are written with mode `0600`. Enabling autostart creates `$XDG_CONFIG_HOME/autostart/io.github.moira.QuotaMonitor.desktop` at runtime.
-
-Claude's separate `$XDG_STATE_HOME/moira/claude-rate-limits.json` cache contains only `five_hour` and `seven_day` objects. Each has `service`, `percentage`, `reset_epoch`, and `retrieved_at`; status-line input, prompts, transcript paths, workspaces, model names, account data, and secrets are never written by Moira. Chained third-party status-line commands still receive the original input and retain responsibility for their own privacy behavior.
+Complete one minimal Claude response after setup if no recent status-line event exists. Until both structured limits arrive, Moira shows waiting/unavailable (or retains an older successful reading as stale), never 0%.
 
 **Create desktop shortcut** and **Remove desktop shortcut** resolve `XDG_DESKTOP_DIR` through `xdg-user-dir`, copy the packaged launcher, mark it executable, and request GNOME's trusted metadata when `gio` supports it. Both operations are idempotent. If the session has no distinct XDG desktop directory, desktop files are unsupported and Moira explains that instead of guessing an English or localized folder name.
 
@@ -72,12 +102,13 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/ruff check .
 .venv/bin/mypy
 PYTHONPATH=src xvfb-run -a python3 -m moira.app --smoke-test
+.venv/bin/python -m build
 ./scripts/build-deb.sh
 desktop-file-validate data/io.github.moira.QuotaMonitor.desktop
 appstreamcli validate --no-net data/io.github.moira.QuotaMonitor.metainfo.xml
 ```
 
-Tests use sanitized fixtures and mocks. They do not require provider accounts, network access, NTFY, or a running keyring.
+Tests use sanitized fixtures and mocks. They do not require provider accounts, network access, NTFY, or a running keyring. The release-consistency tests assert that every release surface (Python package, `pyproject.toml`, Debian control and build output, README commands, AppStream, and runtime User-Agents/clientInfo) agrees with the single authoritative `src/moira/__init__.py::__version__` and fail on stale supported-version literals.
 
 ## Troubleshooting
 
@@ -85,6 +116,7 @@ Tests use sanitized fixtures and mocks. They do not require provider accounts, n
 - **No Claude values:** set up the integration, use Claude Code normally, and complete a response. Some account types may not expose both windows.
 - **Claude integration conflict:** Moira chains only a valid command-type status line. Inspect the non-secret `statusLine` field and decide which integration should own it; Moira does not overwrite an unknown change.
 - **No Codex weekly value:** confirm login and update Codex. Moira requires a rate-limit window declared as exactly seven days.
+- **No exact token statistics:** exact daily statistics require official Codex account usage data in the selected range. Claude never produces token values.
 - **Keyring error:** ensure GNOME Keyring/libsecret is installed and unlocked. Moira never falls back to a plaintext token.
 - **NTFY test fails:** verify the server URL, topic, network, certificate, and token permissions. The token is never included in errors.
 - **Desktop shortcut unavailable:** confirm `xdg-user-dir DESKTOP` points to a separate existing directory. Use the application menu if the shell hides desktop files.

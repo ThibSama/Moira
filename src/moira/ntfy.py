@@ -12,6 +12,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
+from . import __version__
+
 #: Fixed sanitized outcome statuses. No free-form strings may flow here.
 STATUS_SENT = "sent"
 STATUS_INVALID = "invalid configuration"
@@ -55,7 +57,7 @@ def build_request(
         "Title": notification.title,
         "Tags": notification.tags,
         "Priority": str(notification.priority),
-        "User-Agent": "Moira/0.2.2",
+        "User-Agent": f"Moira/{__version__}",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"

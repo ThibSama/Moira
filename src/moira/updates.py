@@ -7,7 +7,7 @@ the response body, raw exceptions, URLs, and repository details are never
 exposed to the UI.
 
 Version comparison follows SemVer 2.0.0 precedence exactly: numeric
-three-part core (``0.10.0`` > ``0.2.2``), prerelease ordering
+three-part core (``0.10.0`` > ``0.9.9``), prerelease ordering
 (``1.0.0-alpha`` < ``1.0.0-alpha.1`` < ``1.0.0-beta`` < ``1.0.0``),
 build metadata ignored for ordering, leading zeros rejected, empty or
 invalid identifiers rejected, and an invalid ``current`` version fails
@@ -25,6 +25,8 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+from . import __version__
 
 #: Fixed sanitized outcome statuses.
 STATUS_UP_TO_DATE = "up to date"
@@ -96,7 +98,7 @@ def _valid_identifier(identifier: str) -> bool:
 
 
 def parse_version(tag: str) -> SemVer | None:
-    """Parse a SemVer 2.0 tag like ``0.2.2``, ``v1.2.3-rc1`` or
+    """Parse a SemVer 2.0 tag like ``0.9.9``, ``v1.2.3-rc1`` or
     ``1.2.3+build.5``. Total and bounded: NEVER raises, every input returns
     ``SemVer | None``. ASCII-only: non-ASCII decimal digits and surrounding
     whitespace are rejected (``tag`` is parsed exactly as given — no
@@ -106,7 +108,7 @@ def parse_version(tag: str) -> SemVer | None:
     if not isinstance(tag, str):
         return None
     # fullmatch (not match): Python's `$` matches before a trailing newline,
-    # which would let "0.3.0\n" through despite the anchored grammar.
+    # which would let "1.2.3\n" through despite the anchored grammar.
     match = _VERSION_RE.fullmatch(tag)
     if match is None:
         return None
@@ -196,7 +198,7 @@ def _fetch_latest_tag(
     response`` via ``None``/JSON errors raised here being reclassified.
     """
     url = f"https://api.github.com/repos/{repo}/releases/latest"
-    request = urllib.request.Request(url, headers={"User-Agent": "Moira/0.2.2"})
+    request = urllib.request.Request(url, headers={"User-Agent": f"Moira/{__version__}"})
     with opener(request, timeout=timeout) as response:
         status = getattr(response, "status", 200)
         if not 200 <= status < 300:
@@ -219,20 +221,24 @@ def _fetch_latest_tag(
 def check_latest_release(
     repo: str,
     *,
-    current: str = "0.2.2",
+    current: str | None = None,
     timeout: float = 5.0,
     max_bytes: int = DEFAULT_MAX_BYTES,
     opener: Callable[..., Any] | None = None,
 ) -> UpdateCheckResult:
     """Check the repository's latest release against ``current``.
 
+    ``current`` defaults to the running release (``__version__``); it is
+    injected explicitly by callers that need a different baseline.
     ``opener`` is injectable for tests (defaults to ``urllib.request.urlopen``).
     Returns a sanitized result; never raises for network or parse failures.
     An invalid ``current`` version (not strict SemVer) fails the check
     closed — it is never reported as "up to date".
     """
     if not _valid_repo(repo):
-        return UpdateCheckResult(False, STATUS_CHECK_FAILED, current)
+        return UpdateCheckResult(False, STATUS_CHECK_FAILED, current or __version__)
+    if current is None:
+        current = __version__
     parsed_current = parse_version(current)
     if parsed_current is None:
         return UpdateCheckResult(False, STATUS_CHECK_FAILED, current)

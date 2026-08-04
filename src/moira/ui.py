@@ -37,6 +37,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
+from . import __version__ as APP_VERSION
 from .alerts import CHANNEL_NATIVE, CHANNEL_NTFY, evaluate_alerts, merge_with_stale
 from .autostart import set_enabled as set_autostart
 from .claude_integration import remove as remove_claude_integration
@@ -82,8 +83,6 @@ from .updates import (
 )
 
 _ = tr
-
-APP_VERSION = "0.2.2"
 
 
 def format_local_datetime(dt: datetime) -> str:
