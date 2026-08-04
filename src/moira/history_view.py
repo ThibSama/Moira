@@ -10,6 +10,14 @@ Reduction policy: first/last and all reset transitions are always kept.
 Local extrema are kept next. If mandatory points exceed the soft cap,
 the cap expands to accommodate all mandatory points (soft cap). Remaining
 slots are evenly sampled. Chronological order is always preserved.
+
+Package 4 additions: frozen ``DailyTokenStats`` view models and pure
+GTK-free builders for selected-range daily indicators (total, reported
+days, average per reported day, range peak day/count and peak share),
+computed only from AVAILABLE_EXACT ``day`` rows with integer/Decimal
+arithmetic. Duplicate (service, day) daily inputs fail closed at the
+aggregation boundary. The official Codex summary stays separate and is
+explicitly labeled account-wide.
 """
 
 from __future__ import annotations
@@ -17,7 +25,8 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from .history import HistoryStatus, QuotaObservation, SchemaVersionError, TokenObservation
@@ -85,6 +94,41 @@ class TokenSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class DailyTokenStats:
+    """Exact selected-range daily token statistics for one service.
+
+    Computed ONLY from ``AVAILABLE_EXACT`` rows with ``period_kind ==
+    'day'``. Migrated ``bucket`` events never contribute here — they stay
+    in their existing ``TokenSummary``. Missing days are never filled with
+    zero, nothing is extrapolated or annualized, and no value is derived
+    from quota percentages.
+
+    Arithmetic is integer/Decimal with documented rounding:
+    - ``average_per_reported_day`` is total / reported_days rounded
+      half-up to the nearest integer.
+    - ``peak_share_percent`` is peak_tokens / total_tokens x 100 rounded
+      half-up to one decimal place (None when total is 0).
+    - Peak ties resolve to the earliest reported day (stable documented
+      rule).
+
+    One exact day is valid. Zero exact days produce no entry — there is
+    never a zero card for missing data.
+    """
+
+    service: Service
+    reported_days: int
+    total_tokens: int
+    average_per_reported_day: int
+    peak_day: str | None
+    peak_tokens: int | None
+    peak_share_percent: Decimal | None
+
+    @property
+    def has_data(self) -> bool:
+        return self.reported_days > 0
+
+
+@dataclass(frozen=True, slots=True)
 class TokenAvailabilityState:
     """Typed, provider-neutral availability state for one service.
 
@@ -110,6 +154,7 @@ class HistoryViewResult:
     range_label: str
     filter_label: str
     token_summaries: tuple[TokenSummary, ...] = ()
+    daily_token_stats: tuple[DailyTokenStats, ...] = ()
     token_availability: tuple[TokenAvailabilityState, ...] = ()
     codex_summaries: tuple[CodexSummary, ...] = ()
 
@@ -268,6 +313,77 @@ def _group_observations(
     return groups
 
 
+def _reject_duplicate_daily_observations(
+    token_observations: list[TokenObservation],
+) -> None:
+    """Reject duplicate (service, day) exact daily inputs at the boundary.
+
+    The canonical daily identity is (service, period_kind='day', day); the
+    schema makes duplicates impossible, so a duplicate here means corrupt
+    input. Failing closed prevents silent double-counting in totals,
+    averages and peak indicators. Migrated bucket rows are not part of the
+    daily identity and are never checked.
+    """
+    seen: set[tuple[Service, date]] = set()
+    for obs in token_observations:
+        if obs.period_kind != "day" or not obs.has_exact_tokens:
+            continue
+        key = (obs.service, obs.day)
+        if key in seen:
+            raise ValueError(
+                f"duplicate daily token observation for {obs.service.value} {obs.day.isoformat()}"
+            )
+        seen.add(key)
+
+
+def _build_daily_token_stats(
+    token_observations: list[TokenObservation],
+) -> tuple[DailyTokenStats, ...]:
+    """Build exact selected-range daily indicators per service.
+
+    Only ``AVAILABLE_EXACT`` rows with ``period_kind == 'day'`` contribute.
+    The denominator is the number of reported exact days — missing days
+    are never filled with zero. Results are deterministic: rows are
+    ordered by activity day before aggregation, arithmetic is
+    integer/Decimal, and peak ties resolve to the earliest reported day.
+    Callers must reject duplicate (service, day) inputs first.
+    """
+    groups: dict[Service, list[TokenObservation]] = {}
+    for obs in token_observations:
+        if obs.period_kind != "day" or not obs.has_exact_tokens:
+            continue
+        groups.setdefault(obs.service, []).append(obs)
+
+    stats: list[DailyTokenStats] = []
+    for service, obs_list in sorted(groups.items(), key=lambda item: item[0].value):
+        ordered = sorted(obs_list, key=lambda o: (o.day, o.observed_at))
+        total = sum(o.tokens or 0 for o in ordered)
+        days = len(ordered)
+        average = int(
+            (Decimal(total) / Decimal(days)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
+        peak_tokens = max(o.tokens or 0 for o in ordered)
+        # Stable tie rule: the earliest reported day carrying the maximum.
+        peak_obs = next(o for o in ordered if (o.tokens or 0) == peak_tokens)
+        share: Decimal | None = None
+        if total > 0:
+            share = (Decimal(peak_tokens) * Decimal(100) / Decimal(total)).quantize(
+                Decimal("0.1"), rounding=ROUND_HALF_UP
+            )
+        stats.append(
+            DailyTokenStats(
+                service=service,
+                reported_days=days,
+                total_tokens=total,
+                average_per_reported_day=average,
+                peak_day=peak_obs.day.isoformat(),
+                peak_tokens=peak_tokens,
+                peak_share_percent=share,
+            )
+        )
+    return tuple(stats)
+
+
 def _build_token_summaries(
     token_observations: list[TokenObservation],
 ) -> tuple[TokenSummary, ...]:
@@ -375,11 +491,37 @@ def build_token_summary_text(ts: TokenSummary, translator: Callable[[str], str])
     return _(" · ").join(parts)
 
 
+def build_daily_token_stats_text(
+    stats: DailyTokenStats,
+    range_label: str,
+    translator: Callable[[str], str],
+) -> str:
+    """Build the compact indicator line as a pure function.
+
+    The service and range are part of the label so derived values are
+    clearly range-aware. A zero-token reported day still renders (it was
+    reported); missing data never renders a zero card because zero exact
+    days produce no DailyTokenStats entry at all.
+    """
+    _ = translator
+    parts: list[str] = [f"{stats.service.value.title()} · {range_label}"]
+    parts.append(f"{_('Total')}: {stats.total_tokens:,}")
+    parts.append(f"{_('Reported days')}: {stats.reported_days}")
+    parts.append(f"{_('Avg/day')}: {stats.average_per_reported_day:,}")
+    if stats.peak_day is not None:
+        parts.append(f"{_('Peak')}: {stats.peak_day} ({stats.peak_tokens:,})")
+    if stats.peak_share_percent is not None:
+        parts.append(f"{_('Peak share')}: {stats.peak_share_percent}%")
+    return _(" · ").join(parts)
+
+
 def build_codex_summary_text(summary: CodexSummary, translator: Callable[[str], str]) -> str:
     """Build the official summary label as a pure function.
 
     The official five-field summary is displayed separately from daily
-    totals. A fully-null summary renders as an em-dash placeholder.
+    totals and explicitly labeled account-wide — lifetime, provider peak,
+    streaks and longest-turn values are never relabeled as selected-range
+    data. A fully-null summary renders as an em-dash placeholder.
     """
     _ = translator
     fields: list[str] = []
@@ -394,8 +536,8 @@ def build_codex_summary_text(summary: CodexSummary, translator: Callable[[str], 
     if summary.longest_running_turn_sec is not None:
         fields.append(f"{_('Longest turn')}: {summary.longest_running_turn_sec:,}s")
     if not fields:
-        return f"{_('Codex summary')}: —"
-    return f"{_('Codex summary')} · " + _(" · ").join(fields)
+        return f"{_('Codex summary')} ({_('account-wide')}): —"
+    return f"{_('Codex summary')} ({_('account-wide')}) · " + _(" · ").join(fields)
 
 
 def build_token_availability_note(status: HistoryStatus, translator: Callable[[str], str]) -> str:
@@ -442,12 +584,16 @@ def prepare_history_view(
         series.append(SeriesView(stats=stats, points=points))
     token_obs = token_observations or []
     avail_records = token_availability_records or []
+    # Pure aggregation boundary: duplicate (service, day) daily inputs fail
+    # closed instead of being double-counted.
+    _reject_duplicate_daily_observations(token_obs)
     return HistoryViewResult(
         series=tuple(series),
         diagnostic=diagnostic,
         range_label=range_label,
         filter_label=filter_label,
         token_summaries=_build_token_summaries(token_obs),
+        daily_token_stats=_build_daily_token_stats(token_obs),
         token_availability=_build_token_availability_from_records(avail_records),
         codex_summaries=_build_codex_summaries(codex_summaries or []),
     )

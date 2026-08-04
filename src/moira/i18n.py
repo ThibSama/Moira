@@ -150,7 +150,13 @@ _FRENCH: dict[str, str] = {
     "Longest turn": "Tour le plus long",
     "Codex summary": "Résumé Codex",
     "Summary": "Résumé",
+    "account-wide": "à l'échelle du compte",
     "Source": "Source",
+    # ── Package 4: exact daily indicators ──
+    "Reported days": "Jours rapportés",
+    "Avg/day": "Moy./jour",
+    "Peak": "Pic",
+    "Peak share": "Part du pic",
 }
 
 

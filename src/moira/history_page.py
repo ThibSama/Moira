@@ -25,12 +25,14 @@ from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from .history_chart import QuotaChart  # noqa: E402
 from .history_view import (  # noqa: E402
+    DailyTokenStats,
     HistoryReader,
     HistoryViewResult,
     SeriesStats,
     SeriesView,
     TokenSummary,
     build_codex_summary_text,
+    build_daily_token_stats_text,
     build_token_availability_note,
     build_token_summary_text,
 )
@@ -272,6 +274,13 @@ class HistoryPage(Gtk.Box):
         for ts in token_summaries:
             self._stats_box.append(self._token_summary_label(ts))
 
+        # Exact selected-range daily indicators (compact, clearly labeled).
+        # Rendered only when exact day rows exist — zero exact days never
+        # create a zero card. The service and range are part of the label.
+        daily_stats = getattr(view, "daily_token_stats", ())
+        for ds in daily_stats:
+            self._stats_box.append(self._daily_stats_label(ds, view.range_label))
+
         # Official Codex summary — displayed separately from daily totals
         codex_summaries = getattr(view, "codex_summaries", ())
         for cs in codex_summaries:
@@ -305,6 +314,16 @@ class HistoryPage(Gtk.Box):
     def _token_summary_label(ts: TokenSummary) -> Gtk.Widget:
         """Build a label showing persisted daily token activity."""
         text = build_token_summary_text(ts, tr)
+        return Gtk.Label(label=text, xalign=0, wrap=True)
+
+    @staticmethod
+    def _daily_stats_label(ds: DailyTokenStats, range_label: str) -> Gtk.Widget:
+        """Build a compact label showing exact selected-range daily indicators.
+
+        One wrapped text label per service — narrow-window friendly and
+        never dependent on color alone.
+        """
+        text = build_daily_token_stats_text(ds, range_label, tr)
         return Gtk.Label(label=text, xalign=0, wrap=True)
 
     @staticmethod
