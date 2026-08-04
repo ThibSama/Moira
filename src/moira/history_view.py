@@ -18,6 +18,13 @@ computed only from AVAILABLE_EXACT ``day`` rows with integer/Decimal
 arithmetic. Duplicate (service, day) daily inputs fail closed at the
 aggregation boundary. The official Codex summary stays separate and is
 explicitly labeled account-wide.
+
+Package 4b additions: a frozen ``HistoryContentState`` helper classifies
+every result (quota series, token summaries, daily statistics, official
+summaries, availability) so token-only, summary-only and availability-only
+results are non-empty History content. A centralized exact-token
+capability gate admits only Codex exact rows; impossible exact Claude
+rows are ignored deterministically and never rendered or summed.
 """
 
 from __future__ import annotations
@@ -139,6 +146,56 @@ class TokenAvailabilityState:
 
     service: Service
     status: HistoryStatus
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryContentState:
+    """Pure immutable content classification of a History result.
+
+    Covers every renderable category: quota series, token summaries,
+    daily statistics, official summaries and availability. The page uses
+    this to decide the visible status — a result with any token content
+    or availability is a non-empty History result even when quota series
+    are absent, and only a fully empty result says "no history data".
+    """
+
+    has_quota_series: bool
+    has_token_summaries: bool
+    has_daily_stats: bool
+    has_codex_summaries: bool
+    has_availability: bool
+
+    @property
+    def has_token_content(self) -> bool:
+        """True when any exact token summary, daily statistic or official
+        summary is present."""
+        return self.has_token_summaries or self.has_daily_stats or self.has_codex_summaries
+
+    @property
+    def has_any_content(self) -> bool:
+        """True when anything at all is renderable."""
+        return self.has_quota_series or self.has_token_content or self.has_availability
+
+    @property
+    def is_empty(self) -> bool:
+        """True only when nothing at all is renderable."""
+        return not self.has_any_content
+
+
+def derive_content_state(view: HistoryViewResult) -> HistoryContentState:
+    """Classify a History result into its renderable content categories.
+
+    Pure and GTK-free. ``has_token_content`` distinguishes "no quota
+    series" from "no history at all": token summaries, daily statistics
+    and official summaries are all real History content.
+    """
+    return HistoryContentState(
+        has_quota_series=bool(view.series),
+        has_token_summaries=bool(view.token_summaries),
+        has_daily_stats=bool(view.daily_token_stats),
+        has_codex_summaries=bool(view.codex_summaries),
+        has_availability=bool(view.token_availability),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +368,25 @@ def _group_observations(
         key = (obs.quota_label, obs.service)
         groups.setdefault(key, []).append(obs)
     return groups
+
+
+def _apply_token_capability_policy(
+    token_observations: list[TokenObservation],
+) -> list[TokenObservation]:
+    """Central exact-token capability gate.
+
+    Only Codex account daily rows are supported token data. Exact rows for
+    any other service are impossible by construction (the collector emits
+    UNSUPPORTED for Claude); they are ignored deterministically here —
+    never rendered, summed, or relabeled as supported data. Non-exact rows
+    (UNSUPPORTED, TEMPORARILY_UNAVAILABLE, INVALID) pass through: they
+    carry no counts and only feed availability rendering.
+    """
+    return [
+        obs
+        for obs in token_observations
+        if obs.service is Service.CODEX or not obs.has_exact_tokens
+    ]
 
 
 def _reject_duplicate_daily_observations(
@@ -584,16 +660,19 @@ def prepare_history_view(
         series.append(SeriesView(stats=stats, points=points))
     token_obs = token_observations or []
     avail_records = token_availability_records or []
+    # Central capability gate: only Codex exact rows are supported token
+    # data; impossible exact rows for other services are ignored.
+    supported_token_obs = _apply_token_capability_policy(token_obs)
     # Pure aggregation boundary: duplicate (service, day) daily inputs fail
     # closed instead of being double-counted.
-    _reject_duplicate_daily_observations(token_obs)
+    _reject_duplicate_daily_observations(supported_token_obs)
     return HistoryViewResult(
         series=tuple(series),
         diagnostic=diagnostic,
         range_label=range_label,
         filter_label=filter_label,
-        token_summaries=_build_token_summaries(token_obs),
-        daily_token_stats=_build_daily_token_stats(token_obs),
+        token_summaries=_build_token_summaries(supported_token_obs),
+        daily_token_stats=_build_daily_token_stats(supported_token_obs),
         token_availability=_build_token_availability_from_records(avail_records),
         codex_summaries=_build_codex_summaries(codex_summaries or []),
     )

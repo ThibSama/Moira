@@ -35,6 +35,7 @@ from .history_view import (  # noqa: E402
     build_daily_token_stats_text,
     build_token_availability_note,
     build_token_summary_text,
+    derive_content_state,
 )
 from .i18n import tr  # noqa: E402
 from .models import HistoryStatus, Service  # noqa: E402
@@ -261,13 +262,21 @@ class HistoryPage(Gtk.Box):
             self._status_label.set_text(_("Loading…"))
             return False
 
-        # Data state
-        if not view.series:
+        # Data state — classified by the pure content-state helper so that
+        # token summaries, daily statistics, official summaries and
+        # availability all count as real History content. "No history data"
+        # appears only when nothing at all is renderable; a missing quota
+        # series with other content shows the narrower quota-absent note.
+        state = derive_content_state(view)
+        if state.is_empty:
             self._status_label.set_text(_("No history data for this range"))
         else:
-            self._status_label.set_text("")
-            for s in view.series:
-                self._stats_box.append(self._series_stats_label(s))
+            if state.has_quota_series:
+                self._status_label.set_text("")
+                for s in view.series:
+                    self._stats_box.append(self._series_stats_label(s))
+            else:
+                self._status_label.set_text(_("No quota observations for this range"))
 
         # Persisted daily totals (token activity), shown per service/kind
         token_summaries = getattr(view, "token_summaries", ())

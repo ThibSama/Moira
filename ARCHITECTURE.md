@@ -43,9 +43,11 @@ The History view adds frozen immutable view models (`DailyTokenStats`) and pure 
 - Denominator: reported exact days only. Missing days are never filled with zero; nothing is extrapolated, annualized, or derived from quota percentages.
 - Arithmetic is integer/Decimal with documented rounding: the average is rounded half-up to the nearest integer; the peak share is rounded half-up to one decimal place. Peak ties resolve to the earliest reported day.
 - Duplicate (service, day) daily inputs are rejected at the pure aggregation boundary (`prepare_history_view`) — the schema PK makes them impossible, so a duplicate means corrupt input and fails closed instead of double-counting.
+- A centralized exact-token capability gate (`_apply_token_capability_policy`) admits only Codex exact rows; impossible exact Claude rows are ignored deterministically — never rendered, summed, or relabeled as supported data — while Claude `UNSUPPORTED` availability notes are preserved.
 - Migrated `bucket` events stay in their existing per-kind `TokenSummary` and never contribute to daily averages or peak indicators.
 - Zero exact days produce no indicator card at all; one exact day (including an explicitly reported zero-token day) is valid.
 - The official Codex summary is displayed separately and explicitly labeled account-wide — lifetime, provider peak, streaks and longest-turn values are never relabeled as selected-range data. Filters and range selectors affect indicators exactly as they affect token rows; Claude remains UNSUPPORTED and shows no token indicators.
+- A pure content-state helper (`HistoryContentState`/`derive_content_state`) classifies every result (quota series, token summaries, daily statistics, official summaries, availability). Token-only, summary-only and availability-only results are non-empty History content: the page only shows "no history data" when nothing at all is renderable, and distinguishes it from the narrower "no quota observations in this range" note.
 
 ## Provider token capability matrix
 

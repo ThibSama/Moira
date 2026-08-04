@@ -263,20 +263,21 @@ def test_duplicate_daily_input_rejected() -> None:
 
 def test_duplicate_check_is_per_service_per_day() -> None:
     """The same day for different services is not a duplicate; bucket rows on
-    the same day are not part of the daily identity and never raise."""
+    the same day are not part of the daily identity and never raise. An exact
+    Claude row is ignored by the capability gate — never rendered or summed."""
     view = _view(
         [
             _token_obs(DAY3, tokens=500),  # codex daily
             _token_obs(DAY3, tokens=100, period_kind="bucket"),  # codex bucket
-            _token_obs(DAY3, tokens=0, service=Service.CLAUDE),  # claude daily
+            _token_obs(DAY3, tokens=0, service=Service.CLAUDE),  # exact claude (impossible)
         ]
     )
-    # Two distinct services on the same day: two daily indicator entries,
-    # each aggregated under its own (service, day) identity.
+    # Only Codex daily rows are supported token data.
     services = {s.service for s in _stats(view)}
-    assert services == {Service.CODEX, Service.CLAUDE}
+    assert services == {Service.CODEX}
     codex = next(s for s in _stats(view) if s.service is Service.CODEX)
     assert codex.total_tokens == 500  # the bucket row never contributes
+    assert codex.reported_days == 1  # the exact Claude row never contributes
 
 
 def test_duplicate_rejection_happens_before_any_rendering() -> None:

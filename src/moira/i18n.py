@@ -122,6 +122,7 @@ _FRENCH: dict[str, str] = {
     "Filter": "Filtre",
     "All": "Tous",
     "No history data for this range": "Aucune donnée d'historique pour cette plage",
+    "No quota observations for this range": "Aucune observation de quota sur cette plage",
     "Database unavailable": "Base de données indisponible",
     "Schema mismatch": "Incompatibilité de schéma",
     "No observations": "Aucune observation",
