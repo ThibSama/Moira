@@ -568,3 +568,148 @@ def test_saved_default_settings_round_trip(tmp_path: Path) -> None:
         loaded = load_settings()
     assert loaded.rules_for(Service.CLAUDE).thresholds == [50, 75, 90]
     assert loaded.rules_for(Service.CODEX).thresholds == [50, 75, 90]
+
+
+# ── Package 5d: persisted version decoded before any migration ──
+
+
+def test_decode_version_exact_semantics() -> None:
+    """Only a non-bool integer 1/2/3 is a valid persisted version."""
+    from moira.persistence import _decode_version
+
+    assert _decode_version({}) == 1  # sole documented legacy rule: versionless = v1
+    for good in (1, 2, 3):
+        assert _decode_version({"version": good}) == good
+    for bad in (True, False, 2.0, "2", 0, -1, 4, 1.0, None):
+        with pytest.raises(ValueError):
+            _decode_version({"version": bad})
+
+
+def test_explicit_malformed_version_fails_closed_no_partial_preservation(
+    tmp_path: Path,
+) -> None:
+    """Boolean, float, string, zero, negative and unsupported explicit
+    versions fall back to COMPLETE defaults — never migrated, never
+    partially preserved."""
+    cases = (
+        {"version": True, "ntfy_topic": "keep"},
+        {"version": False, "ntfy_topic": "keep"},
+        {"version": 2.0, "ntfy_topic": "keep"},
+        {"version": "2", "ntfy_topic": "keep"},
+        {"version": 0, "ntfy_topic": "keep"},
+        {"version": -1, "ntfy_topic": "keep"},
+        {"version": 4, "ntfy_topic": "keep"},
+        {"version": 1.0, "ntfy_topic": "keep"},
+    )
+    for payload in cases:
+        config = tmp_path / "moira" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps(payload))
+        with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
+            settings = load_settings()
+        assert settings.version == 3, payload
+        assert settings.ntfy_topic == "", payload  # nothing preserved
+        assert settings.thresholds == [50, 75, 90]
+        assert settings.rules_for(Service.CLAUDE).thresholds == [50, 75, 90]
+        config.unlink()
+
+
+def test_versionless_legacy_file_migrates(tmp_path: Path) -> None:
+    """The ONE documented legacy rule: a versionless file is v1 and is
+    migrated additively, preserving its settings."""
+    config = tmp_path / "moira" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"refresh_minutes": 10, "ntfy_topic": "legacy"}))
+    with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
+        settings = load_settings()
+    assert settings.version == 3
+    assert settings.refresh_minutes == 10
+    assert settings.ntfy_topic == "legacy"
+    assert settings.rules_for(Service.CLAUDE).thresholds == [50, 75, 90]
+
+
+def test_valid_v1_v2_v3_round_trips(tmp_path: Path) -> None:
+    """Valid persisted versions 1, 2 and 3 each load correctly."""
+    for version, refresh, topic in ((1, 5, "one"), (2, 10, "two"), (3, 15, "three")):
+        config = tmp_path / "moira" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        payload: dict[str, Any] = {
+            "version": version,
+            "refresh_minutes": refresh,
+            "ntfy_topic": topic,
+        }
+        if version == 3:
+            payload["rules"] = _valid_rules()
+        config.write_text(json.dumps(payload))
+        with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
+            settings = load_settings()
+        assert settings.version == 3, version
+        assert settings.refresh_minutes == refresh, version
+        assert settings.ntfy_topic == topic, version
+        config.unlink()
+
+
+# ── Package 5d: persisted provider rules use an exact inner shape ──
+
+
+def test_coerce_rules_exact_inner_shape() -> None:
+    """Each persisted provider rules object must contain exactly
+    thresholds, reset_alerts and error_alerts — no defaults may fill in
+    missing fields."""
+    full = {"thresholds": [50], "reset_alerts": True, "error_alerts": True}
+    with pytest.raises(ValueError):
+        _coerce_rules({"rules": {"claude": {}, "codex": dict(full)}})  # empty provider
+    with pytest.raises(ValueError):
+        _coerce_rules(  # missing error_alerts (silently defaulted before)
+            {"rules": {"claude": {"thresholds": [50], "reset_alerts": True}, "codex": dict(full)}}
+        )
+    with pytest.raises(ValueError):
+        _coerce_rules(  # missing reset_alerts
+            {"rules": {"claude": {"thresholds": [50]}, "codex": dict(full)}}
+        )
+    with pytest.raises(ValueError):
+        _coerce_rules(  # extra field
+            {
+                "rules": {
+                    "claude": {**full, "priority": 1},
+                    "codex": dict(full),
+                }
+            }
+        )
+    coerced = _coerce_rules({"rules": {"claude": dict(full), "codex": dict(full)}})
+    assert coerced["claude"].reset_alerts is True
+    assert coerced["codex"].error_alerts is True
+
+
+def test_persisted_partial_provider_rules_fail_closed(tmp_path: Path) -> None:
+    """A file whose provider objects are empty or partial falls back to
+    COMPLETE defaults — reset/error alerts are never silently enabled."""
+    full = {"thresholds": [50], "reset_alerts": True, "error_alerts": True}
+    cases = (
+        {"version": 3, "ntfy_topic": "keep", "rules": {"claude": {}, "codex": dict(full)}},
+        {
+            "version": 3,
+            "ntfy_topic": "keep",
+            "rules": {"claude": {"thresholds": [50]}, "codex": dict(full)},
+        },
+        {
+            "version": 3,
+            "ntfy_topic": "keep",
+            "rules": {"claude": dict(full), "codex": {"reset_alerts": False}},
+        },
+        {
+            "version": 3,
+            "ntfy_topic": "keep",
+            "rules": {"claude": dict(full), "codex": {**full, "extra": 1}},
+        },
+    )
+    for payload in cases:
+        config = tmp_path / "moira" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps(payload))
+        with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
+            settings = load_settings()
+        assert settings.ntfy_topic == ""
+        assert settings.rules_for(Service.CLAUDE).reset_alerts is True  # default
+        assert settings.rules_for(Service.CODEX).error_alerts is True  # default
+        config.unlink()

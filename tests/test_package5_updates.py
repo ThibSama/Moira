@@ -222,6 +222,60 @@ def test_check_latest_release_oversized_inputs_sanitized() -> None:
     assert result.status == STATUS_CHECK_FAILED
 
 
+# ── Package 5d: ASCII-only grammar, no surrounding whitespace ──
+
+
+def test_non_ascii_core_digits_rejected() -> None:
+    """Python's ``\\d`` accepts non-ASCII decimal digits; strict SemVer
+    requires ASCII [0-9]."""
+    arabic = "١.٢.٣"  # Arabic-Indic digits 1.2.3
+    fullwidth = "１.２.３"  # full-width digits
+    for bad in (arabic, fullwidth, f"v{arabic}", f"{arabic}-rc1", f"{arabic}+build"):
+        assert parse_version(bad) is None, bad
+
+
+def test_non_ascii_prerelease_numeric_attempts_rejected() -> None:
+    """Unicode digit attempts in prerelease identifiers are rejected."""
+    for bad in (
+        "1.2.3-١",  # Arabic-Indic one
+        "1.2.3-rc.١",
+        "1.2.3-" + "١" * 5,
+        "1.2.3-rc1.２",  # full-width two
+    ):
+        assert parse_version(bad) is None, bad
+
+
+def test_surrounding_whitespace_rejected() -> None:
+    """No stripping: the grammar is anchored, so whitespace around the tag
+    is invalid."""
+    for bad in (" 1.2.3", "1.2.3 ", " 1.2.3 ", "\t1.2.3\n", "v1.2.3 ", " 0.2.2"):
+        assert parse_version(bad) is None, repr(bad)
+
+
+def test_ascii_boundary_still_exact() -> None:
+    """The 64-digit bound is unchanged and 65 digits are rejected."""
+    biggest_64 = "9" * 64
+    assert parse_version(f"1.{biggest_64}.0") is not None
+    assert parse_version(f"1.{biggest_64}0.0") is None
+
+
+def test_check_latest_release_unicode_and_whitespace_sanitized() -> None:
+    """Malformed Unicode/whitespace latest or current versions map to
+    sanitized outcomes — never to an update, never to 'up to date'."""
+    # Latest tag with non-ASCII digits or surrounding whitespace.
+    for tag in ("١.٢.٣", "１.٢.٣", " 0.3.0 ", "0.3.0\n"):
+        body = json.dumps({"tag_name": tag}).encode()
+        result = check_latest_release("ThibSama/moira", current="0.2.2", opener=_opener(body))
+        assert result.ok is False, tag
+        assert result.status == STATUS_INVALID_RESPONSE, tag
+    # Current version with non-ASCII digits or surrounding whitespace.
+    body = json.dumps({"tag_name": "0.3.0"}).encode()
+    for bad_current in ("١.٢.٣", " 0.2.2 ", "0.2.2\t"):
+        result = check_latest_release("ThibSama/moira", current=bad_current, opener=_opener(body))
+        assert result.ok is False, bad_current
+        assert result.status == STATUS_CHECK_FAILED, bad_current
+
+
 # ── Release check outcomes ──
 
 

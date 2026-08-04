@@ -36,10 +36,15 @@ STATUS_INVALID_RESPONSE = "invalid response"
 DEFAULT_MAX_BYTES = 65536
 
 #: Full SemVer 2.0 shape (a ``v``/``V`` tag prefix is tolerated, matching
-#: common GitHub release tags). Core groups are ``\\d+``; leading zeros are
-#: rejected by validation afterwards. Prerelease/build groups require at
-#: least one identifier character (``1.2.3-`` / ``1.2.3+`` never match).
-_VERSION_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$")
+#: common GitHub release tags). Core groups are ASCII ``[0-9]`` only —
+#: ``\\d`` would accept non-ASCII decimal digits (Arabic-Indic, full-width)
+#: which strict SemVer forbids. Leading zeros are rejected by validation
+#: afterwards. Prerelease/build groups require at least one identifier
+#: character (``1.2.3-`` / ``1.2.3+`` never match). Surrounding whitespace
+#: is NOT stripped: the grammar is anchored, so ``" 1.2.3 "`` is invalid.
+_VERSION_RE = re.compile(
+    r"^[vV]?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$"
+)
 _IDENTIFIER_RE = re.compile(r"^[0-9A-Za-z-]+$")
 
 #: Deterministic safe bound for numeric SemVer identifiers. Any core or
@@ -81,7 +86,7 @@ def _valid_identifier(identifier: str) -> bool:
     raise. Alphanumeric/hyphen identifiers are valid as-is. Empty
     identifiers are always invalid.
     """
-    if not identifier or not _IDENTIFIER_RE.match(identifier):
+    if not identifier or not _IDENTIFIER_RE.fullmatch(identifier):
         return False
     if identifier.isdigit():
         if len(identifier) > MAX_NUMERIC_IDENTIFIER_DIGITS:
@@ -93,12 +98,16 @@ def _valid_identifier(identifier: str) -> bool:
 def parse_version(tag: str) -> SemVer | None:
     """Parse a SemVer 2.0 tag like ``0.2.2``, ``v1.2.3-rc1`` or
     ``1.2.3+build.5``. Total and bounded: NEVER raises, every input returns
-    ``SemVer | None``. Returns None for anything non-conforming (leading
-    zeros, empty/invalid identifiers, oversized numeric identifiers,
-    malformed shapes)."""
+    ``SemVer | None``. ASCII-only: non-ASCII decimal digits and surrounding
+    whitespace are rejected (``tag`` is parsed exactly as given — no
+    stripping). Returns None for anything non-conforming (leading zeros,
+    empty/invalid identifiers, oversized numeric identifiers, malformed
+    shapes)."""
     if not isinstance(tag, str):
         return None
-    match = _VERSION_RE.match(tag.strip())
+    # fullmatch (not match): Python's `$` matches before a trailing newline,
+    # which would let "0.3.0\n" through despite the anchored grammar.
+    match = _VERSION_RE.fullmatch(tag)
     if match is None:
         return None
     for group in (match.group(1), match.group(2), match.group(3)):
@@ -201,7 +210,10 @@ def _fetch_latest_tag(
     tag = data.get("tag_name")
     if not isinstance(tag, str) or not tag.strip():
         return None
-    return tag.strip()
+    # Returned exactly as received: surrounding whitespace or non-ASCII
+    # digits in the tag fail strict parse_version and map to a sanitized
+    # invalid-response outcome (never silently normalized).
+    return tag
 
 
 def check_latest_release(

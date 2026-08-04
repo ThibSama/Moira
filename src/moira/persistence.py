@@ -34,6 +34,11 @@ DEFAULT_THRESHOLDS = [50, 75, 90]
 #: Valid provider rule keys (the two collection services).
 VALID_RULE_KEYS = ("claude", "codex")
 
+#: Exact field set of one persisted provider rules object. Persisted v3
+#: rules must contain exactly these three fields — missing fields must not
+#: silently fall back to ProviderRules defaults.
+PROVIDER_RULE_FIELDS = ("thresholds", "reset_alerts", "error_alerts")
+
 #: Bounded geometry edge: window sizes are stored as 16-bit-ish positive
 #: integers; anything outside 1..MAX_WINDOW_EDGE is rejected (fail closed).
 MAX_WINDOW_EDGE = 65535
@@ -321,11 +326,14 @@ def _coerce_rules(data: dict[str, Any]) -> dict[str, ProviderRules]:
     """Strictly decode persisted v3 ``rules`` (fail closed).
 
     A persisted v3 file MUST carry ``rules`` as an object containing exactly
-    ``claude`` and ``codex`` with valid typed values. Missing, falsy
-    non-object shapes (``[]``, ``false``, ``0``, ``""``), empty, incomplete
-    or extra shapes all raise ValueError, so ``load_settings`` falls back to
-    a COMPLETE default ``Settings`` instance — never to partial preservation
-    with rules silently derived from the legacy globals.
+    ``claude`` and ``codex``, each being an object with EXACTLY the fields
+    ``thresholds``, ``reset_alerts`` and ``error_alerts`` (no missing field
+    may silently fall back to a ProviderRules default, no extra field is
+    tolerated). Missing, falsy non-object shapes (``[]``, ``false``, ``0``,
+    ``""``), empty, incomplete or extra shapes at either level all raise
+    ValueError, so ``load_settings`` falls back to a COMPLETE default
+    ``Settings`` instance — never to partial preservation with rules
+    silently derived from defaults.
     """
     if "rules" not in data:
         raise ValueError("persisted v3 configuration must contain rules")
@@ -339,6 +347,10 @@ def _coerce_rules(data: dict[str, Any]) -> dict[str, ProviderRules]:
         value = raw[key]
         if not isinstance(value, dict):
             raise ValueError(f"rules for {key!r} must be an object")
+        if set(value) != set(PROVIDER_RULE_FIELDS):
+            raise ValueError(
+                f"rules for {key!r} must contain exactly thresholds, reset_alerts and error_alerts"
+            )
         rules[key] = ProviderRules(**value)
     return rules
 
@@ -359,6 +371,27 @@ def _atomic_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def _decode_version(data: dict[str, Any]) -> int:
+    """Decode the persisted configuration version with exact semantics.
+
+    Only a non-bool integer ``1``, ``2`` or ``3`` is accepted. The sole
+    documented deterministic legacy rule: an ABSENT ``version`` key means a
+    versionless v1 file and is migrated. Every other explicit value —
+    boolean, float, string, zero, negative, unsupported — raises ValueError
+    so ``load_settings`` fails closed to complete defaults WITHOUT any
+    partial preservation (an explicit malformed ``version`` is never
+    reinterpreted as a legacy version).
+    """
+    if "version" not in data:
+        return 1  # documented legacy rule: versionless files are v1
+    version = data["version"]
+    if type(version) is not int:
+        raise ValueError("configuration version must be a non-bool integer")
+    if version not in (1, 2, 3):
+        raise ValueError("unsupported configuration version")
+    return version
+
+
 def load_settings() -> Settings:
     path = config_dir() / "config.json"
     if not path.exists():
@@ -367,7 +400,7 @@ def load_settings() -> Settings:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return Settings()
-        version = data.get("version", 1)
+        version = _decode_version(data)
         if version == 1:
             data = _migrate_v1_to_v2(data)
         if version <= 2:
