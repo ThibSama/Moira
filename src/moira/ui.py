@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import threading
 import time
 from datetime import UTC, datetime
@@ -400,25 +401,41 @@ class MainWindow(Adw.ApplicationWindow):
         self.completed = 0
         self.claude_card.status.set_text(_("Loading…"))
         self.codex_card.status.set_text(_("Loading…"))
-        for collector in (ClaudeCollector(), CodexCollector()):
-            future = self.executor.submit(collector.collect)
-            future.add_done_callback(self._collector_done)
+        self._submit_collectors()
         return False
 
-    def _collector_done(self, future: concurrent.futures.Future[CollectorResult]) -> None:
+    def _submit_collectors(self) -> None:
+        """Submit one collector per provider, binding each future to its Service.
+
+        The identity travels with the future via functools.partial, so
+        ``_collector_done`` receives it independently of completion order —
+        a Claude failure can never be misclassified as Codex (or vice versa).
+        """
+        for service, collector in (
+            (Service.CLAUDE, ClaudeCollector()),
+            (Service.CODEX, CodexCollector()),
+        ):
+            future = self.executor.submit(collector.collect)
+            future.add_done_callback(functools.partial(self._collector_done, service=service))
+
+    def _collector_done(
+        self, future: concurrent.futures.Future[CollectorResult], service: Service
+    ) -> None:
         try:
             result = future.result()
         except Exception:
             # Unexpected collector failure: synthesize one sanitized
-            # TEMPORARILY_UNAVAILABLE record so the UI always has an
-            # availability state to display.
+            # TEMPORARILY_UNAVAILABLE record for the bound provider so the
+            # UI always has an availability state to display. No exception
+            # text is ever stored — TokenAvailabilityRecord has no detail.
             now = datetime.now(UTC)
             result = CollectorResult(
+                service=service,
                 quota_readings=(),
                 token_readings=(),
                 token_availability_records=(
                     TokenAvailabilityRecord(
-                        service=Service.CODEX,
+                        service=service,
                         observed_at=now,
                         source="moira",
                         status=HistoryStatus.TEMPORARILY_UNAVAILABLE,

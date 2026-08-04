@@ -22,6 +22,21 @@ Package 3c additions (schema stays v3):
 - Incomplete databases are never labeled v3: a metadata table with no
   version row is repaired transactionally only when every v3 table exists,
   otherwise the schema fails closed.
+
+Package 3g additions (schema stays v4):
+- The v4 contract is validated by content, never by DDL substrings: the
+  quota replay UNIQUE key (service, quota_label, bucket, observed_at) is
+  proven through PRAGMA index_list/index_info including SQLite autoindexes
+  (origin 'u'), index uniqueness and backing table are checked, and every
+  table's ordered column list must match the contract exactly — extra or
+  reordered columns fail closed.
+- Every missing or wrong required non-unique secondary index (quota,
+  token_events, summaries, availability) is repaired transactionally;
+  a UNIQUE index occupying a required non-unique slot is never dropped
+  and fails closed.
+- init_schema accepts an injected V4Contract dependency so a semantic
+  mismatch can be forced through the production fresh-init path, proving
+  that DDL and the version row commit together or roll back together.
 """
 
 from __future__ import annotations
@@ -1037,17 +1052,21 @@ def _index_present(conn: sqlite3.Connection, index: str) -> bool:
     )
 
 
-def _validate_v4_semantics(conn: sqlite3.Connection) -> list[str]:
+def _validate_v4_semantics(
+    conn: sqlite3.Connection, contract: V4Contract = V4_CONTRACT
+) -> list[str]:
     """Validate the complete v4 schema contract and return a list of violations.
 
-    Uses PRAGMA table_info for column names, types, nullability, defaults
-    and primary-key membership; PRAGMA index_list + PRAGMA index_info for
-    index existence and columns; sqlite_master for UNIQUE constraints.
-    Every object is validated by content, never by name alone.
+    Uses PRAGMA table_info for column names, types, nullability, defaults,
+    primary-key membership and exact declared order; PRAGMA index_list +
+    PRAGMA index_info for index existence, uniqueness, backing table and
+    ordered columns; sqlite_master for autoindex provenance. Every object
+    is validated by content, never by name alone. Extra or reordered
+    columns fail closed.
     """
     violations: list[str] = []
 
-    for table_spec in V4_CONTRACT.tables:
+    for table_spec in contract.tables:
         table_name = table_spec.name
 
         if not _table_present(conn, table_name):
@@ -1057,6 +1076,15 @@ def _validate_v4_semantics(conn: sqlite3.Connection) -> list[str]:
         # Column validation via PRAGMA table_info
         actual_cols = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
         actual_by_name: dict[str, Any] = {row[1]: row for row in actual_cols}
+
+        # Exact ordered columns: extra columns and reordered declarations fail.
+        actual_ordered_names = tuple(row[1] for row in actual_cols)
+        expected_names = tuple(c.name for c in table_spec.columns)
+        if actual_ordered_names != expected_names:
+            violations.append(
+                f"table {table_name} column set/order {list(actual_ordered_names)} "
+                f"expected {list(expected_names)}"
+            )
 
         for col_spec in table_spec.columns:
             actual = actual_by_name.get(col_spec.name)
@@ -1120,6 +1148,25 @@ def _validate_v4_semantics(conn: sqlite3.Connection) -> list[str]:
                 violations.append(f"index {idx_spec.name} missing")
                 continue
 
+            # Uniqueness must match the contract exactly — a UNIQUE index
+            # can never satisfy a required plain secondary index or vice versa.
+            actual_unique = bool(actual_idx[2])
+            if actual_unique != idx_spec.unique:
+                violations.append(
+                    f"index {idx_spec.name} unique={actual_unique} expected {idx_spec.unique}"
+                )
+
+            # The index must back the expected table.
+            tbl_row = conn.execute(
+                "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?",
+                (idx_spec.name,),
+            ).fetchone()
+            if tbl_row is None or tbl_row[0] != idx_spec.table:
+                violations.append(
+                    f"index {idx_spec.name} table {tbl_row[0] if tbl_row else None} "
+                    f"expected {idx_spec.table}"
+                )
+
             idx_cols = conn.execute(f"PRAGMA index_info({idx_spec.name})").fetchall()
             actual_columns = tuple(row[2] for row in sorted(idx_cols, key=lambda r: r[0]))
             if actual_columns != idx_spec.columns:
@@ -1128,7 +1175,8 @@ def _validate_v4_semantics(conn: sqlite3.Connection) -> list[str]:
                     f"expected {list(idx_spec.columns)}"
                 )
 
-    # Validate quota_replay UNIQUE constraint
+    # Validate the quota replay UNIQUE constraint by content: PRAGMA
+    # index_list (including SQLite autoindexes, origin 'u') + index_info.
     _check_unique_constraint(
         conn,
         violations,
@@ -1145,26 +1193,29 @@ def _check_unique_constraint(
     table: str,
     columns: tuple[str, ...],
 ) -> None:
-    """Verify that a UNIQUE constraint exists covering the given columns."""
-    ddl_row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
-        (table,),
-    ).fetchone()
-    if ddl_row is None:
-        return
-    ddl = ddl_row[0] or ""
-    if "UNIQUE" not in ddl.upper():
-        violations.append(f"table {table} missing UNIQUE constraint")
-        return
-    for col in columns:
-        if col not in ddl:
-            violations.append(f"table {table} UNIQUE constraint missing column {col}")
+    """Prove a UNIQUE constraint covers exactly the given ordered columns.
+
+    Reads PRAGMA index_list + PRAGMA index_info. SQLite materializes
+    table-level UNIQUE constraints as autoindexes with origin 'u' and
+    unique=1; only those can satisfy a required unique key. The DDL text
+    is never inspected — a ``UNIQUE(service)`` declaration plus ordinary
+    mentions of the other columns can never satisfy the key.
+    """
+    index_list = conn.execute(f"PRAGMA index_list({table})").fetchall()
+    candidates = [row for row in index_list if row[3] == "u" and bool(row[2])]
+    for row in candidates:
+        idx_cols = conn.execute(f"PRAGMA index_info({row[1]})").fetchall()
+        actual_columns = tuple(ic[2] for ic in sorted(idx_cols, key=lambda r: r[0]))
+        if actual_columns == columns:
             return
+    violations.append(f"table {table} missing UNIQUE constraint on ({', '.join(columns)})")
 
 
-def _validate_v4_completeness(conn: sqlite3.Connection) -> list[str]:
+def _validate_v4_completeness(
+    conn: sqlite3.Connection, contract: V4Contract = V4_CONTRACT
+) -> list[str]:
     """Thin wrapper around _validate_v4_semantics for backward compatibility."""
-    return _validate_v4_semantics(conn)
+    return _validate_v4_semantics(conn, contract=contract)
 
 
 def _has_all_v4_tables(conn: sqlite3.Connection) -> bool:
@@ -1172,19 +1223,28 @@ def _has_all_v4_tables(conn: sqlite3.Connection) -> bool:
     return all(_table_present(conn, t) for t in REQUIRED_V4_TABLES)
 
 
-def _create_missing_v4_objects(conn: sqlite3.Connection) -> None:
+def _create_missing_v4_objects(
+    conn: sqlite3.Connection, contract: V4Contract = V4_CONTRACT
+) -> None:
     """Create or repair every v4 addition that is missing or incorrect.
 
-    Idempotent and transactional: only creates explicitly additive objects
-    (tables and non-unique secondary indexes that don't exist or have wrong
-    columns). Never drops, renames, or alters existing tables, primary keys
-    or UNIQUE constraints. Called inside an existing transaction.
+    Idempotent and transactional: creates the two v4 table additions
+    (codex_summaries, token_availability) when absent, then repairs every
+    required non-unique secondary index across ALL contract tables —
+    quota, token_events, summaries and availability — by recreating any
+    index that is missing or has wrong columns. Never drops, renames, or
+    alters existing tables, primary keys, or UNIQUE constraints. A UNIQUE
+    index occupying a required non-unique slot is never dropped (that
+    would silently remove a semantic constraint) — it fails closed by
+    raising. Called inside an existing transaction.
 
-    Per criterion 5: missing or incorrect non-unique secondary indexes are
-    recreated (DROP INDEX + CREATE INDEX). Incompatible table semantics
-    (wrong PK, wrong affinity, missing UNIQUE) are never repaired silently
-    — they fail closed through semantic validation.
+    Per criterion 5/6: missing or incorrect non-unique secondary indexes
+    are recreated (DROP INDEX + CREATE INDEX). Incompatible table
+    semantics (wrong PK, wrong affinity, missing UNIQUE) are never
+    repaired silently — they fail closed through semantic validation.
     """
+    # Table additions first: the two v4 tables may be absent on a v3
+    # database (both the Package 3b and Package 3c historical shapes).
     if not _table_present(conn, "codex_summaries"):
         conn.execute(
             """\
@@ -1200,13 +1260,6 @@ CREATE TABLE codex_summaries (
     PRIMARY KEY (service, observed_at)
 )"""
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_codex_summaries_time ON codex_summaries (observed_at)"
-        )
-    else:
-        # Table exists — repair missing or incorrect index
-        _repair_index(conn, "idx_codex_summaries_time", "codex_summaries", ("observed_at",))
-
     if not _table_present(conn, "token_availability"):
         conn.execute(
             """\
@@ -1219,15 +1272,15 @@ CREATE TABLE token_availability (
     PRIMARY KEY (service, observed_at)
 )"""
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_token_avail_service ON token_availability (service)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_token_avail_time ON token_availability (observed_at)"
-        )
-    else:
-        _repair_index(conn, "idx_token_avail_service", "token_availability", ("service",))
-        _repair_index(conn, "idx_token_avail_time", "token_availability", ("observed_at",))
+
+    # Repair every required non-unique secondary index on every table.
+    for table_spec in contract.tables:
+        if not _table_present(conn, table_spec.name):
+            continue  # missing tables fail closed through validation
+        for idx_spec in table_spec.indexes:
+            if idx_spec.unique:
+                continue  # UNIQUE indexes are semantic constraints — never repaired
+            _repair_index(conn, idx_spec.name, idx_spec.table, idx_spec.columns)
 
 
 def _repair_index(
@@ -1238,35 +1291,68 @@ def _repair_index(
 ) -> None:
     """Ensure a non-unique secondary index exists with the correct columns.
 
-    If the index is missing, create it. If it exists but has wrong columns,
-    drop and recreate. Never modifies UNIQUE indexes (those imply a semantic
-    constraint that can't be safely repaired).
+    If the index is missing, create it. If it exists but has wrong columns
+    or backs the wrong table, drop and recreate. If it exists as a UNIQUE
+    index, never drop it — a UNIQUE index is a semantic constraint and
+    silently removing it would be unsafe; fail closed instead. When the
+    backing table is itself defective (missing the required columns), the
+    repair is skipped — the table defect is reported by semantic
+    validation, which fails closed.
     """
     if not _index_present(conn, index_name):
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} "
-            f"({', '.join(expected_columns)})"
-        )
+        if not _table_has_columns(conn, table_name, expected_columns):
+            return  # table defect — validation fails closed
+        conn.execute(f"CREATE INDEX {index_name} ON {table_name} ({', '.join(expected_columns)})")
         return
+
+    tbl_row = conn.execute(
+        "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?",
+        (index_name,),
+    ).fetchone()
+    if tbl_row is None or tbl_row[0] != table_name:
+        raise SchemaVersionError(
+            f"index {index_name} backs table {tbl_row[0] if tbl_row else None}, "
+            f"required {table_name} — cannot repair safely"
+        )
+
+    unique_rows = [
+        row
+        for row in conn.execute(f"PRAGMA index_list({table_name})").fetchall()
+        if row[1] == index_name
+    ]
+    if unique_rows and bool(unique_rows[0][2]):
+        raise SchemaVersionError(
+            f"index {index_name} is UNIQUE but a non-unique secondary index is "
+            "required — refusing to drop a semantic constraint"
+        )
 
     # Check columns
     idx_cols = conn.execute(f"PRAGMA index_info({index_name})").fetchall()
     actual_columns = tuple(row[2] for row in sorted(idx_cols, key=lambda r: r[0]))
     if actual_columns != expected_columns:
+        if not _table_has_columns(conn, table_name, expected_columns):
+            return  # table defect — validation fails closed
         conn.execute(f"DROP INDEX IF EXISTS {index_name}")
         conn.execute(f"CREATE INDEX {index_name} ON {table_name} ({', '.join(expected_columns)})")
 
 
-def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+def _table_has_columns(conn: sqlite3.Connection, table_name: str, columns: tuple[str, ...]) -> bool:
+    """Return True when the table declares every one of the given columns."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    return all(col in existing for col in columns)
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection, contract: V4Contract = V4_CONTRACT) -> None:
     """Transactionally migrate a v3 schema to v4.
 
     Preserves all existing quota, token_events, and codex_summaries rows.
     Creates every missing v4 addition (codex_summaries, its index,
     token_availability, and its indexes) idempotently — a Package 3b v3
     without codex_summaries and a Package 3c v3 with it both reach complete
-    v4. Validates the complete v4 manifest after creation. Rolls back fully
-    on any failure, leaving version, tables, indexes, and rows exactly as
-    they were.
+    v4. Validates the complete v4 manifest — every table, column, PK,
+    UNIQUE key and secondary index by content — after creation. Rolls back
+    fully on any failure, leaving version, tables, indexes, and rows exactly
+    as they were.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1276,10 +1362,10 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
             raise SchemaVersionError("history database is incomplete: missing tables from v3")
 
         # Create every missing v4 addition — handles both 3b and 3c shapes.
-        _create_missing_v4_objects(conn)
+        _create_missing_v4_objects(conn, contract=contract)
 
         # Validate the complete v4 manifest before committing the version change.
-        missing_objects = _validate_v4_completeness(conn)
+        missing_objects = _validate_v4_completeness(conn, contract=contract)
         if missing_objects:
             raise SchemaVersionError(
                 f"history database v4 migration incomplete — missing: {', '.join(missing_objects)}"
@@ -1295,7 +1381,7 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
         raise
 
 
-def init_schema(conn: sqlite3.Connection) -> None:
+def init_schema(conn: sqlite3.Connection, *, contract: V4Contract | None = None) -> None:
     """Initialize or migrate the schema. Throws on irrecoverable mismatch.
 
     Inspects the existing schema version BEFORE any DDL. If the database
@@ -1303,6 +1389,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     explicit all-or-nothing transaction. If at v1, v2, or v3, runs the
     incremental migration path. Failed migration leaves version, tables,
     indexes and rows exactly as they were before.
+
+    ``contract`` injects the v4 schema contract (defaults to V4_CONTRACT).
+    A caller can force a semantic mismatch on the production fresh-init
+    path by passing a broken contract: DDL runs first, the mismatch is
+    detected before the version row is inserted, and the whole transaction
+    — every table and index — rolls back.
 
     Fail-closed completeness: an incomplete database is never labeled v4.
     A metadata table with no version row is repaired transactionally only
@@ -1314,6 +1406,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
     fresh-init transaction leaves no falsely labeled schema — the
     version row and all tables are committed together or not at all.
     """
+    effective_contract = contract if contract is not None else V4_CONTRACT
+
     # Detect the existing version before creating anything
     has_meta = (
         conn.execute(
@@ -1326,13 +1420,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
         if row is None:
             # Table exists but no version row. Repair transactionally only
             # when the v4 complete manifest validates cleanly.
-            missing = _validate_v4_completeness(conn)
+            missing = _validate_v4_completeness(conn, contract=effective_contract)
             if missing:
                 # Try additive repair
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    _create_missing_v4_objects(conn)
-                    still_missing = _validate_v4_completeness(conn)
+                    _create_missing_v4_objects(conn, contract=effective_contract)
+                    still_missing = _validate_v4_completeness(conn, contract=effective_contract)
                     if still_missing:
                         raise SchemaVersionError(
                             "history database is incomplete: cannot label it v4 "
@@ -1361,16 +1455,16 @@ def init_schema(conn: sqlite3.Connection) -> None:
         if row[0] == 1:
             _migrate_v1_to_v2(conn)
             _migrate_v2_to_v3(conn)
-            _migrate_v3_to_v4(conn)
+            _migrate_v3_to_v4(conn, contract=effective_contract)
             _reconcile_legacy_keys(conn)
             return
         if row[0] == 2:
             _migrate_v2_to_v3(conn)
-            _migrate_v3_to_v4(conn)
+            _migrate_v3_to_v4(conn, contract=effective_contract)
             _reconcile_legacy_keys(conn)
             return
         if row[0] == 3:
-            _migrate_v3_to_v4(conn)
+            _migrate_v3_to_v4(conn, contract=effective_contract)
             _reconcile_legacy_keys(conn)
             return
         if row[0] != SCHEMA_VERSION:
@@ -1379,15 +1473,15 @@ def init_schema(conn: sqlite3.Connection) -> None:
             )
         # Already at v4: validate the complete manifest (tables + columns + indexes).
         # A version label on an incomplete database is never trusted.
-        missing = _validate_v4_completeness(conn)
+        missing = _validate_v4_completeness(conn, contract=effective_contract)
         if missing:
             # Repair only explicitly additive missing objects inside a
             # transaction. If the repair succeeds, the manifest validates
             # cleanly; if it fails, the transaction rolls back completely.
             conn.execute("BEGIN IMMEDIATE")
             try:
-                _create_missing_v4_objects(conn)
-                still_missing = _validate_v4_completeness(conn)
+                _create_missing_v4_objects(conn, contract=effective_contract)
+                still_missing = _validate_v4_completeness(conn, contract=effective_contract)
                 if still_missing:
                     raise SchemaVersionError(
                         "history database is incomplete: version row claims v4 but "
@@ -1415,7 +1509,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
             if stmt:
                 conn.execute(stmt)
         # Validate the semantic v4 contract before committing the version row.
-        violations = _validate_v4_semantics(conn)
+        violations = _validate_v4_semantics(conn, contract=effective_contract)
         if violations:
             raise SchemaVersionError(
                 "fresh v4 database failed semantic validation: " + "; ".join(violations)

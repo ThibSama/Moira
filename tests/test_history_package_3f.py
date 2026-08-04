@@ -426,6 +426,7 @@ def test_collector_result_rejects_zero_availability() -> None:
     """CollectorResult with zero availability records raises ValueError."""
     with pytest.raises(ValueError, match="exactly one"):
         CollectorResult(
+            service=Service.CODEX,
             quota_readings=(),
             token_readings=(),
             token_availability_records=(),
@@ -449,6 +450,7 @@ def test_collector_result_rejects_two_availability() -> None:
     )
     with pytest.raises(ValueError, match="exactly one"):
         CollectorResult(
+            service=Service.CODEX,
             quota_readings=(),
             token_readings=(),
             token_availability_records=(r1, r2),
@@ -462,6 +464,7 @@ def test_collector_exception_synthesizes_availability() -> None:
     """When a collector throws, fallback produces one TEMPORARILY_UNAVAILABLE record."""
     now = datetime.now(UTC)
     result = CollectorResult(
+        service=Service.CODEX,
         quota_readings=(),
         token_readings=(),
         token_availability_records=(

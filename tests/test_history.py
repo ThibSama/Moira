@@ -2449,7 +2449,7 @@ def test_v3_migration_rollback_preserves_version_and_rows(tmp_path: Path) -> Non
     # Monkey-patch _create_missing_v4_objects to fail after creating something
     original_create = history_db_module._create_missing_v4_objects
 
-    def failing_create(c: sqlite3.Connection) -> None:
+    def failing_create(c: sqlite3.Connection, *args: object, **kwargs: object) -> None:
         original_create(c)
         raise sqlite3.OperationalError("simulated failure")
 
@@ -2458,7 +2458,7 @@ def test_v3_migration_rollback_preserves_version_and_rows(tmp_path: Path) -> Non
         with pytest.raises(sqlite3.OperationalError, match="simulated failure"):
             init_schema(conn)
     finally:
-        history_db_module._create_missing_v4_objects = original_create  # type: ignore[assignment]
+        history_db_module._create_missing_v4_objects = original_create
 
     # Version stays 3 (rollback)
     row = conn.execute("SELECT version FROM schema_meta").fetchone()
@@ -2583,6 +2583,7 @@ def test_two_provider_availability_persisted(tmp_path: Path) -> None:
     from moira.models import CollectorResult
 
     codex_result = CollectorResult(
+        service=Service.CODEX,
         quota_readings=(),
         token_readings=(),
         token_availability_records=(codex_avail,),

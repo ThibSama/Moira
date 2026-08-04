@@ -28,6 +28,7 @@ class ClaudeCollector:
 
         now = utc_now()
         return CollectorResult(
+            service=Service.CLAUDE,
             quota_readings=tuple(load_cached_readings()),
             token_readings=(),
             token_availability_records=(
@@ -89,6 +90,7 @@ class CodexCollector:
         executable = shutil.which(self.binary)
         if not executable:
             return CollectorResult(
+                service=Service.CODEX,
                 quota_readings=(
                     QuotaReading(
                         Service.CODEX,
@@ -234,6 +236,7 @@ class CodexCollector:
                 )
 
             return CollectorResult(
+                service=Service.CODEX,
                 quota_readings=tuple(quota_readings),
                 token_readings=tuple(token_readings),
                 codex_summary=codex_summary,
@@ -242,6 +245,7 @@ class CodexCollector:
 
         except (OSError, TimeoutError, subprocess.SubprocessError, json.JSONDecodeError):
             return CollectorResult(
+                service=Service.CODEX,
                 quota_readings=(
                     QuotaReading(
                         Service.CODEX,

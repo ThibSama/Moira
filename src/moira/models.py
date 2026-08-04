@@ -312,27 +312,57 @@ class TokenAvailabilityRecord:
 class CollectorResult:
     """Typed output from a single collector refresh.
 
-    Carries both quota readings and token readings. Token readings are only
-    present when the provider exposes a structured token surface.
-    codex_summary carries the official aggregate summary (lifetime, peak,
-    streaks, longest turn) as one typed immutable record when available
-    from the usage surface.
+    ``service`` is the explicit owner identity of every payload carried by
+    the result. Validation is by construction: the result must carry
+    exactly one availability record, and the availability record, every
+    quota reading, every token reading, and any codex_summary must all
+    belong to the same owner service. A mismatched or foreign payload is
+    rejected at construction time.
+
+    Token readings are only present when the provider exposes a structured
+    token surface. codex_summary carries the official aggregate summary
+    (lifetime, peak, streaks, longest turn) as one typed immutable record
+    when available from the usage surface.
     token_availability_records carries exactly one provider-neutral
     availability observation per collector attempt — always an immutable
     tuple, never None. Collectors that don't support token data emit a
     typed UNSUPPORTED record.
     """
 
+    service: Service
     quota_readings: tuple[QuotaReading, ...]
     token_readings: tuple[TokenReading, ...]
     codex_summary: CodexSummary | None = None
     token_availability_records: tuple[TokenAvailabilityRecord, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.service, Service):
+            raise ValueError("service must be a Service value")
         n_avail = len(self.token_availability_records)
         if n_avail != 1:
             raise ValueError(
                 f"CollectorResult must carry exactly one availability record, got {n_avail}"
             )
-        # Verify the record's service matches this collector's expected service
-        # (enforced by the collector itself at construction time)
+        avail = self.token_availability_records[0]
+        if avail.service != self.service:
+            raise ValueError(
+                f"availability record service {avail.service!r} does not match "
+                f"owner {self.service!r}"
+            )
+        for quota_reading in self.quota_readings:
+            if quota_reading.service != self.service:
+                raise ValueError(
+                    f"quota reading service {quota_reading.service!r} does not match "
+                    f"owner {self.service!r}"
+                )
+        for token_reading in self.token_readings:
+            if token_reading.service != self.service:
+                raise ValueError(
+                    f"token reading service {token_reading.service!r} does not match "
+                    f"owner {self.service!r}"
+                )
+        if self.codex_summary is not None and self.codex_summary.service != self.service:
+            raise ValueError(
+                f"summary service {self.codex_summary.service!r} does not match "
+                f"owner {self.service!r}"
+            )
