@@ -135,6 +135,14 @@ _FRENCH: dict[str, str] = {
     "Exact token usage is not available": "L'utilisation exacte des jetons n'est pas disponible",
     "First": "Premier",
     "Last": "Dernier",
+    # ── Token display ──
+    "token activity": "activité des jetons",
+    "Total": "Total",
+    "Input": "Entrée",
+    "Cached": "Cache",
+    "Output": "Sortie",
+    "Reasoning": "Raisonnement",
+    "Source": "Source",
 }
 
 

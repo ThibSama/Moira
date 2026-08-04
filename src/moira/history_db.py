@@ -4,18 +4,20 @@ Stores validated quota and optional token observations for at most 90 days.
 Uses stdlib sqlite3 with a transactional schema version. The database file
 is created with mode 0600. Config and current-state JSON are unchanged.
 
-Schema v2: Removes UNIQUE(service, quota_label, bucket) to preserve every
-distinct percentage or reset transition, including multiple changes inside
-one bucket. Unchanged values retain at most one periodic sample per
-service/quota/bucket via INSERT OR IGNORE on a periodic-sample index.
+Schema v3: Replaces token_observations with token_events. Each event has a
+stable deterministic event key (PRIMARY KEY), allowing several events per
+15-minute bucket and idempotent replay/upsert. The v2 UNIQUE(service,bucket)
+constraint is removed. Daily usage buckets and migrated v2 buckets coexist
+with distinct period_kind values.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import threading
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,10 +28,10 @@ from .history import (
     SchemaVersionError,
     TokenObservation,
 )
-from .models import Service
+from .models import Service, TokenReading
 from .persistence import state_dir
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 RETENTION_DAYS = 90
 BUCKET_MINUTES = 15
 
@@ -63,6 +65,44 @@ def _connect(path: Path | None = None, *, timeout: float = 5.0) -> sqlite3.Conne
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
+
+SCHEMA_SQL_V3 = """\
+CREATE TABLE IF NOT EXISTS schema_meta (
+    version INTEGER PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS quota_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    service         TEXT    NOT NULL,
+    quota_label     TEXT    NOT NULL,
+    percentage      REAL    NOT NULL,
+    reset_at        TEXT    NOT NULL,
+    observed_at     TEXT    NOT NULL,
+    source          TEXT    NOT NULL,
+    bucket          TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'available_exact',
+    is_change       INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (service, quota_label, bucket, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_quota_obs_time ON quota_observations (observed_at);
+CREATE INDEX IF NOT EXISTS idx_quota_obs_service ON quota_observations (service, quota_label);
+CREATE TABLE IF NOT EXISTS token_events (
+    event_key               TEXT PRIMARY KEY,
+    service                 TEXT    NOT NULL,
+    period_start            TEXT    NOT NULL,
+    period_kind             TEXT    NOT NULL,
+    observed_at             TEXT    NOT NULL,
+    source                  TEXT    NOT NULL,
+    status                  TEXT    NOT NULL,
+    input_tokens            INTEGER,
+    cached_input_tokens     INTEGER,
+    output_tokens           INTEGER,
+    reasoning_output_tokens INTEGER,
+    total_tokens            INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_token_events_time ON token_events (observed_at);
+CREATE INDEX IF NOT EXISTS idx_token_events_service ON token_events (service);
+CREATE INDEX IF NOT EXISTS idx_token_events_period ON token_events (period_start);
+"""
 
 SCHEMA_SQL_V2 = """\
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -146,6 +186,21 @@ def _bucket(dt: datetime) -> str:
     return bucket_dt.isoformat()
 
 
+def _source_digest(source: str) -> str:
+    """Return a short deterministic digest of a source string for event keys."""
+    return hashlib.sha256(source.encode()).hexdigest()[:12]
+
+
+def _make_usage_event_key(service: Service, day: date, source: str) -> str:
+    """Build a stable deterministic event key for a daily usage event."""
+    return f"{service.value}:u:{day.isoformat()}:{_source_digest(source)}"
+
+
+def _make_migrated_event_key(service: str, bucket: str) -> str:
+    """Build a stable event key for a migrated v2 token observation."""
+    return f"{service}:b:{bucket}"
+
+
 def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     """Transactionally migrate a v1 schema to v2.
 
@@ -199,20 +254,110 @@ FROM quota_observations_v1"""
         raise
 
 
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """Transactionally migrate a v2 schema to v3.
+
+    Preserves all existing token_observations rows as token_events with
+    stable event keys derived from (service, bucket). Rolls back fully
+    on any failure.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Check if token_observations exists (it might not if v2 was clean)
+        has_v2_tokens = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_observations'"
+            ).fetchone()
+            is not None
+        )
+
+        # Create the new token_events table (may already exist from SCHEMA_SQL_V3)
+        conn.execute(
+            """\
+CREATE TABLE IF NOT EXISTS token_events (
+    event_key               TEXT PRIMARY KEY,
+    service                 TEXT    NOT NULL,
+    period_start            TEXT    NOT NULL,
+    period_kind             TEXT    NOT NULL,
+    observed_at             TEXT    NOT NULL,
+    source                  TEXT    NOT NULL,
+    status                  TEXT    NOT NULL,
+    input_tokens            INTEGER,
+    cached_input_tokens     INTEGER,
+    output_tokens           INTEGER,
+    reasoning_output_tokens INTEGER,
+    total_tokens            INTEGER
+)"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_events_time ON token_events (observed_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_events_service ON token_events (service)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_events_period ON token_events (period_start)"
+        )
+
+        # Migrate existing v2 token rows
+        if has_v2_tokens:
+            existing = conn.execute(
+                "SELECT service, observed_at, source, status, input_tokens, "
+                "cached_input_tokens, output_tokens, reasoning_output_tokens, "
+                "total_tokens, bucket FROM token_observations"
+            ).fetchall()
+            for row in existing:
+                event_key = _make_migrated_event_key(str(row[0]), str(row[9]))
+                conn.execute(
+                    "INSERT OR IGNORE INTO token_events "
+                    "(event_key, service, period_start, period_kind, observed_at, source, "
+                    "status, input_tokens, cached_input_tokens, output_tokens, "
+                    "reasoning_output_tokens, total_tokens) "
+                    "VALUES (?, ?, ?, 'bucket', ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        event_key,
+                        str(row[0]),
+                        str(row[9]),  # bucket as period_start
+                        str(row[1]),  # observed_at
+                        str(row[2]),  # source
+                        str(row[3]),  # status
+                        row[4],  # input_tokens
+                        row[5],  # cached_input_tokens
+                        row[6],  # output_tokens
+                        row[7],  # reasoning_output_tokens
+                        row[8],  # total_tokens
+                    ),
+                )
+            conn.execute("DROP TABLE token_observations")
+
+        conn.execute("UPDATE schema_meta SET version = 3 WHERE version = 2")
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Initialize or migrate the schema. Throws on irrecoverable mismatch."""
-    # For a fresh database, create v2 directly
-    conn.executescript(SCHEMA_SQL_V2)
+    # For a fresh database, create v3 directly
+    conn.executescript(SCHEMA_SQL_V3)
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute("SELECT version FROM schema_meta").fetchone()
         if row is None:
             conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
         elif row[0] == 1:
-            # Need to migrate v1 → v2. Rollback the current transaction first,
-            # then run the migration.
             conn.execute("ROLLBACK")
             _migrate_v1_to_v2(conn)
+            # Now at v2, continue to v3
+            _migrate_v2_to_v3(conn)
+            return
+        elif row[0] == 2:
+            conn.execute("ROLLBACK")
+            _migrate_v2_to_v3(conn)
             return
         elif row[0] != SCHEMA_VERSION:
             raise SchemaVersionError(
@@ -319,25 +464,28 @@ def record_token(
     *,
     now: datetime | None = None,
 ) -> bool:
-    """Record a token observation, deduplicating within 15-minute buckets.
+    """Record a token observation as a token_events row (v3 schema compat).
 
-    Returns True if a row was inserted or updated. Purges old rows after
-    a successful write.
+    Generates a stable event key from (service, bucket) for deduplication.
+    Returns True. Purges old rows after a successful write.
     """
     clock = now or datetime.now(UTC)
     bucket = _bucket(obs.observed_at)
     observed_iso = obs.observed_at.isoformat()
+    event_key = _make_migrated_event_key(obs.service.value, bucket)
 
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO token_observations "
-            "(service, observed_at, source, status, input_tokens, "
-            "cached_input_tokens, output_tokens, reasoning_output_tokens, "
-            "total_tokens, bucket) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO token_events "
+            "(event_key, service, period_start, period_kind, observed_at, source, "
+            "status, input_tokens, cached_input_tokens, output_tokens, "
+            "reasoning_output_tokens, total_tokens) "
+            "VALUES (?, ?, ?, 'bucket', ?, ?, ?, ?, ?, ?, ?, ?)",
             (
+                event_key,
                 obs.service.value,
+                bucket,
                 observed_iso,
                 obs.source,
                 obs.status.value,
@@ -346,12 +494,76 @@ def record_token(
                 obs.output_tokens,
                 obs.reasoning_output_tokens,
                 obs.total_tokens,
-                bucket,
             ),
         )
         _purge(conn, clock)
         conn.execute("COMMIT")
         return True
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+
+
+def record_token_events(
+    conn: sqlite3.Connection,
+    readings: list[TokenReading],
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Record validated daily token usage readings as token_events.
+
+    Each TokenReading produces one token_events row with a stable event key
+    derived from (service, day, source). Idempotent: replay of the same
+    (service, day, source) upserts the values via INSERT OR REPLACE.
+
+    Only AVAILABLE readings with total_tokens are stored. Non-available,
+    error, and empty readings are skipped silently.
+
+    Returns the number of events written. Purges old rows after write.
+    """
+    clock = now or datetime.now(UTC)
+    observed_iso = clock.isoformat()
+    written = 0
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for reading in readings:
+            if not isinstance(reading, TokenReading):
+                continue
+            if reading.status.value not in ("available",):
+                continue
+            if reading.total_tokens is None:
+                continue
+
+            event_key = _make_usage_event_key(reading.service, reading.day, reading.source)
+
+            conn.execute(
+                "INSERT OR REPLACE INTO token_events "
+                "(event_key, service, period_start, period_kind, observed_at, source, "
+                "status, input_tokens, cached_input_tokens, output_tokens, "
+                "reasoning_output_tokens, total_tokens) "
+                "VALUES (?, ?, ?, 'day', ?, ?, 'available_exact', ?, ?, ?, ?, ?)",
+                (
+                    event_key,
+                    reading.service.value,
+                    reading.day.isoformat(),
+                    observed_iso,
+                    reading.source,
+                    reading.input_tokens,
+                    reading.cached_input_tokens,
+                    reading.output_tokens,
+                    reading.reasoning_output_tokens,
+                    reading.total_tokens,
+                ),
+            )
+            written += 1
+
+        _purge(conn, clock)
+        conn.execute("COMMIT")
+        return written
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -367,7 +579,7 @@ def _purge(conn: sqlite3.Connection, now: datetime) -> int:
         "DELETE FROM quota_observations WHERE observed_at < ?", (boundary,)
     ).rowcount
     token_deleted = conn.execute(
-        "DELETE FROM token_observations WHERE observed_at < ?", (boundary,)
+        "DELETE FROM token_events WHERE observed_at < ?", (boundary,)
     ).rowcount
     return quota_deleted + token_deleted
 
@@ -416,7 +628,10 @@ def query_token(
     service: Service | None = None,
     metric: str | None = None,
 ) -> list[TokenObservation]:
-    """Return token observations since a given UTC time, optionally filtered."""
+    """Return token observations since a given UTC time, optionally filtered.
+
+    Reads from token_events (v3) table.
+    """
     since_iso = since.isoformat()
     clauses = ["observed_at >= ?"]
     params: list[object] = [since_iso]
@@ -427,7 +642,7 @@ def query_token(
     rows = conn.execute(
         f"SELECT service, observed_at, source, status, input_tokens, "
         f"cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens "
-        f"FROM token_observations WHERE {where} ORDER BY observed_at ASC",
+        f"FROM token_events WHERE {where} ORDER BY period_start ASC, observed_at ASC",
         params,
     ).fetchall()
     return [
@@ -491,7 +706,7 @@ def delete_all(conn: sqlite3.Connection) -> int:
     conn.execute("BEGIN IMMEDIATE")
     try:
         q = conn.execute("DELETE FROM quota_observations").rowcount
-        t = conn.execute("DELETE FROM token_observations").rowcount
+        t = conn.execute("DELETE FROM token_events").rowcount
         conn.execute("COMMIT")
         return q + t
     except Exception:
@@ -508,11 +723,10 @@ def record_refresh(
     *,
     now: datetime | None = None,
 ) -> None:
-    """Record fresh validated quota observations from a refresh batch.
+    """Record fresh validated quota and token observations from a refresh batch.
 
-    Only AVAILABLE readings with percentage and reset_at are stored.
-    STALE/error/unavailable readings are silently skipped. Token observations
-    are not recorded here (no structured token surface is wired yet).
+    Handles both QuotaReading and TokenReading objects. Only AVAILABLE
+    readings are stored. Non-available/error readings are silently skipped.
 
     Failure is caught by the caller; this function raises on DB errors so
     the caller can produce a sanitized diagnostic.
@@ -520,22 +734,43 @@ def record_refresh(
     from .models import QuotaReading, QuotaStatus
 
     clock = now or datetime.now(UTC)
+
+    # Separate readings by type
+    quota_readings: list[QuotaReading] = []
+    token_readings: list[TokenReading] = []
+
     for reading in readings:
-        if not isinstance(reading, QuotaReading):
-            continue
-        if reading.status is not QuotaStatus.AVAILABLE:
-            continue
-        if reading.percentage is None or reading.reset_at is None:
-            continue
+        if isinstance(reading, QuotaReading):
+            if reading.status is not QuotaStatus.AVAILABLE:
+                continue
+            if reading.percentage is None or reading.reset_at is None:
+                continue
+            quota_readings.append(reading)
+        elif isinstance(reading, TokenReading):
+            if reading.status is not QuotaStatus.AVAILABLE:
+                continue
+            if reading.total_tokens is None:
+                continue
+            token_readings.append(reading)
+
+    # Write quota observations
+    for reading in quota_readings:
+        # Type guard: we already filtered out None values above
+        pct: float = reading.percentage  # type: ignore[assignment]
+        reset: datetime = reading.reset_at  # type: ignore[assignment]
         obs = QuotaObservation(
             service=reading.service,
             quota_label=reading.quota_label,
-            percentage=reading.percentage,
-            reset_at=reading.reset_at,
+            percentage=pct,
+            reset_at=reset,
             observed_at=reading.retrieved_at,
             source=reading.source,
         )
         record_quota(conn, obs, now=clock)
+
+    # Write token events
+    if token_readings:
+        record_token_events(conn, token_readings, now=clock)
 
 
 def write_history_safely(
@@ -545,7 +780,7 @@ def write_history_safely(
     db_path: Path | None = None,
     db_timeout: float = 5.0,
 ) -> HistoryWriteResult:
-    """Write quota observations to the history database and return a sanitized result.
+    """Write quota and token observations to the history database and return a sanitized result.
 
     This is the entry point for off-thread history writes. It performs
     connect/schema/write/purge in one call and returns only a bounded

@@ -22,7 +22,7 @@ from .exhaustion import derive_state
 from .history_db import HistoryCoordinator
 from .history_page import HistoryPage
 from .i18n import is_french, tr
-from .models import QuotaReading, QuotaStatus, Service
+from .models import CollectorResult, QuotaReading, QuotaStatus, Service, TokenReading
 from .ntfy import Notification, send
 from .persistence import (
     VALID_REFRESH_MINUTES,
@@ -216,6 +216,7 @@ class MainWindow(Adw.ApplicationWindow):
         )
         self.refreshing = False
         self.pending: list[QuotaReading] = []
+        self.pending_tokens: list[TokenReading] = []
         self.pending_lock = threading.Lock()
         self.completed = 0
         self._refresh_timer_id: int | None = None
@@ -382,6 +383,7 @@ class MainWindow(Adw.ApplicationWindow):
             return False
         self.refreshing = True
         self.pending = []
+        self.pending_tokens = []
         self.completed = 0
         self.claude_card.status.set_text(_("Loading…"))
         self.codex_card.status.set_text(_("Loading…"))
@@ -390,13 +392,14 @@ class MainWindow(Adw.ApplicationWindow):
             future.add_done_callback(self._collector_done)
         return False
 
-    def _collector_done(self, future: concurrent.futures.Future[list[QuotaReading]]) -> None:
+    def _collector_done(self, future: concurrent.futures.Future[CollectorResult]) -> None:
         try:
             result = future.result()
         except Exception:
-            result = []
+            result = CollectorResult(quota_readings=(), token_readings=())
         with self.pending_lock:
-            self.pending.extend(result)
+            self.pending.extend(result.quota_readings)
+            self.pending_tokens.extend(result.token_readings)
             self.completed += 1
             complete = self.completed == 2
         if complete:
@@ -425,13 +428,15 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _record_history(self, readings: list[QuotaReading], now: datetime) -> None:
-        """Enqueue fresh quota observations for off-thread history writing.
+        """Enqueue fresh quota and token observations for off-thread history writing.
 
         Never blocks the GTK thread. If the worker is busy, the newest batch
         replaces any pending batch (newest-wins) and a sanitized status is set.
         History failure does not affect quota state, display, or alerts.
         """
-        self._history_coordinator.enqueue(readings, now)
+        combined: list[Any] = list(readings)
+        combined.extend(self.pending_tokens)
+        self._history_coordinator.enqueue(combined, now)
 
     def _on_close_request(self, *_: Any) -> bool:
         """Stop the history worker cleanly on window close.

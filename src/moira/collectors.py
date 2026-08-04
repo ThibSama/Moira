@@ -8,15 +8,18 @@ import signal
 import subprocess
 import time
 
-from .models import QuotaReading, QuotaStatus, Service, utc_now
-from .parsers import ParseError, parse_codex_rate_limits
+from .models import CollectorResult, QuotaReading, QuotaStatus, Service, TokenReading, utc_now
+from .parsers import ParseError, parse_codex_rate_limits, parse_codex_usage
 
 
 class ClaudeCollector:
-    def collect(self) -> list[QuotaReading]:
+    def collect(self) -> CollectorResult:
         from .claude_integration import load_cached_readings
 
-        return load_cached_readings()
+        return CollectorResult(
+            quota_readings=tuple(load_cached_readings()),
+            token_readings=(),
+        )
 
 
 def _send_message(process: subprocess.Popen[str], message: dict[str, object]) -> None:
@@ -48,26 +51,36 @@ def _read_response(
 
 
 class CodexCollector:
+    """Collects both quota and token data from the Codex app-server.
+
+    Reuses one initialized app-server process per refresh. Requests rate
+    limits and usage independently — failure of one surface does not
+    discard valid data from the other.
+    """
+
     def __init__(self) -> None:
         self.binary = "codex"
 
-    def collect(self) -> list[QuotaReading]:
+    def collect(self) -> CollectorResult:
         now = utc_now()
         executable = shutil.which(self.binary)
-        source = "codex-app-server:account/rateLimits/read"
         if not executable:
-            return [
-                QuotaReading(
-                    Service.CODEX,
-                    "Weekly",
-                    None,
-                    None,
-                    now,
-                    source,
-                    QuotaStatus.UNAVAILABLE,
-                    "codex CLI not found",
-                )
-            ]
+            return CollectorResult(
+                quota_readings=(
+                    QuotaReading(
+                        Service.CODEX,
+                        "Weekly",
+                        None,
+                        None,
+                        now,
+                        "codex-app-server",
+                        QuotaStatus.UNAVAILABLE,
+                        "codex CLI not found",
+                    ),
+                ),
+                token_readings=(),
+            )
+
         process: subprocess.Popen[str] | None = None
         try:
             process = subprocess.Popen(
@@ -80,7 +93,10 @@ class CodexCollector:
             )
             if process.stdin is None or process.stdout is None:
                 raise OSError("Codex app-server pipes unavailable")
+
             deadline = time.monotonic() + 12
+
+            # Initialize the app-server
             _send_message(
                 process,
                 {
@@ -93,37 +109,92 @@ class CodexCollector:
             if "error" in initialized or not isinstance(initialized.get("result"), dict):
                 raise OSError("Codex app-server initialization rejected")
             _send_message(process, {"method": "initialized", "params": {}})
+
+            # Request rate limits and usage independently
+            quota_readings: list[QuotaReading] = []
+            token_readings: list[TokenReading] = []
+
+            # Rate limits request
             _send_message(process, {"id": 2, "method": "account/rateLimits/read", "params": None})
-            response = _read_response(process, 2, deadline)
-            if "error" in response:
-                raise OSError("Codex app-server rate-limit request rejected")
-            return parse_codex_rate_limits(response, now)
-        except ParseError as exc:
-            return [
-                QuotaReading(
-                    Service.CODEX,
-                    "Weekly",
-                    None,
-                    None,
-                    now,
-                    source,
-                    QuotaStatus.PARSE_ERROR,
-                    str(exc),
+            try:
+                rate_response = _read_response(process, 2, deadline)
+                if "error" not in rate_response:
+                    quota_readings.extend(parse_codex_rate_limits(rate_response, now))
+                else:
+                    quota_readings.append(
+                        QuotaReading(
+                            Service.CODEX,
+                            "Weekly",
+                            None,
+                            None,
+                            now,
+                            "codex-app-server:account/rateLimits/read",
+                            QuotaStatus.ERROR,
+                            "Codex app-server rate-limit request rejected",
+                        )
+                    )
+            except ParseError:
+                quota_readings.append(
+                    QuotaReading(
+                        Service.CODEX,
+                        "Weekly",
+                        None,
+                        None,
+                        now,
+                        "codex-app-server:account/rateLimits/read",
+                        QuotaStatus.PARSE_ERROR,
+                        "Codex rate-limit response malformed",
+                    )
                 )
-            ]
+            except (OSError, TimeoutError, json.JSONDecodeError):
+                quota_readings.append(
+                    QuotaReading(
+                        Service.CODEX,
+                        "Weekly",
+                        None,
+                        None,
+                        now,
+                        "codex-app-server:account/rateLimits/read",
+                        QuotaStatus.ERROR,
+                        "Codex rate-limit request failed",
+                    )
+                )
+
+            # Usage request (token data)
+            _send_message(process, {"id": 3, "method": "account/usage/read", "params": None})
+            try:
+                usage_response = _read_response(process, 3, deadline)
+                if "error" not in usage_response:
+                    token_readings.extend(parse_codex_usage(usage_response, now))
+                # On error, silently produce no token readings (not a quota failure)
+            except ParseError:
+                # Malformed usage data — no token readings, but quotas survive
+                pass
+            except (OSError, TimeoutError, json.JSONDecodeError):
+                # Usage request failed — no token readings, quotas survive
+                pass
+
+            return CollectorResult(
+                quota_readings=tuple(quota_readings),
+                token_readings=tuple(token_readings),
+            )
+
         except (OSError, TimeoutError, subprocess.SubprocessError, json.JSONDecodeError):
-            return [
-                QuotaReading(
-                    Service.CODEX,
-                    "Weekly",
-                    None,
-                    None,
-                    now,
-                    source,
-                    QuotaStatus.ERROR,
-                    "Codex app-server request failed",
-                )
-            ]
+            return CollectorResult(
+                quota_readings=(
+                    QuotaReading(
+                        Service.CODEX,
+                        "Weekly",
+                        None,
+                        None,
+                        now,
+                        "codex-app-server",
+                        QuotaStatus.ERROR,
+                        "Codex app-server request failed",
+                    ),
+                ),
+                token_readings=(),
+            )
         finally:
             if process is not None and process.poll() is None:
                 try:

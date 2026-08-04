@@ -123,8 +123,8 @@ def _v1_db(tmp_path: Path) -> sqlite3.Connection:
 # ── Schema and versioning ──
 
 
-def test_schema_version_is_2() -> None:
-    assert SCHEMA_VERSION == 2
+def test_schema_version_is_3() -> None:
+    assert SCHEMA_VERSION == 3
 
 
 def test_init_schema_creates_tables(tmp_path: Path) -> None:
@@ -135,7 +135,7 @@ def test_init_schema_creates_tables(tmp_path: Path) -> None:
     }
     assert "schema_meta" in tables
     assert "quota_observations" in tables
-    assert "token_observations" in tables
+    assert "token_events" in tables
     conn.close()
 
 
@@ -178,15 +178,15 @@ def test_v2_has_status_and_is_change_columns(tmp_path: Path) -> None:
 
 
 def test_populated_v1_migrates_without_loss(tmp_path: Path) -> None:
-    """A populated v1 database migrates to v2 preserving all rows."""
+    """A populated v1 database migrates to v3 preserving all rows."""
     conn = _v1_db(tmp_path)
     conn.close()
-    # Open and init_schema should trigger migration
+    # Open and init_schema should trigger migration v1 → v2 → v3
     conn = _connect(tmp_path / "history.sqlite3")
     init_schema(conn)
-    # Verify version is now 2
+    # Verify version is now 3
     row = conn.execute("SELECT version FROM schema_meta").fetchone()
-    assert row[0] == 2
+    assert row[0] == 3
     # Verify the row survived
     rows = query_quota(conn, since=NOW - timedelta(hours=1))
     assert len(rows) == 1
@@ -210,11 +210,11 @@ def test_v1_migration_rollback_on_failure(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_fresh_db_created_at_v2(tmp_path: Path) -> None:
-    """A brand-new database is created at v2 without needing migration."""
+def test_fresh_db_created_at_v3(tmp_path: Path) -> None:
+    """A brand-new database is created at v3 without needing migration."""
     conn = _db(tmp_path)
     row = conn.execute("SELECT version FROM schema_meta").fetchone()
-    assert row[0] == 2
+    assert row[0] == 3
     conn.close()
 
 
@@ -1670,3 +1670,101 @@ def test_lifecycle_terminated_after_shutdown(tmp_path: Path) -> None:
     coord.start()
     coord.shutdown()
     assert coord.lifecycle_state == "terminated"
+
+
+# ── Schema v3: token events with stable event keys ──
+
+
+def test_v3_token_events_table_exists(tmp_path: Path) -> None:
+    """Fresh v3 database has token_events table, not token_observations."""
+    conn = _db(tmp_path)
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    assert "token_events" in tables
+    assert "token_observations" not in tables
+    conn.close()
+
+
+def test_v3_token_events_columns(tmp_path: Path) -> None:
+    """token_events has event_key, period_start, period_kind columns."""
+    conn = _db(tmp_path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(token_events)").fetchall()}
+    assert "event_key" in cols
+    assert "period_start" in cols
+    assert "period_kind" in cols
+    assert "service" in cols
+    conn.close()
+
+
+def test_v2_to_v3_migration_preserves_token_rows(tmp_path: Path) -> None:
+    """A v2 database with token rows migrates to v3 preserving all data."""
+    from moira.history_db import SCHEMA_SQL_V2
+
+    db_path = tmp_path / "history.sqlite3"
+    conn = _connect(db_path)
+    conn.executescript(SCHEMA_SQL_V2)
+    conn.execute("INSERT INTO schema_meta (version) VALUES (2)")
+    conn.execute(
+        "INSERT INTO token_observations "
+        "(service, observed_at, source, status, input_tokens, output_tokens, "
+        "total_tokens, bucket) "
+        "VALUES ('codex', ?, 'fixture', 'available_exact', 100, 200, 300, ?)",
+        (NOW.isoformat(), _bucket(NOW)),
+    )
+    conn.execute(
+        "INSERT INTO token_observations "
+        "(service, observed_at, source, status, input_tokens, output_tokens, "
+        "total_tokens, bucket) "
+        "VALUES ('codex', ?, 'fixture', 'available_exact', 50, 75, 125, ?)",
+        ((NOW + timedelta(minutes=30)).isoformat(), _bucket(NOW + timedelta(minutes=30))),
+    )
+    conn.close()
+
+    # Migrate
+    conn = _connect(db_path)
+    init_schema(conn)
+    row = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row[0] == 3
+    rows = query_token(conn, since=NOW - timedelta(hours=2))
+    assert len(rows) == 2
+    total = sum(r.total_tokens or 0 for r in rows)
+    assert total == 425  # 300 + 125
+    conn.close()
+
+
+def test_v2_to_v3_migration_rollback(tmp_path: Path) -> None:
+    """If v2→v3 migration fails, the v2 data survives (rollback)."""
+    from moira.history_db import SCHEMA_SQL_V2, _migrate_v2_to_v3
+
+    db_path = tmp_path / "history.sqlite3"
+    conn = _connect(db_path)
+    conn.executescript(SCHEMA_SQL_V2)
+    conn.execute("INSERT INTO schema_meta (version) VALUES (2)")
+    conn.execute(
+        "INSERT INTO token_observations "
+        "(service, observed_at, source, status, input_tokens, total_tokens, bucket) "
+        "VALUES ('codex', ?, 'fixture', 'available_exact', 100, 100, ?)",
+        (NOW.isoformat(), _bucket(NOW)),
+    )
+    conn.close()
+
+    # Corrupt the v2 table structure so migration fails
+    conn = _connect(db_path)
+    conn.execute("ALTER TABLE token_observations RENAME TO token_observations_bak")
+    conn.execute("CREATE TABLE token_observations (id INTEGER PRIMARY KEY)")
+    conn.close()
+
+    conn = _connect(db_path)
+    with pytest.raises(sqlite3.OperationalError):
+        _migrate_v2_to_v3(conn)
+    conn.close()
+
+    # Verify v2 data is still intact
+    conn = _connect(db_path)
+    row = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row[0] == 2  # unchanged
+    rows = conn.execute("SELECT COUNT(*) FROM token_observations_bak").fetchone()
+    assert rows[0] >= 1  # data survived
+    conn.close()

@@ -29,6 +29,7 @@ from .history_view import (  # noqa: E402
     HistoryViewResult,
     SeriesStats,
     SeriesView,
+    TokenSummary,
 )
 from .i18n import tr  # noqa: E402
 from .models import Service  # noqa: E402
@@ -263,6 +264,15 @@ class HistoryPage(Gtk.Box):
             for s in view.series:
                 self._stats_box.append(self._series_stats_label(s))
 
+        # Token summaries
+        token_summaries = getattr(view, "token_summaries", ())
+        if token_summaries:
+            for ts in token_summaries:
+                self._stats_box.append(self._token_summary_label(ts))
+            self._token_note.set_text("")
+        else:
+            self._token_note.set_text(_("Exact token usage is not available"))
+
         return False
 
     @staticmethod
@@ -270,6 +280,25 @@ class HistoryPage(Gtk.Box):
         """Build a label showing stats for one series."""
         text = build_series_stats_text(s.stats, tr, converter=_system_local_converter)
         return Gtk.Label(label=text, xalign=0, wrap=True)
+
+    @staticmethod
+    def _token_summary_label(ts: TokenSummary) -> Gtk.Widget:
+        """Build a label showing token activity for one service."""
+        _ = tr
+        parts: list[str] = [f"{ts.service.value.title()} {_('token activity')}"]
+        parts.append(f"{_('Total')}: {ts.total_tokens:,}")
+        if ts.total_input_tokens:
+            parts.append(f"{_('Input')}: {ts.total_input_tokens:,}")
+        if ts.total_cached_input_tokens:
+            parts.append(f"{_('Cached')}: {ts.total_cached_input_tokens:,}")
+        if ts.total_output_tokens:
+            parts.append(f"{_('Output')}: {ts.total_output_tokens:,}")
+        if ts.total_reasoning_output_tokens:
+            parts.append(f"{_('Reasoning')}: {ts.total_reasoning_output_tokens:,}")
+        if ts.earliest_day:
+            parts.append(f"{ts.earliest_day}–{ts.latest_day}")
+        parts.append(f"{_('Source')}: {ts.source}")
+        return Gtk.Label(label=_(" · ").join(parts), xalign=0, wrap=True)
 
 
 def build_series_stats_text(

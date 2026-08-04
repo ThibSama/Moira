@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from .history import QuotaObservation, SchemaVersionError
+from .history import QuotaObservation, SchemaVersionError, TokenObservation
 from .models import Service
 
 # Soft cap for chart points. Mandatory points (first/last/resets/extrema)
@@ -61,6 +61,30 @@ class SeriesView:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenSummary:
+    """Aggregate token activity for one service in the selected range.
+
+    Empty when no exact token data is available. Totals are the sum of all
+    token events in the range. Provenance is the source string.
+    """
+
+    service: Service
+    source: str
+    total_input_tokens: int
+    total_cached_input_tokens: int
+    total_output_tokens: int
+    total_reasoning_output_tokens: int
+    total_tokens: int
+    event_count: int
+    earliest_day: str | None
+    latest_day: str | None
+
+    @property
+    def has_data(self) -> bool:
+        return self.event_count > 0
+
+
+@dataclass(frozen=True, slots=True)
 class HistoryViewResult:
     """The complete immutable result returned to GTK.
 
@@ -72,6 +96,7 @@ class HistoryViewResult:
     diagnostic: str
     range_label: str
     filter_label: str
+    token_summaries: tuple[TokenSummary, ...] = ()
 
 
 def _detect_resets(observations: list[QuotaObservation]) -> list[bool]:
@@ -228,6 +253,57 @@ def _group_observations(
     return groups
 
 
+def _build_token_summaries(
+    token_observations: list[TokenObservation],
+) -> tuple[TokenSummary, ...]:
+    """Build TokenSummary objects from token observations, grouped by service+source."""
+    if not token_observations:
+        return ()
+
+    # Group by (service, source)
+    groups: dict[tuple[Service, str], list[TokenObservation]] = {}
+    for obs in token_observations:
+        if not obs.has_exact_tokens:
+            continue
+        key = (obs.service, obs.source)
+        groups.setdefault(key, []).append(obs)
+
+    summaries: list[TokenSummary] = []
+    for (service, source), obs_list in sorted(groups.items()):
+        input_sum = 0
+        cached_sum = 0
+        output_sum = 0
+        reasoning_sum = 0
+        total_sum = 0
+        days: list[datetime] = []
+
+        for obs in obs_list:
+            input_sum += obs.input_tokens or 0
+            cached_sum += obs.cached_input_tokens or 0
+            output_sum += obs.output_tokens or 0
+            reasoning_sum += obs.reasoning_output_tokens or 0
+            total_sum += obs.total_tokens or 0
+            days.append(obs.observed_at)
+
+        days.sort()
+        summaries.append(
+            TokenSummary(
+                service=service,
+                source=source,
+                total_input_tokens=input_sum,
+                total_cached_input_tokens=cached_sum,
+                total_output_tokens=output_sum,
+                total_reasoning_output_tokens=reasoning_sum,
+                total_tokens=total_sum,
+                event_count=len(obs_list),
+                earliest_day=days[0].strftime("%Y-%m-%d") if days else None,
+                latest_day=days[-1].strftime("%Y-%m-%d") if days else None,
+            )
+        )
+
+    return tuple(summaries)
+
+
 def prepare_history_view(
     observations: list[QuotaObservation],
     *,
@@ -235,6 +311,7 @@ def prepare_history_view(
     filter_label: str,
     diagnostic: str = "ok",
     max_points: int = MAX_CHART_POINTS,
+    token_observations: list[TokenObservation] | None = None,
 ) -> HistoryViewResult:
     """Prepare an immutable HistoryViewResult from raw observations.
 
@@ -254,6 +331,7 @@ def prepare_history_view(
         diagnostic=diagnostic,
         range_label=range_label,
         filter_label=filter_label,
+        token_summaries=_build_token_summaries(token_observations or []),
     )
 
 
@@ -303,9 +381,11 @@ def _safe_read(
             init_schema(conn)
             result = range_func(conn, now=now)
             quota_obs: list[QuotaObservation] = result.get("quota", [])
+            token_obs: list[TokenObservation] = result.get("tokens", [])
             if service is not None:
                 quota_obs = [o for o in quota_obs if o.service is service]
-            if not quota_obs:
+                token_obs = [o for o in token_obs if o.service is service]
+            if not quota_obs and not token_obs:
                 return (
                     req_id,
                     HistoryViewResult(
@@ -319,6 +399,7 @@ def _safe_read(
                 quota_obs,
                 range_label=range_label,
                 filter_label=filter_label,
+                token_observations=token_obs,
             )
             return (req_id, view)
         finally:

@@ -47,14 +47,16 @@ def test_versioned_settings_and_no_token_on_disk(tmp_path: Path, monkeypatch: ob
 
 def test_collector_unavailable(monkeypatch: object) -> None:
     with patch.dict("os.environ", {"XDG_STATE_HOME": "/nonexistent/moira-test"}):
-        reading = ClaudeCollector().collect()[0]
+        result = ClaudeCollector().collect()
+        reading = result.quota_readings[0]
     assert reading.status is QuotaStatus.UNAVAILABLE
     assert "not found" in reading.detail
 
 
 def test_collector_parse_error() -> None:
     with patch("moira.claude_integration._read_object", return_value={"bad": "cache"}):
-        reading = ClaudeCollector().collect()[0]
+        result = ClaudeCollector().collect()
+        reading = result.quota_readings[0]
     assert reading.status is QuotaStatus.PARSE_ERROR
 
 
@@ -67,6 +69,6 @@ def test_collector_available(tmp_path: Path) -> None:
     }
     with patch.dict("os.environ", {"XDG_STATE_HOME": str(tmp_path)}):
         assert update_cache(payload)
-        readings = ClaudeCollector().collect()
-    assert len(readings) == 2
-    assert all(item.status is QuotaStatus.AVAILABLE for item in readings)
+        result = ClaudeCollector().collect()
+    assert len(result.quota_readings) == 2
+    assert all(item.status is QuotaStatus.AVAILABLE for item in result.quota_readings)
