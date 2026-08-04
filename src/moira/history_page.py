@@ -307,6 +307,7 @@ class HistoryPage(Gtk.Box):
             export_history,
             self._db_path if self._db_path is not None else history_path(),
             range_func=self._range_func(),
+            range_delta=RANGES[self._range_idx][2],
             service=self._current_service(),
             fmt=fmt,
             dest=Path(path),

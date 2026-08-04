@@ -175,6 +175,12 @@ _FRENCH: dict[str, str] = {
     "Native desktop notifications": "Notifications de bureau natives",
     "Send native test notification": "Envoyer une notification de test native",
     "Native notifications are unavailable.": "Notifications natives indisponibles.",
+    "Test failed: invalid settings.": "Échec du test : paramètres invalides.",
+    "Test failed: keyring unavailable.": "Échec du test : trousseau indisponible.",
+    "Test failed: notification unavailable.": "Échec du test : notification indisponible.",
+    "Test failed: native notification unavailable.": (
+        "Échec du test : notification native indisponible."
+    ),
     "Compact mode": "Mode compact",
     "Claude thresholds (%)": "Seuils Claude (%)",
     "Codex thresholds (%)": "Seuils Codex (%)",

@@ -1,4 +1,4 @@
-"""Manual GitHub release checking with strict SemVer comparison.
+"""Manual GitHub release checking with strict SemVer 2.0 comparison.
 
 The check is triggered ONLY by the user (no startup check, no telemetry,
 no token, no auto-download, no install). The request is bounded in time
@@ -6,8 +6,12 @@ and response size, and every outcome is a fixed sanitized status string —
 the response body, raw exceptions, URLs, and repository details are never
 exposed to the UI.
 
-Version comparison is numeric and pre-release suffixes are ignored for
-ordering (``0.10.0`` > ``0.2.2``; ``v1.2.3-rc1`` parses as ``1.2.3``).
+Version comparison follows SemVer 2.0.0 precedence exactly: numeric
+three-part core (``0.10.0`` > ``0.2.2``), prerelease ordering
+(``1.0.0-alpha`` < ``1.0.0-alpha.1`` < ``1.0.0-beta`` < ``1.0.0``),
+build metadata ignored for ordering, leading zeros rejected, empty or
+invalid identifiers rejected, and an invalid ``current`` version fails
+the check (never reported as "up to date").
 """
 
 from __future__ import annotations
@@ -28,7 +32,23 @@ STATUS_INVALID_RESPONSE = "invalid response"
 #: Bounded read: at most this many bytes of the response body are consumed.
 DEFAULT_MAX_BYTES = 65536
 
-_VERSION_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+#: Full SemVer 2.0 shape (a ``v``/``V`` tag prefix is tolerated, matching
+#: common GitHub release tags). Core groups are ``\\d+``; leading zeros are
+#: rejected by validation afterwards. Prerelease/build groups require at
+#: least one identifier character (``1.2.3-`` / ``1.2.3+`` never match).
+_VERSION_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$")
+_IDENTIFIER_RE = re.compile(r"^[0-9A-Za-z-]+$")
+
+
+@dataclass(frozen=True, slots=True)
+class SemVer:
+    """A parsed SemVer 2.0 version. Build metadata is discarded by design
+    (it never affects precedence); prerelease identifiers are kept."""
+
+    major: int
+    minor: int
+    patch: int
+    prerelease: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,21 +61,86 @@ class UpdateCheckResult:
     latest: str | None = None
 
 
-def parse_version(tag: str) -> tuple[int, int, int] | None:
-    """Parse a SemVer tag like ``0.2.2`` or ``v1.2.3-rc1`` into ints."""
+def _valid_identifier(identifier: str) -> bool:
+    """Validate one dot-separated SemVer identifier.
+
+    Numeric identifiers (all digits) MUST NOT carry leading zeros (``01``
+    is invalid, ``0`` is valid). Alphanumeric/hyphen identifiers are valid
+    as-is. Empty identifiers are always invalid.
+    """
+    if not identifier or not _IDENTIFIER_RE.match(identifier):
+        return False
+    if identifier.isdigit():
+        return len(identifier) == 1 or identifier[0] != "0"
+    return True
+
+
+def parse_version(tag: str) -> SemVer | None:
+    """Parse a SemVer 2.0 tag like ``0.2.2``, ``v1.2.3-rc1`` or
+    ``1.2.3+build.5``. Returns None for anything non-conforming
+    (leading zeros, empty/invalid identifiers, malformed shapes)."""
+    if not isinstance(tag, str):
+        return None
     match = _VERSION_RE.match(tag.strip())
     if match is None:
         return None
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    for group in (match.group(1), match.group(2), match.group(3)):
+        if len(group) > 1 and group.startswith("0"):
+            return None
+    prerelease: tuple[str, ...] = ()
+    if match.group(4) is not None:
+        parts = match.group(4).split(".")
+        if any(not _valid_identifier(part) for part in parts):
+            return None
+        prerelease = tuple(parts)
+    if match.group(5) is not None:
+        # Build metadata: identifiers may contain digits with leading
+        # zeros, but must be non-empty (``1.2.3+`` is rejected by the
+        # regex; ``1.2.3+..x`` and ``1.2.3+a.`` are rejected here).
+        if any(not part or not _IDENTIFIER_RE.match(part) for part in match.group(5).split(".")):
+            return None
+    return SemVer(int(match.group(1)), int(match.group(2)), int(match.group(3)), prerelease)
 
 
-def compare_versions(a: tuple[int, int, int], b: tuple[int, int, int]) -> int:
-    """Numeric three-part comparison: -1, 0, or 1 (a vs b)."""
-    if a < b:
+def _compare_prerelease(a: tuple[str, ...], b: tuple[str, ...]) -> int:
+    """SemVer 2.0 prerelease precedence: numeric identifiers compare
+    numerically, alphanumeric identifiers compare ASCII, numeric <
+    alphanumeric, and a longer identifier set wins when all preceding
+    identifiers are equal."""
+    for x, y in zip(a, b, strict=False):
+        if x == y:
+            continue
+        x_numeric = x.isdigit()
+        y_numeric = y.isdigit()
+        if x_numeric and y_numeric:
+            return -1 if int(x) < int(y) else 1
+        if x_numeric:
+            return -1
+        if y_numeric:
+            return 1
+        return -1 if x < y else 1
+    if len(a) < len(b):
         return -1
-    if a > b:
+    if len(a) > len(b):
         return 1
     return 0
+
+
+def compare_versions(a: SemVer, b: SemVer) -> int:
+    """SemVer 2.0 precedence: -1, 0, or 1 (a vs b).
+
+    Core is compared numerically; a version WITHOUT prerelease has higher
+    precedence than one WITH it; build metadata is ignored.
+    """
+    if (a.major, a.minor, a.patch) != (b.major, b.minor, b.patch):
+        return -1 if (a.major, a.minor, a.patch) < (b.major, b.minor, b.patch) else 1
+    if not a.prerelease and not b.prerelease:
+        return 0
+    if not a.prerelease:
+        return 1  # release > prerelease
+    if not b.prerelease:
+        return -1
+    return _compare_prerelease(a.prerelease, b.prerelease)
 
 
 def _valid_repo(repo: str) -> bool:
@@ -112,8 +197,13 @@ def check_latest_release(
 
     ``opener`` is injectable for tests (defaults to ``urllib.request.urlopen``).
     Returns a sanitized result; never raises for network or parse failures.
+    An invalid ``current`` version (not strict SemVer) fails the check
+    closed — it is never reported as "up to date".
     """
     if not _valid_repo(repo):
+        return UpdateCheckResult(False, STATUS_CHECK_FAILED, current)
+    parsed_current = parse_version(current)
+    if parsed_current is None:
         return UpdateCheckResult(False, STATUS_CHECK_FAILED, current)
     urlopen = opener if opener is not None else urllib.request.urlopen
     try:
@@ -129,10 +219,6 @@ def check_latest_release(
     latest = parse_version(tag)
     if latest is None:
         return UpdateCheckResult(False, STATUS_INVALID_RESPONSE, current)
-    parsed_current = parse_version(current)
-    if parsed_current is None:
-        # Current version is not SemVer — treat as up to date with the tag.
-        return UpdateCheckResult(True, STATUS_UP_TO_DATE, current, tag)
     if compare_versions(latest, parsed_current) > 0:
         return UpdateCheckResult(True, STATUS_UPDATE_AVAILABLE, current, tag)
     return UpdateCheckResult(True, STATUS_UP_TO_DATE, current, tag)

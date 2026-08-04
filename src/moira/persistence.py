@@ -34,6 +34,53 @@ DEFAULT_THRESHOLDS = [50, 75, 90]
 #: Valid provider rule keys (the two collection services).
 VALID_RULE_KEYS = ("claude", "codex")
 
+#: Bounded geometry edge: window sizes are stored as 16-bit-ish positive
+#: integers; anything outside 1..MAX_WINDOW_EDGE is rejected (fail closed).
+MAX_WINDOW_EDGE = 65535
+
+#: Boolean configuration switches (must be actual JSON booleans, never
+#: truthy values like strings, numbers, or None).
+_SWITCH_FIELDS = (
+    "ntfy_enabled",
+    "native_notifications",
+    "reset_alerts",
+    "error_alerts",
+    "collect_claude",
+    "collect_codex",
+    "compact_mode",
+    "window_maximized",
+    "autostart",
+)
+
+
+def _is_exact_bool(value: Any) -> bool:
+    """Return True only for actual ``bool`` values (``type(x) is bool``).
+
+    ``bool`` is a subclass of ``int`` in Python, so ``isinstance``-based
+    checks would accept ``1``/``0`` and strings like ``"false"``; exact type
+    comparison is the only check that keeps JSON switches honest.
+    """
+    return type(value) is bool
+
+
+def _valid_thresholds(value: Any) -> bool:
+    """Exact-type thresholds contract: a list of non-bool ints in 1..100."""
+    if not isinstance(value, list):
+        return False
+    return all(type(item) is int and 1 <= item <= 100 for item in value)
+
+
+def _valid_geometry(width: Any, height: Any) -> bool:
+    """Geometry contract: both None, or two positive bounded ints."""
+    if width is None and height is None:
+        return True
+    return (
+        type(width) is int
+        and type(height) is int
+        and 1 <= width <= MAX_WINDOW_EDGE
+        and 1 <= height <= MAX_WINDOW_EDGE
+    )
+
 
 def config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "moira"
@@ -52,8 +99,10 @@ class ProviderRules:
     error_alerts: bool = True
 
     def validate(self) -> None:
-        if any(not 1 <= value <= 100 for value in self.thresholds):
-            raise ValueError("thresholds must be between 1 and 100")
+        if not _valid_thresholds(self.thresholds):
+            raise ValueError("thresholds must be a list of integers between 1 and 100")
+        if not _is_exact_bool(self.reset_alerts) or not _is_exact_bool(self.error_alerts):
+            raise ValueError("reset/error alert switches must be booleans")
         self.thresholds = sorted(set(self.thresholds))
 
 
@@ -82,15 +131,27 @@ class Settings:
     autostart: bool = False
 
     def validate(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool):
+            raise ValueError("configuration version must be an integer")
         if self.version != CONFIG_VERSION:
             raise ValueError("unsupported configuration version")
-        if self.refresh_minutes not in VALID_REFRESH_MINUTES:
+        if (
+            type(self.refresh_minutes) is not int
+            or self.refresh_minutes not in VALID_REFRESH_MINUTES
+        ):
             raise ValueError(
                 f"refresh interval must be one of: {', '.join(map(str, VALID_REFRESH_MINUTES))}"
             )
-        if any(not 1 <= value <= 100 for value in self.thresholds):
-            raise ValueError("thresholds must be between 1 and 100")
+        if type(self.ntfy_server) is not str or type(self.ntfy_topic) is not str:
+            raise ValueError("NTFY server and topic must be strings")
+        for name in _SWITCH_FIELDS:
+            if not _is_exact_bool(getattr(self, name)):
+                raise ValueError(f"{name} must be a boolean")
+        if not _valid_thresholds(self.thresholds):
+            raise ValueError("thresholds must be a list of integers between 1 and 100")
         self.thresholds = sorted(set(self.thresholds))
+        if not _valid_geometry(self.window_width, self.window_height):
+            raise ValueError("window geometry must be two positive integers or both null")
         if not _valid_repo(self.repo):
             raise ValueError("update-check repository must be owner/name without separators")
         if self.rules:
@@ -156,14 +217,25 @@ def _migrate_v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
     """
     migrated = dict(data)
     old = migrated.get("refresh_minutes")
-    if old is not None and old in VALID_REFRESH_MINUTES:
+    if type(old) is int and old in VALID_REFRESH_MINUTES:
         # Valid existing value → preserve as-is
         pass
     else:
-        # Absent or invalid → new default
+        # Absent or invalid (including booleans, floats, strings) → new default
         migrated["refresh_minutes"] = DEFAULT_REFRESH_MINUTES
     migrated["version"] = 2
     return migrated
+
+
+def _legacy_bool(data: dict[str, Any], key: str, default: bool) -> bool:
+    """Read a legacy switch with exact-type semantics (never truthiness).
+
+    Only an actual JSON boolean is preserved; strings like ``"false"``,
+    numbers, and None all fail closed to the default. ``bool(value)``
+    coercion is forbidden because ``bool("false")`` is True.
+    """
+    value = data.get(key, default)
+    return value if _is_exact_bool(value) else default
 
 
 def _legacy_thresholds(data: dict[str, Any]) -> list[int]:
@@ -189,8 +261,8 @@ def _migrate_v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
     """
     migrated = dict(data)
     thresholds = _legacy_thresholds(migrated)
-    reset_alerts = bool(migrated.get("reset_alerts", True))
-    error_alerts = bool(migrated.get("error_alerts", True))
+    reset_alerts = _legacy_bool(migrated, "reset_alerts", True)
+    error_alerts = _legacy_bool(migrated, "error_alerts", True)
     migrated["rules"] = {
         "claude": {
             "thresholds": list(thresholds),

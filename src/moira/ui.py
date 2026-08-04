@@ -234,8 +234,6 @@ class QuotaCard(Gtk.Frame):
             xalign=0,
         )
         title.add_css_class("heading")
-        progress = Gtk.ProgressBar(fraction=1.0)
-        progress.add_css_class("error")
         detail = Gtk.Label(
             label=f"{_('Resets ')}{reset_text} · {_('in ')}{format_countdown(weekly.reset_at)}",
             xalign=0,
@@ -243,7 +241,10 @@ class QuotaCard(Gtk.Frame):
         detail.set_wrap(True)
         detail.add_css_class("dim-label")
         self.rows.append(title)
-        self.rows.append(progress)
+        if not self._compact:
+            progress = Gtk.ProgressBar(fraction=1.0)
+            progress.add_css_class("error")
+            self.rows.append(progress)
         self.rows.append(detail)
 
         # For Claude: visually disable the five-hour row
@@ -252,8 +253,6 @@ class QuotaCard(Gtk.Frame):
             if fh.percentage is not None and fh.reset_at is not None:
                 fh_title = Gtk.Label(label=f"{fh.quota_label} — {fh.percentage:.0f}%", xalign=0)
                 fh_title.add_css_class("dim-label")
-                fh_progress = Gtk.ProgressBar(fraction=fh.percentage / 100)
-                fh_progress.set_sensitive(False)
                 fh_detail = Gtk.Label(
                     label=_("Five-hour quota disabled due to weekly exhaustion"),
                     xalign=0,
@@ -261,7 +260,10 @@ class QuotaCard(Gtk.Frame):
                 fh_detail.set_wrap(True)
                 fh_detail.add_css_class("dim-label")
                 self.rows.append(fh_title)
-                self.rows.append(fh_progress)
+                if not self._compact:
+                    fh_progress = Gtk.ProgressBar(fraction=fh.percentage / 100)
+                    fh_progress.set_sensitive(False)
+                    self.rows.append(fh_progress)
                 self.rows.append(fh_detail)
 
         latest = max(item.retrieved_at for item in readings).astimezone()
@@ -870,6 +872,13 @@ class MainWindow(Adw.ApplicationWindow):
             autostart=self.autostart.get_active(),
             refresh_minutes=refresh_val,
         )
+        # Explicit merge: the form never edits the repository, the window
+        # geometry, or the maximized state — saving settings must preserve
+        # every non-editable field exactly as loaded.
+        settings.repo = self.settings.repo
+        settings.window_width = self.settings.window_width
+        settings.window_height = self.settings.window_height
+        settings.window_maximized = self.settings.window_maximized
         settings.validate()
         return settings
 
@@ -903,11 +912,18 @@ class MainWindow(Adw.ApplicationWindow):
             self.settings_status.set_text(f"{_('Could not save settings: ')}{exc}")
 
     def _test_notification(self, *_args: Any) -> None:
-        """Send a test NTFY notification. Never changes dedup state."""
+        """Send a test NTFY notification. Never changes dedup state; every
+        failure (invalid settings, keyring retrieval, delivery) shows a fixed
+        translated outcome — no raw exception text reaches the UI."""
         try:
             settings = self._read_form()
-        except Exception as exc:
-            self.settings_status.set_text(f"{_('Invalid settings: ')}{exc}")
+        except Exception:
+            self.settings_status.set_text(_("Test failed: invalid settings."))
+            return
+        try:
+            token = self.token.get_text() or get_ntfy_token()
+        except Exception:
+            self.settings_status.set_text(_("Test failed: keyring unavailable."))
             return
         self.settings_status.set_text(_("Sending test…"))
         future = self.executor.submit(
@@ -919,13 +935,19 @@ class MainWindow(Adw.ApplicationWindow):
                 _("Notifications are configured correctly."),
                 "white_check_mark",
             ),
-            self.token.get_text() or get_ntfy_token(),
+            token,
         )
-        future.add_done_callback(lambda done: GLib.idle_add(self._test_done, done.result()))
+        future.add_done_callback(lambda done: GLib.idle_add(self._test_done, done))
 
-    def _test_done(self, result: Any) -> bool:
+    def _test_done(self, future: Any) -> bool:
         """Show the sanitized typed outcome. Never exposes server, topic,
-        token, response body, or raw exceptions; never changes dedup state."""
+        token, response body, or raw exceptions; never changes dedup state.
+        A failed future (executor error) maps to a fixed translated outcome."""
+        try:
+            result = future.result()
+        except Exception:
+            self.settings_status.set_text(_("Test failed: notification unavailable."))
+            return False
         if result.ok:
             self.settings_status.set_text(_("Test notification sent."))
         else:
@@ -933,14 +955,19 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _test_native_notification(self, *_args: Any) -> None:
-        """Send a test native notification. Never changes dedup state."""
+        """Send a test native notification. Never changes dedup state; Gio
+        delivery failures show a fixed translated outcome."""
         app = self.get_application()
         if app is None:
             self.settings_status.set_text(_("Native notifications are unavailable."))
             return
-        gio_notification = Gio.Notification.new(_("Moira test"))
-        gio_notification.set_body(_("Notifications are configured correctly."))
-        app.send_notification("moira-native-test", gio_notification)
+        try:
+            gio_notification = Gio.Notification.new(_("Moira test"))
+            gio_notification.set_body(_("Notifications are configured correctly."))
+            app.send_notification("moira-native-test", gio_notification)
+        except Exception:
+            self.settings_status.set_text(_("Test failed: native notification unavailable."))
+            return
         self.settings_status.set_text(_("Test notification sent."))
 
     # ── Update check (manual only) ──

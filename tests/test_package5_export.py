@@ -10,6 +10,7 @@ import os
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from moira.export import (
     CSV_COLUMNS,
@@ -28,7 +29,10 @@ from moira.history import HistoryStatus, QuotaObservation
 from moira.history_db import (
     _connect,
     init_schema,
+    query_7d,
+    query_24h,
     query_30d,
+    query_90d,
     record_codex_summary,
     record_quota,
     record_token_availability,
@@ -112,6 +116,7 @@ def _export(db_path: Path, tmp_path: Path, fmt: str) -> tuple[ExportResult, Path
     result = export_history(
         db_path,
         range_func=query_30d,
+        range_delta=timedelta(days=30),
         service=None,
         fmt=fmt,
         dest=dest,
@@ -325,12 +330,99 @@ def test_service_filter_limits_export(tmp_path: Path) -> None:
     db_path = _seed(tmp_path)
     dest = tmp_path / "claude.csv"
     result = export_history(
-        db_path, range_func=query_30d, service=Service.CLAUDE, fmt="csv", dest=dest, now=NOW
+        db_path,
+        range_func=query_30d,
+        range_delta=timedelta(days=30),
+        service=Service.CLAUDE,
+        fmt="csv",
+        dest=dest,
+        now=NOW,
     )
     assert result.ok is True
     rows = list(csv.reader(io.StringIO(dest.read_text(encoding="utf-8"))))
     assert len(rows) == 2  # header + one availability row
     assert rows[1][1] == "claude"
+
+
+def test_export_availability_honors_selected_range(tmp_path: Path) -> None:
+    """Availability rows follow the SAME clock and boundary as the selected
+    24h/7d/30d/90d range — a narrow export never contains out-of-range rows."""
+    db_path = tmp_path / "history.sqlite3"
+    conn = _connect(db_path)
+    init_schema(conn)
+    ages = (
+        timedelta(hours=1),
+        timedelta(days=2),
+        timedelta(days=10),
+        timedelta(days=40),
+        timedelta(days=95),
+    )
+    for age in ages:
+        record_token_availability(
+            conn,
+            TokenAvailabilityRecord(
+                Service.CLAUDE, NOW - age, CLAUDE_SOURCE, HistoryStatus.UNSUPPORTED
+            ),
+            now=NOW,
+        )
+    conn.close()
+
+    def availability_ages(range_delta: timedelta, range_func: Any) -> list[float]:
+        dest = tmp_path / f"out-{int(range_delta.total_seconds())}.csv"
+        result = export_history(
+            db_path,
+            range_func=range_func,
+            range_delta=range_delta,
+            service=None,
+            fmt="csv",
+            dest=dest,
+            now=NOW,
+        )
+        assert result.ok is True
+        rows = list(csv.reader(io.StringIO(dest.read_text(encoding="utf-8"))))
+        assert rows[0] == list(CSV_COLUMNS)
+        return sorted(
+            (NOW - datetime.fromisoformat(row[2])).total_seconds() / 86400 for row in rows[1:]
+        )
+
+    # 24h → only the 1-hour-old record; 7d → + the 2-day; 30d → + the 10-day;
+    # 90d → + the 40-day; the 95-day record is outside every range.
+    assert availability_ages(timedelta(hours=24), query_24h) == [1 / 24]
+    assert availability_ages(timedelta(days=7), query_7d) == [1 / 24, 2.0]
+    assert availability_ages(timedelta(days=30), query_30d) == [1 / 24, 2.0, 10.0]
+    assert availability_ages(timedelta(days=90), query_90d) == [1 / 24, 2.0, 10.0, 40.0]
+
+
+def test_export_service_filter_applies_to_availability(tmp_path: Path) -> None:
+    """The selected service filter bounds availability rows too."""
+    db_path = tmp_path / "history.sqlite3"
+    conn = _connect(db_path)
+    init_schema(conn)
+    record_token_availability(
+        conn,
+        TokenAvailabilityRecord(Service.CLAUDE, NOW, CLAUDE_SOURCE, HistoryStatus.UNSUPPORTED),
+        now=NOW,
+    )
+    record_token_availability(
+        conn,
+        TokenAvailabilityRecord(Service.CODEX, NOW, TOKEN_SOURCE, HistoryStatus.AVAILABLE_EXACT),
+        now=NOW,
+    )
+    conn.close()
+    dest = tmp_path / "codex.csv"
+    result = export_history(
+        db_path,
+        range_func=query_30d,
+        range_delta=timedelta(days=30),
+        service=Service.CODEX,
+        fmt="csv",
+        dest=dest,
+        now=NOW,
+    )
+    assert result.ok is True
+    rows = list(csv.reader(io.StringIO(dest.read_text(encoding="utf-8"))))
+    assert len(rows) == 2  # header + one codex availability row
+    assert rows[1][1] == "codex"
 
 
 # ── Atomic write ──
@@ -340,7 +432,13 @@ def test_atomic_write_leaves_no_temp_file_and_mode_0600(tmp_path: Path) -> None:
     db_path = _seed(tmp_path)
     dest = tmp_path / "sub" / "dir" / "out.csv"
     result = export_history(
-        db_path, range_func=query_30d, service=None, fmt="csv", dest=dest, now=NOW
+        db_path,
+        range_func=query_30d,
+        range_delta=timedelta(days=30),
+        service=None,
+        fmt="csv",
+        dest=dest,
+        now=NOW,
     )
     assert result.ok is True
     assert dest.exists()
@@ -355,7 +453,13 @@ def test_atomic_write_leaves_no_temp_file_and_mode_0600(tmp_path: Path) -> None:
 def test_export_invalid_destination_is_directory(tmp_path: Path) -> None:
     db_path = _seed(tmp_path)
     result = export_history(
-        db_path, range_func=query_30d, service=None, fmt="csv", dest=tmp_path, now=NOW
+        db_path,
+        range_func=query_30d,
+        range_delta=timedelta(days=30),
+        service=None,
+        fmt="csv",
+        dest=tmp_path,
+        now=NOW,
     )
     assert result.ok is False
     assert result.status == STATUS_INVALID_DESTINATION
@@ -365,7 +469,13 @@ def test_export_no_database_does_not_create_file(tmp_path: Path) -> None:
     missing = tmp_path / "missing.sqlite3"
     dest = tmp_path / "out.csv"
     result = export_history(
-        missing, range_func=query_30d, service=None, fmt="csv", dest=dest, now=NOW
+        missing,
+        range_func=query_30d,
+        range_delta=timedelta(days=30),
+        service=None,
+        fmt="csv",
+        dest=dest,
+        now=NOW,
     )
     assert result.ok is False
     assert result.status == STATUS_NO_DATABASE
@@ -381,7 +491,13 @@ def test_export_schema_mismatch(tmp_path: Path) -> None:
     conn.close()
     dest = tmp_path / "out.csv"
     result = export_history(
-        db_path, range_func=query_30d, service=None, fmt="csv", dest=dest, now=NOW
+        db_path,
+        range_func=query_30d,
+        range_delta=timedelta(days=30),
+        service=None,
+        fmt="csv",
+        dest=dest,
+        now=NOW,
     )
     assert result.ok is False
     assert result.status == STATUS_SCHEMA_MISMATCH
@@ -394,7 +510,13 @@ def test_export_db_error_is_sanitized(tmp_path: Path) -> None:
     db_path.write_bytes(b"this is not a sqlite database at all")
     dest = tmp_path / "out.csv"
     result = export_history(
-        db_path, range_func=query_30d, service=None, fmt="csv", dest=dest, now=NOW
+        db_path,
+        range_func=query_30d,
+        range_delta=timedelta(days=30),
+        service=None,
+        fmt="csv",
+        dest=dest,
+        now=NOW,
     )
     assert result.ok is False
     assert result.status in (STATUS_DB_ERROR, STATUS_SCHEMA_MISMATCH)
@@ -409,7 +531,13 @@ def test_export_empty_range_reports_no_data(tmp_path: Path) -> None:
     conn.close()
     dest = tmp_path / "out.csv"
     result = export_history(
-        db_path, range_func=query_30d, service=None, fmt="csv", dest=dest, now=NOW
+        db_path,
+        range_func=query_30d,
+        range_delta=timedelta(days=30),
+        service=None,
+        fmt="csv",
+        dest=dest,
+        now=NOW,
     )
     assert result.ok is True
     assert result.status == STATUS_NO_DATA
@@ -421,7 +549,13 @@ def test_export_unknown_format_fails_sanitized(tmp_path: Path) -> None:
     db_path = _seed(tmp_path)
     dest = tmp_path / "out.xyz"
     result = export_history(
-        db_path, range_func=query_30d, service=None, fmt="xyz", dest=dest, now=NOW
+        db_path,
+        range_func=query_30d,
+        range_delta=timedelta(days=30),
+        service=None,
+        fmt="xyz",
+        dest=dest,
+        now=NOW,
     )
     assert result.ok is False
     assert not dest.exists()

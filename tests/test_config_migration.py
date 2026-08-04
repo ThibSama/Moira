@@ -3,7 +3,10 @@ collection toggles, and fail-closed validation."""
 
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
+
+import pytest
 
 from moira.models import Service
 from moira.persistence import (
@@ -198,7 +201,6 @@ def test_save_and_load_v3_settings(tmp_path: Path) -> None:
 
 
 def test_invalid_refresh_rejected() -> None:
-    import pytest
 
     with pytest.raises(ValueError):
         Settings(refresh_minutes=7).validate()
@@ -226,7 +228,6 @@ def test_rules_for_falls_back_to_legacy_without_validate() -> None:
 
 
 def test_unknown_provider_in_rules_fails_closed() -> None:
-    import pytest
 
     settings = Settings(rules={"claude": ProviderRules(), "unknown": ProviderRules()})
     with pytest.raises(ValueError):
@@ -234,7 +235,6 @@ def test_unknown_provider_in_rules_fails_closed() -> None:
 
 
 def test_missing_provider_in_rules_fails_closed() -> None:
-    import pytest
 
     settings = Settings(rules={"claude": ProviderRules()})
     with pytest.raises(ValueError):
@@ -242,7 +242,6 @@ def test_missing_provider_in_rules_fails_closed() -> None:
 
 
 def test_invalid_thresholds_in_rules_fail_closed() -> None:
-    import pytest
 
     settings = Settings(rules={"claude": ProviderRules([0]), "codex": ProviderRules()})
     with pytest.raises(ValueError):
@@ -250,7 +249,6 @@ def test_invalid_thresholds_in_rules_fail_closed() -> None:
 
 
 def test_invalid_repo_fails_closed() -> None:
-    import pytest
 
     for bad in ("", "no-slash", "owner/name/extra", "owner@x/name", "owner/name with space"):
         settings = Settings(repo=bad)
@@ -277,3 +275,186 @@ def test_enabled_services() -> None:
     assert settings.enabled_services() == [Service.CODEX]
     settings = Settings(collect_claude=False, collect_codex=False)
     assert settings.enabled_services() == []
+
+
+# ── Package 5b: exact-type v3 validation (no bool/int conflation) ──
+
+
+def test_boolean_thresholds_rejected() -> None:
+    """bool is a subclass of int — True must NOT pass the 1..100 threshold
+    checks as the integer 1. Values are routed through untyped variables
+    (exactly as JSON parses them) so the runtime validation is the subject."""
+    bad_values: list[Any] = [[True], [True, 50], [50, False], [False]]
+    for bad in bad_values:
+        rules = ProviderRules()
+        rules.thresholds = bad
+        with pytest.raises(ValueError):
+            rules.validate()
+    settings = Settings()
+    bad_settings_thresholds: Any = [True, 50]
+    settings.thresholds = bad_settings_thresholds
+    with pytest.raises(ValueError):
+        settings.validate()
+
+
+def test_string_switches_rejected() -> None:
+    for name in (
+        "ntfy_enabled",
+        "native_notifications",
+        "reset_alerts",
+        "error_alerts",
+        "collect_claude",
+        "collect_codex",
+        "compact_mode",
+        "window_maximized",
+        "autostart",
+    ):
+        for bad in ("false", 1, None):
+            settings = Settings()
+            setattr(settings, name, bad)
+            with pytest.raises(ValueError):
+                settings.validate()
+    # Real booleans pass.
+    Settings(collect_claude=False, ntfy_enabled=True).validate()
+
+
+def test_rule_switch_types_rejected() -> None:
+    bad_reset: Any = "false"
+    rules = ProviderRules()
+    rules.reset_alerts = bad_reset
+    with pytest.raises(ValueError):
+        rules.validate()
+    bad_error: Any = 1
+    rules2 = ProviderRules()
+    rules2.error_alerts = bad_error
+    with pytest.raises(ValueError):
+        rules2.validate()
+    # JSON-shaped rules with a string switch fail closed through Settings too.
+    settings = Settings(rules={"claude": ProviderRules(), "codex": ProviderRules()})
+    settings.rules["claude"].reset_alerts = bad_reset
+    with pytest.raises(ValueError):
+        settings.validate()
+
+
+def test_malformed_geometry_rejected() -> None:
+    for kwargs in (
+        {"window_width": "800", "window_height": 600},
+        {"window_width": 800, "window_height": "600"},
+        {"window_width": True, "window_height": 600},
+        {"window_width": 800, "window_height": True},
+        {"window_width": 0, "window_height": 600},
+        {"window_width": 800, "window_height": -5},
+        {"window_width": 100_000, "window_height": 600},
+        {"window_width": 800},  # only one edge set
+        {"window_height": 600},  # only one edge set
+        {"window_width": 800.0, "window_height": 600},
+    ):
+        settings = Settings()
+        for key, value in kwargs.items():
+            setattr(settings, key, value)
+        with pytest.raises(ValueError):
+            settings.validate()
+    # Valid shapes pass.
+    Settings().validate()
+    Settings(window_width=None, window_height=None).validate()
+    Settings(window_width=800, window_height=600).validate()
+    Settings(window_width=1, window_height=65535).validate()
+
+
+def test_refresh_minutes_bool_and_float_rejected() -> None:
+    bad_values: list[Any] = [True, 2.0, "2"]
+    for bad in bad_values:
+        settings = Settings()
+        settings.refresh_minutes = bad
+        with pytest.raises(ValueError):
+            settings.validate()
+
+
+def test_string_fields_exact_type() -> None:
+    bad_server: Any = 123
+    bad_topic: Any = True
+    bad_repo: Any = 123
+    settings = Settings()
+    settings.ntfy_server = bad_server
+    with pytest.raises(ValueError):
+        settings.validate()
+    settings2 = Settings()
+    settings2.ntfy_topic = bad_topic
+    with pytest.raises(ValueError):
+        settings2.validate()
+    settings3 = Settings()
+    settings3.repo = bad_repo
+    with pytest.raises(ValueError):
+        settings3.validate()
+
+
+def test_invalid_v3_json_fails_closed(tmp_path: Path) -> None:
+    """Exact-type violations in a v3 file fall back to defaults."""
+    cases = (
+        {"version": 3, "collect_claude": "yes"},
+        {"version": 3, "ntfy_enabled": "false"},
+        {"version": 3, "thresholds": [True, 75]},
+        {"version": 3, "window_width": "800", "window_height": 600},
+        {"version": 3, "window_maximized": 1},
+        {
+            "version": 3,
+            "rules": {"claude": {"thresholds": [50], "reset_alerts": "yes"}, "codex": {}},
+        },
+    )
+    for payload in cases:
+        config = tmp_path / "moira" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps(payload))
+        with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
+            settings = load_settings()
+        assert settings.version == 3
+        assert settings.collect_claude is True
+        assert settings.ntfy_enabled is False
+        assert settings.thresholds == [50, 75, 90]
+        assert settings.window_width is None
+        assert settings.window_maximized is False
+        config.unlink()
+
+
+# ── Package 5b: migration never coerces by truthiness ──
+
+
+def test_v2_migration_string_false_is_not_enabled() -> None:
+    """bool(\"false\") is True — the migration must never coerce by truthiness."""
+    v3 = _migrate_v2_to_v3({"version": 2, "reset_alerts": "false", "error_alerts": "false"})
+    assert v3["rules"]["claude"]["reset_alerts"] is True  # fail closed to default
+    assert v3["rules"]["claude"]["error_alerts"] is True
+    assert v3["rules"]["codex"]["reset_alerts"] is True
+
+
+def test_v2_migration_preserves_real_booleans() -> None:
+    v3 = _migrate_v2_to_v3({"version": 2, "reset_alerts": False, "error_alerts": True})
+    assert v3["rules"]["claude"]["reset_alerts"] is False
+    assert v3["rules"]["claude"]["error_alerts"] is True
+    assert v3["rules"]["codex"]["reset_alerts"] is False
+
+
+def test_v2_migration_numeric_and_none_switches_fail_closed() -> None:
+    for bad in (1, 0, None, "true", 2):
+        v3 = _migrate_v2_to_v3({"version": 2, "reset_alerts": bad})
+        assert v3["rules"]["claude"]["reset_alerts"] is True, bad
+
+
+def test_v1_migration_boolean_refresh_minutes_not_preserved() -> None:
+    """True == 1 must not survive as a refresh interval."""
+    v2 = _migrate_v1_to_v2({"version": 1, "refresh_minutes": True})
+    assert v2["refresh_minutes"] == DEFAULT_REFRESH_MINUTES
+    v2 = _migrate_v1_to_v2({"version": 1, "refresh_minutes": 5.0})
+    assert v2["refresh_minutes"] == DEFAULT_REFRESH_MINUTES
+    v2 = _migrate_v1_to_v2({"version": 1, "refresh_minutes": "10"})
+    assert v2["refresh_minutes"] == DEFAULT_REFRESH_MINUTES
+
+
+def test_load_settings_v2_string_false_fails_closed(tmp_path: Path) -> None:
+    config = tmp_path / "moira" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"version": 2, "reset_alerts": "false"}))
+    with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
+        settings = load_settings()
+    assert settings.rules_for(Service.CLAUDE).reset_alerts is True
+    assert settings.rules_for(Service.CODEX).reset_alerts is True

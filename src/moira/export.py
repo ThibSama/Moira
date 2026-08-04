@@ -223,12 +223,18 @@ def export_history(
     db_path: Path,
     *,
     range_func: Callable[..., dict[str, Any]],
+    range_delta: timedelta,
     service: Service | None,
     fmt: str,
     dest: Path,
     now: datetime | None = None,
 ) -> ExportResult:
     """Read the selected range from the history database and write the file.
+
+    ``range_delta`` is the selected 24h/7d/30d/90d boundary: quota, token,
+    summary AND availability rows are all read with the same clock and the
+    same ``since = now - range_delta`` boundary, so a narrow export never
+    contains out-of-range availability rows.
 
     Runs off the GTK thread. Never raises for DB or write failures and
     never exposes raw exceptions, SQL, payloads, paths, or secrets in the
@@ -256,7 +262,8 @@ def export_history(
             quota: list[QuotaObservation] = list(result.get("quota", []))
             tokens: list[TokenObservation] = list(result.get("tokens", []))
             summaries: list[CodexSummary] = list(result.get("summaries", []))
-            since = clock - timedelta(days=90)
+            # The same clock and boundary as the selected range query.
+            since = clock - range_delta
             availability: list[TokenAvailabilityRecord] = query_token_availability(
                 conn, since=since
             )

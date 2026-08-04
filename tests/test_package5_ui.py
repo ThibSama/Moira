@@ -11,7 +11,7 @@ import gi  # type: ignore[import-untyped]
 import pytest
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gio, GLib  # type: ignore[import-untyped]  # noqa: E402
+from gi.repository import Gio, GLib, Gtk  # type: ignore[import-untyped]  # noqa: E402
 
 from moira.i18n import tr
 from moira.models import QuotaReading, QuotaStatus, Service
@@ -105,6 +105,38 @@ def test_exhausted_card_keeps_reset_countdown() -> None:
     assert card.status.get_text() == tr("Weekly quota exhausted — usage blocked until reset")
     assert any(tr("in ") in t for t in texts)
     assert any("100%" in t and tr("used") in t for t in texts)
+
+
+def test_compact_exhausted_card_has_no_progress_bars() -> None:
+    """Compact exhausted rendering contains no progress bars while keeping
+    provider (heading), status (exhaustion), used/remaining, and
+    reset/countdown visible."""
+    from moira.exhaustion import derive_service
+
+    card = _card()
+    card.set_compact(True)
+    snapshot = derive_service(Service.CLAUDE, [_reading(100.0)], now=NOW)
+    card.show_readings([_reading(100.0)], snapshot)
+    texts = _rows_texts(card.rows)
+    assert card.status.get_text() == tr("Weekly quota exhausted — usage blocked until reset")
+    assert any("100%" in t and tr("used") in t for t in texts)
+    assert any(tr("in ") in t for t in texts)
+    # No Gtk.ProgressBar anywhere in the card's rows.
+    child = card.rows.get_first_child()
+    while child is not None:
+        assert not isinstance(child, Gtk.ProgressBar)
+        child = child.get_next_sibling()
+
+
+def test_compact_normal_card_has_no_progress_bars() -> None:
+    card = _card()
+    card.set_compact(True)
+    card.show_readings([_reading(45.0)], None)
+    child = card.rows.get_first_child()
+    while child is not None:
+        assert not isinstance(child, Gtk.ProgressBar)
+        child = child.get_next_sibling()
+    assert card.status.get_text() == tr("Available")
 
 
 def test_diagnostics_page_updates_text() -> None:
