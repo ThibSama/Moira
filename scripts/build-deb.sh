@@ -29,12 +29,15 @@ if [ "$control_version" != "$version" ]; then
 fi
 
 stage="$project_dir/build/deb-root"
-output="$project_dir/dist/moira_${version}_all.deb"
+# Output directory is overridable so artifact tests can build into an
+# isolated directory; the default is the repository-local dist/.
+output_dir="${MOIRA_OUTPUT_DIR:-$project_dir/dist}"
+output="$output_dir/moira_${version}_all.deb"
 
 rm -rf "$stage"
 mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/lib/moira" \
   "$stage/usr/share/applications" "$stage/usr/share/icons/hicolor/scalable/apps" \
-  "$stage/usr/share/metainfo" "$project_dir/dist"
+  "$stage/usr/share/metainfo" "$output_dir"
 cp "$project_dir/packaging/control" "$stage/DEBIAN/control"
 cp -R "$project_dir/src/moira" "$stage/usr/lib/moira/"
 find "$stage/usr/lib/moira" -type d -name __pycache__ -prune -exec rm -rf {} +

@@ -1,0 +1,18 @@
+# Source distribution manifest for moira-quota-monitor.
+#
+# The sdist must contain only what is required to build/install the package
+# offline: package sources (src/moira), pyproject.toml, README, LICENSE and
+# generated packaging metadata (egg-info). Everything else — tests, caches,
+# bytecode, VCS/venv trees, local build output, user state and credentials —
+# is excluded here. tests/test_artifact_hygiene.py enforces this contract
+# deterministically by building fresh artifacts and enumerating members.
+
+prune tests
+prune .venv
+prune .mypy_cache
+prune .pytest_cache
+prune .ruff_cache
+prune build
+prune dist
+global-exclude *.py[cod]
+global-exclude *~
