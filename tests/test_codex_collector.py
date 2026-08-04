@@ -121,8 +121,8 @@ def test_handshake_requests_both_surfaces_independently() -> None:
     assert result.codex_summary.service == Service.CODEX
     assert result.codex_summary.source == CodexCollector.USAGE_SOURCE
     # Token availability is always emitted — one per provider attempt
-    assert result.token_availability is not None
-    assert result.token_availability.status is HistoryStatus.AVAILABLE_EXACT
+    assert result.token_availability_records[0] is not None
+    assert result.token_availability_records[0].status is HistoryStatus.AVAILABLE_EXACT
 
 
 def test_usage_failure_preserves_quota() -> None:
@@ -150,9 +150,9 @@ def test_usage_failure_preserves_quota() -> None:
     assert result.quota_readings[0].quota_label == "Weekly"
     # Usage failure produces token_availability, not TokenReadings
     assert len(result.token_readings) == 0
-    assert result.token_availability is not None
-    assert result.token_availability.status is HistoryStatus.TEMPORARILY_UNAVAILABLE
-    assert result.token_availability.detail == "Codex usage request failed"
+    assert result.token_availability_records[0] is not None
+    assert result.token_availability_records[0].status is HistoryStatus.TEMPORARILY_UNAVAILABLE
+    assert result.token_availability_records[0].detail == "Codex usage request failed"
 
 
 def test_usage_rpc_error_preserves_quota() -> None:
@@ -178,9 +178,9 @@ def test_usage_rpc_error_preserves_quota() -> None:
 
     assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
     assert len(result.token_readings) == 0
-    assert result.token_availability is not None
-    assert result.token_availability.status is HistoryStatus.TEMPORARILY_UNAVAILABLE
-    assert result.token_availability.detail == "Codex usage request rejected"
+    assert result.token_availability_records[0] is not None
+    assert result.token_availability_records[0].status is HistoryStatus.TEMPORARILY_UNAVAILABLE
+    assert result.token_availability_records[0].detail == "Codex usage request rejected"
 
 
 def test_usage_parse_error_produces_invalid() -> None:
@@ -206,9 +206,9 @@ def test_usage_parse_error_produces_invalid() -> None:
 
     assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
     assert len(result.token_readings) == 0
-    assert result.token_availability is not None
-    assert result.token_availability.status is HistoryStatus.INVALID
-    assert result.token_availability.detail == "Codex usage response malformed"
+    assert result.token_availability_records[0] is not None
+    assert result.token_availability_records[0].status is HistoryStatus.INVALID
+    assert result.token_availability_records[0].detail == "Codex usage response malformed"
 
 
 def test_timeout_terminates_process_group_and_sanitizes_error() -> None:
@@ -225,8 +225,8 @@ def test_timeout_terminates_process_group_and_sanitizes_error() -> None:
     assert result.quota_readings[0].detail == "Codex app-server request failed"
     # Availability shows temporarily_unavailable
     assert len(result.token_readings) == 0
-    assert result.token_availability is not None
-    assert result.token_availability.status is HistoryStatus.TEMPORARILY_UNAVAILABLE
+    assert result.token_availability_records[0] is not None
+    assert result.token_availability_records[0].status is HistoryStatus.TEMPORARILY_UNAVAILABLE
     kill.assert_called_once_with(4242, signal.SIGTERM)
 
 
@@ -258,8 +258,8 @@ def test_rate_limit_parse_error_preserves_tokens() -> None:
     assert result.token_readings[0].tokens == 1700
     assert result.token_readings[0].status == "available_exact"
     # Availability is AVAILABLE_EXACT
-    assert result.token_availability is not None
-    assert result.token_availability.status is HistoryStatus.AVAILABLE_EXACT
+    assert result.token_availability_records[0] is not None
+    assert result.token_availability_records[0].status is HistoryStatus.AVAILABLE_EXACT
 
 
 def test_independent_deadlines() -> None:
@@ -294,8 +294,8 @@ def test_independent_deadlines() -> None:
     assert rate_deadlines[0] != usage_deadlines[0]
     assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
     assert result.token_readings[0].status == "available_exact"
-    assert result.token_availability is not None
-    assert result.token_availability.status is HistoryStatus.AVAILABLE_EXACT
+    assert result.token_availability_records[0] is not None
+    assert result.token_availability_records[0].status is HistoryStatus.AVAILABLE_EXACT
 
 
 def test_codex_not_found_produces_unsupported() -> None:
@@ -306,5 +306,5 @@ def test_codex_not_found_produces_unsupported() -> None:
     assert len(result.quota_readings) == 1
     assert result.quota_readings[0].status is QuotaStatus.UNAVAILABLE
     assert len(result.token_readings) == 0
-    assert result.token_availability is not None
-    assert result.token_availability.status is HistoryStatus.UNSUPPORTED
+    assert result.token_availability_records[0] is not None
+    assert result.token_availability_records[0].status is HistoryStatus.UNSUPPORTED

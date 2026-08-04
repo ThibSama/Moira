@@ -1740,8 +1740,7 @@ def test_token_availability_latest_status_per_service() -> None:
         ),
     ]
     view = prepare_history_view(
-        [_obs(pct=50.0)], range_label="24h", filter_label="All",
-        token_availability_records=records
+        [_obs(pct=50.0)], range_label="24h", filter_label="All", token_availability_records=records
     )
     assert len(view.token_availability) == 1
     state = view.token_availability[0]
@@ -1766,8 +1765,11 @@ def test_availability_never_hides_exact_data() -> None:
         ),
     ]
     view = prepare_history_view(
-        [_obs(pct=50.0)], range_label="24h", filter_label="All",
-        token_observations=exact_obs, token_availability_records=avail_records,
+        [_obs(pct=50.0)],
+        range_label="24h",
+        filter_label="All",
+        token_observations=exact_obs,
+        token_availability_records=avail_records,
     )
     assert len(view.token_summaries) == 1
     assert view.token_summaries[0].total_tokens == 500

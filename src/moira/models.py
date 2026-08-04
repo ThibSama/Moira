@@ -314,11 +314,13 @@ class CollectorResult:
     codex_summary carries the official aggregate summary (lifetime, peak,
     streaks, longest turn) as one typed immutable record when available
     from the usage surface.
-    token_availability carries the provider-neutral availability observation
-    for this attempt — always emitted, one per collection.
+    token_availability_records carries exactly one provider-neutral
+    availability observation per collector attempt — always an immutable
+    tuple, never None. Collectors that don't support token data emit a
+    typed UNSUPPORTED record.
     """
 
     quota_readings: tuple[QuotaReading, ...]
     token_readings: tuple[TokenReading, ...]
     codex_summary: CodexSummary | None = None
-    token_availability: TokenAvailabilityRecord | None = None
+    token_availability_records: tuple[TokenAvailabilityRecord, ...] = ()

@@ -2173,7 +2173,7 @@ def test_non_exact_status_never_hides_exact_data(tmp_path: Path) -> None:
 def test_non_exact_status_persisted_via_availability(tmp_path: Path) -> None:
     """Non-exact availability is persisted in token_availability, not token_events."""
     conn = _db(tmp_path)
-    from moira.history_db import record_token_availability, query_token_availability
+    from moira.history_db import query_token_availability, record_token_availability
     from moira.models import TokenAvailabilityRecord
 
     avail = TokenAvailabilityRecord(
@@ -2196,7 +2196,7 @@ def test_non_exact_status_persisted_via_availability(tmp_path: Path) -> None:
 def test_availability_coexists_with_exact_data(tmp_path: Path) -> None:
     """Availability state coexists with exact daily data — never alters totals."""
     conn = _db(tmp_path)
-    from moira.history_db import record_token_availability, query_token_availability
+    from moira.history_db import query_token_availability, record_token_availability
     from moira.models import TokenAvailabilityRecord
 
     # Write exact data first
@@ -2254,4 +2254,417 @@ def test_record_refresh_end_to_end_with_summary(tmp_path: Path) -> None:
     summaries = query_codex_summaries(conn, since=NOW - timedelta(hours=1))
     assert len(summaries) == 1
     assert summaries[0].lifetime_tokens == 123456
+    conn.close()
+
+
+# ── Package 3e: v3→v4 migration with historical shapes ──
+
+
+def _v3_db_3b(tmp_path: Path) -> sqlite3.Connection:
+    """Create a populated Package 3b v3 database (no codex_summaries)."""
+    from moira.history_db import SCHEMA_SQL_V3_3B
+
+    db_path = tmp_path / "history_3b.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(db_path), os.O_CREAT | os.O_WRONLY, 0o600)
+    os.close(fd)
+    os.chmod(db_path, 0o600)
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    conn.executescript(SCHEMA_SQL_V3_3B)
+    conn.execute("INSERT INTO schema_meta (version) VALUES (3)")
+    conn.execute(
+        "INSERT INTO quota_observations "
+        "(service, quota_label, percentage, reset_at, observed_at, source, bucket) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("codex", "Weekly", 42.0, RESET.isoformat(), NOW.isoformat(), "fixture", _bucket(NOW)),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO token_events "
+        "(event_key, service, period_start, period_kind, observed_at, source, "
+        "status, total_tokens) "
+        "VALUES (?, ?, ?, 'day', ?, ?, 'available_exact', ?)",
+        ("codex:day:2026-08-02", "codex", "2026-08-02", NOW.isoformat(), "fixture", 500),
+    )
+    return conn
+
+
+def _v3_db_3c(tmp_path: Path) -> sqlite3.Connection:
+    """Create a populated Package 3c v3 database (with codex_summaries)."""
+    from moira.history_db import SCHEMA_SQL_V3_3C
+
+    db_path = tmp_path / "history_3c.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(db_path), os.O_CREAT | os.O_WRONLY, 0o600)
+    os.close(fd)
+    os.chmod(db_path, 0o600)
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    conn.executescript(SCHEMA_SQL_V3_3C)
+    conn.execute("INSERT INTO schema_meta (version) VALUES (3)")
+    conn.execute(
+        "INSERT INTO quota_observations "
+        "(service, quota_label, percentage, reset_at, observed_at, source, bucket) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("codex", "Weekly", 42.0, RESET.isoformat(), NOW.isoformat(), "fixture", _bucket(NOW)),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO token_events "
+        "(event_key, service, period_start, period_kind, observed_at, source, "
+        "status, total_tokens) "
+        "VALUES (?, ?, ?, 'day', ?, ?, 'available_exact', ?)",
+        ("codex:day:2026-08-02", "codex", "2026-08-02", NOW.isoformat(), "fixture", 500),
+    )
+    return conn
+
+
+def test_3b_migration_creates_codex_summaries_and_availability(tmp_path: Path) -> None:
+    """Package 3b v3 (no codex_summaries) → v4 creates both tables, preserves rows."""
+    conn = _v3_db_3b(tmp_path)
+    # Verify no codex_summaries, no token_availability before migration
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='codex_summaries'"
+        ).fetchone()
+        is None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_availability'"
+        ).fetchone()
+        is None
+    )
+    conn.close()
+
+    conn = _connect(tmp_path / "history_3b.sqlite3")
+    init_schema(conn)
+
+    # Version is now 4
+    row = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row[0] == 4
+
+    # Both v4 tables now exist
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='codex_summaries'"
+        ).fetchone()
+        is not None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_availability'"
+        ).fetchone()
+        is not None
+    )
+
+    # Indexes exist
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_codex_summaries_time'"
+        ).fetchone()
+        is not None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_token_avail_service'"
+        ).fetchone()
+        is not None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_token_avail_time'"
+        ).fetchone()
+        is not None
+    )
+
+    # Existing rows preserved
+    quota = query_quota(conn, since=NOW - timedelta(hours=1))
+    assert len(quota) == 1
+    assert quota[0].percentage == 42.0
+
+    tokens = query_token(conn, since=NOW - timedelta(hours=1))
+    assert len(tokens) == 1
+    assert tokens[0].tokens == 500
+
+    # A subsequent codex_summary write works
+    from moira.models import CodexSummary
+
+    summary = CodexSummary(
+        service=Service.CODEX,
+        source="test",
+        observed_at=NOW,
+        lifetime_tokens=999,
+    )
+    record_codex_summary(conn, summary, now=NOW)
+    summaries = query_codex_summaries(conn, since=NOW - timedelta(hours=1))
+    assert len(summaries) == 1
+    assert summaries[0].lifetime_tokens == 999
+
+    conn.close()
+
+
+def test_3c_migration_idempotent(tmp_path: Path) -> None:
+    """Package 3c v3 (with codex_summaries) → v4 creates only missing additions."""
+    conn = _v3_db_3c(tmp_path)
+    # Verify codex_summaries EXISTS but token_availability does NOT
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='codex_summaries'"
+        ).fetchone()
+        is not None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_availability'"
+        ).fetchone()
+        is None
+    )
+    conn.close()
+
+    conn = _connect(tmp_path / "history_3c.sqlite3")
+    init_schema(conn)
+
+    row = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row[0] == 4
+
+    # Both tables exist
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_availability'"
+        ).fetchone()
+        is not None
+    )
+
+    # Run init_schema again (idempotent)
+    init_schema(conn)
+    row2 = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row2[0] == 4
+
+    conn.close()
+
+
+def test_v3_migration_rollback_preserves_version_and_rows(tmp_path: Path) -> None:
+    """Forced failure during v3→v4 rolls back DDL, index, and version changes."""
+    conn = _v3_db_3b(tmp_path)
+    conn.close()
+
+    conn = _connect(tmp_path / "history_3b.sqlite3")
+
+    # Monkey-patch _create_missing_v4_objects to fail after creating something
+    original_create = history_db_module._create_missing_v4_objects
+
+    def failing_create(c: sqlite3.Connection) -> None:
+        original_create(c)
+        raise sqlite3.OperationalError("simulated failure")
+
+    history_db_module._create_missing_v4_objects = failing_create  # type: ignore[assignment]
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="simulated failure"):
+            init_schema(conn)
+    finally:
+        history_db_module._create_missing_v4_objects = original_create  # type: ignore[assignment]
+
+    # Version stays 3 (rollback)
+    row = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row[0] == 3
+
+    # Neither v4 table was committed
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='codex_summaries'"
+        ).fetchone()
+        is None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_availability'"
+        ).fetchone()
+        is None
+    )
+
+    # Existing rows survive
+    quota = query_quota(conn, since=NOW - timedelta(hours=1))
+    assert len(quota) == 1
+    conn.close()
+
+
+def test_v4_completeness_validates_indexes(tmp_path: Path) -> None:
+    """A v4 database missing a required index fails validation."""
+    conn = _db(tmp_path)  # fresh v4
+    row = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row[0] == 4
+
+    # Drop one required index
+    conn.execute("DROP INDEX idx_codex_summaries_time")
+    conn.close()
+
+    conn = _connect(tmp_path / "history.sqlite3")
+    # init_schema should detect the missing index and repair it
+    init_schema(conn)
+
+    # The index is recreated
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_codex_summaries_time'"
+        ).fetchone()
+        is not None
+    )
+    conn.close()
+
+
+def test_v4_idempotent_reinit_repairs_missing_index(tmp_path: Path) -> None:
+    """Calling init_schema on a valid v4 DB is idempotent."""
+    conn = _db(tmp_path)
+    row = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row[0] == 4
+
+    init_schema(conn)  # second call
+    row2 = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row2[0] == 4
+
+    # No duplicate application tables (sqlite_sequence is an internal table)
+    tables_count = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchone()[0]
+    conn.close()
+    assert tables_count == 5
+
+
+def test_damaged_v4_fails_closed_on_missing_column(tmp_path: Path) -> None:
+    """A v4 database missing a required column fails closed."""
+    conn = _db(tmp_path)
+    # Drop a required column (SQLite doesn't support DROP COLUMN easily,
+    # so we create a fresh table with fewer columns and rename)
+    conn.execute("ALTER TABLE codex_summaries RENAME TO codex_summaries_old")
+    conn.execute(
+        "CREATE TABLE codex_summaries ("
+        "service TEXT NOT NULL, observed_at TEXT NOT NULL, source TEXT NOT NULL,"
+        "PRIMARY KEY (service, observed_at))"
+    )
+    conn.execute("DROP TABLE codex_summaries_old")
+    conn.close()
+
+    conn = _connect(tmp_path / "history.sqlite3")
+    with pytest.raises(SchemaVersionError, match="required objects"):
+        init_schema(conn)
+    conn.close()
+
+
+def test_v3_db_3b_produces_complete_v4_manifest(tmp_path: Path) -> None:
+    """After 3b→v4 migration, the complete v4 manifest validates cleanly."""
+    from moira.history_db import _validate_v4_completeness
+
+    conn = _v3_db_3b(tmp_path)
+    conn.close()
+
+    conn = _connect(tmp_path / "history_3b.sqlite3")
+    init_schema(conn)
+    missing = _validate_v4_completeness(conn)
+    assert missing == [], f"v4 manifest incomplete: {missing}"
+    conn.close()
+
+
+def test_two_provider_availability_persisted(tmp_path: Path) -> None:
+    """Claude UNSUPPORTED and Codex AVAILABLE_EXACT coexist in one batch."""
+    from moira.collectors import ClaudeCollector
+    from moira.history_db import query_token_availability
+
+    # Simulate a full refresh with both collectors
+    claude_result = ClaudeCollector().collect()
+    assert len(claude_result.token_availability_records) == 1
+    assert claude_result.token_availability_records[0].status is HistoryStatus.UNSUPPORTED
+    assert claude_result.token_availability_records[0].service is Service.CLAUDE
+
+    # Build a synthetic Codex result with exact availability
+    from moira.models import TokenAvailabilityRecord
+
+    codex_avail = TokenAvailabilityRecord(
+        service=Service.CODEX,
+        observed_at=NOW,
+        source="codex-app-server",
+        status=HistoryStatus.AVAILABLE_EXACT,
+    )
+    from moira.models import CollectorResult
+
+    codex_result = CollectorResult(
+        quota_readings=(),
+        token_readings=(),
+        token_availability_records=(codex_avail,),
+    )
+
+    # Combine all readings into one batch like MainWindow does
+    conn = _db(tmp_path)
+    batch: list[Any] = list(claude_result.quota_readings)
+    batch.extend(claude_result.token_readings)
+    batch.extend(claude_result.token_availability_records)
+    batch.extend(codex_result.quota_readings)
+    batch.extend(codex_result.token_readings)
+    batch.extend(codex_result.token_availability_records)
+
+    record_refresh(conn, batch, now=NOW)
+
+    avail_rows = query_token_availability(conn, since=NOW - timedelta(hours=1))
+    services = {r.service for r in avail_rows}
+    assert Service.CLAUDE in services
+    assert Service.CODEX in services
+    assert len(avail_rows) == 2
+
+    conn.close()
+
+
+def test_claude_unsupported_does_not_hide_codex_data(tmp_path: Path) -> None:
+    """Claude UNSUPPORTED availability coexists with Codex exact token data."""
+    from moira.history_db import query_token_availability
+    from moira.models import TokenAvailabilityRecord
+
+    conn = _db(tmp_path)
+
+    # Write Codex exact token data
+    exact = _token_reading(NOW, tokens=800)
+    record_token_events(conn, [exact], now=NOW)
+
+    # Write Codex AVAILABLE_EXACT availability
+    codex_avail = TokenAvailabilityRecord(
+        service=Service.CODEX,
+        observed_at=NOW,
+        source="test",
+        status=HistoryStatus.AVAILABLE_EXACT,
+    )
+    from moira.history_db import record_token_availability
+
+    record_token_availability(conn, codex_avail, now=NOW)
+
+    # Write Claude UNSUPPORTED availability
+    claude_avail = TokenAvailabilityRecord(
+        service=Service.CLAUDE,
+        observed_at=NOW,
+        source="claude-statusline",
+        status=HistoryStatus.UNSUPPORTED,
+    )
+    record_token_availability(conn, claude_avail, now=NOW)
+
+    # Codex exact data survives
+    tokens = query_token(conn, since=NOW - timedelta(hours=1))
+    assert len(tokens) == 1
+    assert tokens[0].tokens == 800
+
+    avail_rows = query_token_availability(conn, since=NOW - timedelta(hours=1))
+    statuses = {(r.service, r.status) for r in avail_rows}
+    assert (Service.CLAUDE, HistoryStatus.UNSUPPORTED) in statuses
+    assert (Service.CODEX, HistoryStatus.AVAILABLE_EXACT) in statuses
+
+    conn.close()
+
+
+def test_v4_manifest_indexes_exist_after_fresh_create(tmp_path: Path) -> None:
+    """Fresh v4 database has all required indexes."""
+    conn = _db(tmp_path)
+    from moira.history_db import V4_MANIFEST
+
+    indexes_manifest: list[str] = V4_MANIFEST["indexes"]  # type: ignore[assignment]
+    for idx in indexes_manifest:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (idx,)
+            ).fetchone()
+            is not None
+        ), f"index {idx} missing"
     conn.close()

@@ -26,9 +26,19 @@ class ClaudeCollector:
     def collect(self) -> CollectorResult:
         from .claude_integration import load_cached_readings
 
+        now = utc_now()
         return CollectorResult(
             quota_readings=tuple(load_cached_readings()),
             token_readings=(),
+            token_availability_records=(
+                TokenAvailabilityRecord(
+                    service=Service.CLAUDE,
+                    observed_at=now,
+                    source="claude-statusline",
+                    status=HistoryStatus.UNSUPPORTED,
+                    detail="Claude does not expose a structured token surface",
+                ),
+            ),
         )
 
 
@@ -93,12 +103,14 @@ class CodexCollector:
                     ),
                 ),
                 token_readings=(),
-                token_availability=TokenAvailabilityRecord(
-                    service=Service.CODEX,
-                    observed_at=now,
-                    source="codex-app-server",
-                    status=HistoryStatus.UNSUPPORTED,
-                    detail="codex CLI not found",
+                token_availability_records=(
+                    TokenAvailabilityRecord(
+                        service=Service.CODEX,
+                        observed_at=now,
+                        source="codex-app-server",
+                        status=HistoryStatus.UNSUPPORTED,
+                        detail="codex CLI not found",
+                    ),
                 ),
             )
 
@@ -230,7 +242,9 @@ class CodexCollector:
                 quota_readings=tuple(quota_readings),
                 token_readings=tuple(token_readings),
                 codex_summary=codex_summary,
-                token_availability=token_availability,
+                token_availability_records=(token_availability,)
+                if token_availability is not None
+                else (),
             )
 
         except (OSError, TimeoutError, subprocess.SubprocessError, json.JSONDecodeError):
@@ -248,12 +262,14 @@ class CodexCollector:
                     ),
                 ),
                 token_readings=(),
-                token_availability=TokenAvailabilityRecord(
-                    service=Service.CODEX,
-                    observed_at=now,
-                    source="codex-app-server",
-                    status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
-                    detail="Codex app-server request failed",
+                token_availability_records=(
+                    TokenAvailabilityRecord(
+                        service=Service.CODEX,
+                        observed_at=now,
+                        source="codex-app-server",
+                        status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
+                        detail="Codex app-server request failed",
+                    ),
                 ),
             )
         finally:

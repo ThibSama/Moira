@@ -547,46 +547,265 @@ REQUIRED_V4_TABLES = (
     "token_availability",
 )
 
+# v4 completeness manifest: every table, column, constraint and index that must
+# be present for a v4 database to be considered complete.
+V4_MANIFEST: dict[str, object] = {
+    "tables": {
+        "schema_meta": {"columns": ("version",)},
+        "quota_observations": {
+            "columns": (
+                "id",
+                "service",
+                "quota_label",
+                "percentage",
+                "reset_at",
+                "observed_at",
+                "source",
+                "bucket",
+                "status",
+                "is_change",
+            ),
+        },
+        "token_events": {
+            "columns": (
+                "event_key",
+                "service",
+                "period_start",
+                "period_kind",
+                "observed_at",
+                "source",
+                "status",
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+                "total_tokens",
+            ),
+        },
+        "codex_summaries": {
+            "columns": (
+                "service",
+                "observed_at",
+                "source",
+                "lifetime_tokens",
+                "peak_daily_tokens",
+                "current_streak_days",
+                "longest_streak_days",
+                "longest_running_turn_sec",
+            ),
+        },
+        "token_availability": {
+            "columns": (
+                "service",
+                "observed_at",
+                "source",
+                "status",
+                "detail",
+            ),
+        },
+    },
+    "indexes": [
+        "idx_quota_obs_time",
+        "idx_quota_obs_service",
+        "idx_token_events_time",
+        "idx_token_events_service",
+        "idx_token_events_period",
+        "idx_codex_summaries_time",
+        "idx_token_avail_service",
+        "idx_token_avail_time",
+    ],
+}
 
-def _has_all_v4_tables(conn: sqlite3.Connection) -> bool:
-    """Return True when every table required by schema v4 exists."""
-    present = {
+# Historical Package 3b v3 DDL: token_events + quota but NO codex_summaries.
+# Represents the shape a real Package 3b database had before codex_summaries
+# was added in Package 3c. Used for migration tests only.
+SCHEMA_SQL_V3_3B = """\
+CREATE TABLE IF NOT EXISTS schema_meta (
+    version INTEGER PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS quota_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    service         TEXT    NOT NULL,
+    quota_label     TEXT    NOT NULL,
+    percentage      REAL    NOT NULL,
+    reset_at        TEXT    NOT NULL,
+    observed_at     TEXT    NOT NULL,
+    source          TEXT    NOT NULL,
+    bucket          TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'available_exact',
+    is_change       INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (service, quota_label, bucket, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_quota_obs_time ON quota_observations (observed_at);
+CREATE INDEX IF NOT EXISTS idx_quota_obs_service ON quota_observations (service, quota_label);
+CREATE TABLE IF NOT EXISTS token_events (
+    event_key               TEXT PRIMARY KEY,
+    service                 TEXT    NOT NULL,
+    period_start            TEXT    NOT NULL,
+    period_kind             TEXT    NOT NULL,
+    observed_at             TEXT    NOT NULL,
+    source                  TEXT    NOT NULL,
+    status                  TEXT    NOT NULL,
+    input_tokens            INTEGER,
+    cached_input_tokens     INTEGER,
+    output_tokens           INTEGER,
+    reasoning_output_tokens INTEGER,
+    total_tokens            INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_token_events_time ON token_events (observed_at);
+CREATE INDEX IF NOT EXISTS idx_token_events_service ON token_events (service);
+CREATE INDEX IF NOT EXISTS idx_token_events_period ON token_events (period_start);
+"""
+
+# Historical Package 3c v3 DDL: same as SCHEMA_SQL_V3 (includes codex_summaries).
+SCHEMA_SQL_V3_3C = """\
+CREATE TABLE IF NOT EXISTS schema_meta (
+    version INTEGER PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS quota_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    service         TEXT    NOT NULL,
+    quota_label     TEXT    NOT NULL,
+    percentage      REAL    NOT NULL,
+    reset_at        TEXT    NOT NULL,
+    observed_at     TEXT    NOT NULL,
+    source          TEXT    NOT NULL,
+    bucket          TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'available_exact',
+    is_change       INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (service, quota_label, bucket, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_quota_obs_time ON quota_observations (observed_at);
+CREATE INDEX IF NOT EXISTS idx_quota_obs_service ON quota_observations (service, quota_label);
+CREATE TABLE IF NOT EXISTS token_events (
+    event_key               TEXT PRIMARY KEY,
+    service                 TEXT    NOT NULL,
+    period_start            TEXT    NOT NULL,
+    period_kind             TEXT    NOT NULL,
+    observed_at             TEXT    NOT NULL,
+    source                  TEXT    NOT NULL,
+    status                  TEXT    NOT NULL,
+    input_tokens            INTEGER,
+    cached_input_tokens     INTEGER,
+    output_tokens           INTEGER,
+    reasoning_output_tokens INTEGER,
+    total_tokens            INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_token_events_time ON token_events (observed_at);
+CREATE INDEX IF NOT EXISTS idx_token_events_service ON token_events (service);
+CREATE INDEX IF NOT EXISTS idx_token_events_period ON token_events (period_start);
+CREATE TABLE IF NOT EXISTS codex_summaries (
+    service                 TEXT    NOT NULL,
+    observed_at             TEXT    NOT NULL,
+    source                  TEXT    NOT NULL,
+    lifetime_tokens         INTEGER,
+    peak_daily_tokens       INTEGER,
+    current_streak_days     INTEGER,
+    longest_streak_days     INTEGER,
+    longest_running_turn_sec INTEGER,
+    PRIMARY KEY (service, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_codex_summaries_time ON codex_summaries (observed_at);
+"""
+
+
+def _table_present(conn: sqlite3.Connection, table: str) -> bool:
+    """Return True when the named table exists."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _index_present(conn: sqlite3.Connection, index: str) -> bool:
+    """Return True when the named index exists."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+            (index,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _validate_v4_completeness(conn: sqlite3.Connection) -> list[str]:
+    """Validate the complete v4 manifest and return a list of missing objects.
+
+    Checks tables, columns, and indexes against ``V4_MANIFEST``. If the
+    returned list is empty, the database is a complete v4 instance.
+    """
+    tables_manifest: dict[str, dict[str, object]] = V4_MANIFEST["tables"]  # type: ignore[assignment]
+    indexes_manifest: list[str] = V4_MANIFEST["indexes"]  # type: ignore[assignment]
+    missing: list[str] = []
+
+    existing_tables: set[str] = {
         row[0]
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
-    return all(table in present for table in REQUIRED_V4_TABLES)
+
+    for table_name, spec in tables_manifest.items():
+        if table_name not in existing_tables:
+            missing.append(f"table {table_name}")
+            continue
+        # Validate columns
+        columns_spec: tuple[str, ...] = spec["columns"]  # type: ignore[assignment]
+        existing_cols: set[str] = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        for col in columns_spec:
+            if col not in existing_cols:
+                missing.append(f"column {table_name}.{col}")
+
+    for index_name in indexes_manifest:
+        if not _index_present(conn, index_name):
+            missing.append(f"index {index_name}")
+
+    return missing
 
 
-def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
-    """Transactionally migrate a v3 schema to v4.
+def _has_all_v4_tables(conn: sqlite3.Connection) -> bool:
+    """Return True when every table required by schema v4 exists."""
+    return all(_table_present(conn, t) for t in REQUIRED_V4_TABLES)
 
-    Preserves all existing quota, token_events, and codex_summaries rows.
-    Creates the ``token_availability`` table (the only v4 addition).
-    Rolls back fully on any failure. Requires every v3 table to exist
-    before beginning — incomplete v3 databases fail closed.
+
+def _create_missing_v4_objects(conn: sqlite3.Connection) -> None:
+    """Create every v4 addition that is missing from the current database.
+
+    Idempotent and transactional: only creates explicitly additive objects
+    (tables and indexes that don't exist). Never drops, renames, or alters
+    existing objects. Called inside an existing transaction.
     """
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        if not _has_all_v4_tables(conn):
-            # Some required tables are still missing — this v3 database
-            # is incomplete. Check the v3 set first for a clearer error.
-            missing_v3 = [
-                t
-                for t in REQUIRED_V3_TABLES
-                if t
-                not in {
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table'"
-                    ).fetchall()
-                }
-            ]
-            if missing_v3:
-                raise SchemaVersionError("history database is incomplete: missing tables from v3")
-            # v3 tables exist but v4 tables don't — create the v4 additions
-            conn.execute(
-                """\
-CREATE TABLE IF NOT EXISTS token_availability (
+    if not _table_present(conn, "codex_summaries"):
+        conn.execute(
+            """\
+CREATE TABLE codex_summaries (
+    service                 TEXT    NOT NULL,
+    observed_at             TEXT    NOT NULL,
+    source                  TEXT    NOT NULL,
+    lifetime_tokens         INTEGER,
+    peak_daily_tokens       INTEGER,
+    current_streak_days     INTEGER,
+    longest_streak_days     INTEGER,
+    longest_running_turn_sec INTEGER,
+    PRIMARY KEY (service, observed_at)
+)"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_summaries_time ON codex_summaries (observed_at)"
+        )
+    else:
+        # Table exists but index may be missing
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_summaries_time ON codex_summaries (observed_at)"
+        )
+
+    if not _table_present(conn, "token_availability"):
+        conn.execute(
+            """\
+CREATE TABLE token_availability (
     service     TEXT NOT NULL,
     observed_at TEXT NOT NULL,
     source      TEXT NOT NULL,
@@ -594,13 +813,48 @@ CREATE TABLE IF NOT EXISTS token_availability (
     detail      TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (service, observed_at)
 )"""
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_token_avail_service ON token_availability (service)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_token_avail_time "
-                "ON token_availability (observed_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_avail_service ON token_availability (service)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_avail_time ON token_availability (observed_at)"
+        )
+    else:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_avail_service ON token_availability (service)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_avail_time ON token_availability (observed_at)"
+        )
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """Transactionally migrate a v3 schema to v4.
+
+    Preserves all existing quota, token_events, and codex_summaries rows.
+    Creates every missing v4 addition (codex_summaries, its index,
+    token_availability, and its indexes) idempotently — a Package 3b v3
+    without codex_summaries and a Package 3c v3 with it both reach complete
+    v4. Validates the complete v4 manifest after creation. Rolls back fully
+    on any failure, leaving version, tables, indexes, and rows exactly as
+    they were.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Fail closed: v4 migration requires every v3 table to exist.
+        missing_v3 = [t for t in REQUIRED_V3_TABLES if not _table_present(conn, t)]
+        if missing_v3:
+            raise SchemaVersionError("history database is incomplete: missing tables from v3")
+
+        # Create every missing v4 addition — handles both 3b and 3c shapes.
+        _create_missing_v4_objects(conn)
+
+        # Validate the complete v4 manifest before committing the version change.
+        missing_objects = _validate_v4_completeness(conn)
+        if missing_objects:
+            raise SchemaVersionError(
+                f"history database v4 migration incomplete — missing: {', '.join(missing_objects)}"
             )
 
         conn.execute("UPDATE schema_meta SET version = 4 WHERE version = 3")
@@ -643,21 +897,38 @@ def init_schema(conn: sqlite3.Connection) -> None:
         row = conn.execute("SELECT version FROM schema_meta").fetchone()
         if row is None:
             # Table exists but no version row. Repair transactionally only
-            # when the v4 tables are complete; otherwise fail closed.
-            if not _has_all_v4_tables(conn):
-                raise SchemaVersionError(
-                    "history database is incomplete: cannot label it v4 without all required tables"
-                )
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
-                conn.execute("COMMIT")
-            except Exception:
+            # when the v4 complete manifest validates cleanly.
+            missing = _validate_v4_completeness(conn)
+            if missing:
+                # Try additive repair
+                conn.execute("BEGIN IMMEDIATE")
                 try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    pass
-                raise
+                    _create_missing_v4_objects(conn)
+                    still_missing = _validate_v4_completeness(conn)
+                    if still_missing:
+                        raise SchemaVersionError(
+                            "history database is incomplete: cannot label it v4 "
+                            f"without all required objects: {', '.join(still_missing)}"
+                        )
+                    conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.OperationalError:
+                        pass
+                    raise
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.OperationalError:
+                        pass
+                    raise
             return
         if row[0] == 1:
             _migrate_v1_to_v2(conn)
@@ -678,13 +949,29 @@ def init_schema(conn: sqlite3.Connection) -> None:
             raise SchemaVersionError(
                 f"history database schema version {row[0]} does not match expected {SCHEMA_VERSION}"
             )
-        # Already at v4: verify completeness — never trust a version label
-        # on a database missing required tables.
-        if not _has_all_v4_tables(conn):
-            raise SchemaVersionError(
-                "history database is incomplete: version row claims v4 but "
-                "required tables are missing"
-            )
+        # Already at v4: validate the complete manifest (tables + columns + indexes).
+        # A version label on an incomplete database is never trusted.
+        missing = _validate_v4_completeness(conn)
+        if missing:
+            # Repair only explicitly additive missing objects inside a
+            # transaction. If the repair succeeds, the manifest validates
+            # cleanly; if it fails, the transaction rolls back completely.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _create_missing_v4_objects(conn)
+                still_missing = _validate_v4_completeness(conn)
+                if still_missing:
+                    raise SchemaVersionError(
+                        "history database is incomplete: version row claims v4 but "
+                        f"required objects are missing: {', '.join(still_missing)}"
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
         _reconcile_legacy_keys(conn)
         return
 
@@ -1272,7 +1559,7 @@ def record_refresh(
     quota_readings: list[QuotaReading] = []
     token_readings: list[TokenReading] = []
     summary: CodexSummary | None = None
-    avail: TokenAvailabilityRecord | None = None
+    avail_records: list[TokenAvailabilityRecord] = []
 
     for reading in readings:
         if isinstance(reading, QuotaReading):
@@ -1286,7 +1573,7 @@ def record_refresh(
         elif isinstance(reading, CodexSummary):
             summary = reading
         elif isinstance(reading, TokenAvailabilityRecord):
-            avail = reading
+            avail_records.append(reading)
 
     # Write quota observations
     for reading in quota_readings:
@@ -1311,8 +1598,8 @@ def record_refresh(
     if summary is not None:
         record_codex_summary(conn, summary, now=clock)
 
-    # Write the token availability observation — one per provider attempt
-    if avail is not None:
+    # Write token availability observations — one record per provider attempt
+    for avail in avail_records:
         record_token_availability(conn, avail, now=clock)
 
 
