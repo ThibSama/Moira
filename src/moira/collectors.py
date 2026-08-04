@@ -36,7 +36,6 @@ class ClaudeCollector:
                     observed_at=now,
                     source="claude-statusline",
                     status=HistoryStatus.UNSUPPORTED,
-                    detail="Claude does not expose a structured token surface",
                 ),
             ),
         )
@@ -109,7 +108,6 @@ class CodexCollector:
                         observed_at=now,
                         source="codex-app-server",
                         status=HistoryStatus.UNSUPPORTED,
-                        detail="codex CLI not found",
                     ),
                 ),
             )
@@ -145,7 +143,7 @@ class CodexCollector:
             quota_readings: list[QuotaReading] = []
             token_readings: list[TokenReading] = []
             codex_summary: CodexSummary | None = None
-            token_availability: TokenAvailabilityRecord | None = None
+            token_availability: TokenAvailabilityRecord
 
             # ── Rate limits (quota) — independent deadline ──
             rate_deadline = time.monotonic() + 10
@@ -206,7 +204,6 @@ class CodexCollector:
                         observed_at=now,
                         source=self.USAGE_SOURCE,
                         status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
-                        detail="Codex usage request rejected",
                     )
                 else:
                     daily, summary_parsed = parse_codex_usage(usage_response, now)
@@ -226,7 +223,6 @@ class CodexCollector:
                     observed_at=now,
                     source=self.USAGE_SOURCE,
                     status=HistoryStatus.INVALID,
-                    detail="Codex usage response malformed",
                 )
             except (OSError, TimeoutError, json.JSONDecodeError):
                 # Transport/provider failure → temporarily unavailable
@@ -235,16 +231,13 @@ class CodexCollector:
                     observed_at=now,
                     source=self.USAGE_SOURCE,
                     status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
-                    detail="Codex usage request failed",
                 )
 
             return CollectorResult(
                 quota_readings=tuple(quota_readings),
                 token_readings=tuple(token_readings),
                 codex_summary=codex_summary,
-                token_availability_records=(token_availability,)
-                if token_availability is not None
-                else (),
+                token_availability_records=(token_availability,),
             )
 
         except (OSError, TimeoutError, subprocess.SubprocessError, json.JSONDecodeError):
@@ -268,7 +261,6 @@ class CodexCollector:
                         observed_at=now,
                         source="codex-app-server",
                         status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
-                        detail="Codex app-server request failed",
                     ),
                 ),
             )

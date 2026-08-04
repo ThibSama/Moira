@@ -1729,14 +1729,12 @@ def test_token_availability_latest_status_per_service() -> None:
             observed_at=NOW,
             source="codex-app-server",
             status=HistoryStatus.INVALID,
-            detail="malformed",
         ),
         TokenAvailabilityRecord(
             service=Service.CODEX,
             observed_at=NOW + timedelta(minutes=1),
             source="codex-app-server",
             status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
-            detail="timeout",
         ),
     ]
     view = prepare_history_view(
@@ -1761,7 +1759,6 @@ def test_availability_never_hides_exact_data() -> None:
             observed_at=NOW + timedelta(minutes=1),
             source="codex-app-server",
             status=HistoryStatus.INVALID,
-            detail="malformed",
         ),
     ]
     view = prepare_history_view(

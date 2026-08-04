@@ -266,15 +266,20 @@ class TokenAvailabilityRecord:
     and never alters exact totals. One observation per (service, observed_at)
     — each provider attempt writes exactly one row.
 
-    The status is a frozen HistoryStatus value; detail is a sanitized
-    fixed string, never raw exception text.
+    The status is a frozen HistoryStatus value. No free-form detail is
+    accepted — raw exceptions are impossible by construction. The DB
+    column exists for backward compatibility but is always stored as ''.
     """
 
     service: Service
     observed_at: datetime
     source: str
     status: HistoryStatus
-    detail: str = ""
+
+    @property
+    def detail(self) -> str:
+        """Always returns '' — no free-form strings enter the system."""
+        return ""
 
     def __post_init__(self) -> None:
         if self.observed_at.tzinfo is None:
@@ -283,7 +288,6 @@ class TokenAvailabilityRecord:
             raise ValueError("source must not be empty")
         if not isinstance(self.status, HistoryStatus):
             raise ValueError("status must be a HistoryStatus value")
-        object.__setattr__(self, "detail", str(self.detail or ""))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -301,7 +305,6 @@ class TokenAvailabilityRecord:
             observed_at=datetime.fromisoformat(data["observed_at"]),
             source=str(data["source"]),
             status=HistoryStatus(data["status"]),
-            detail=str(data.get("detail", "")),
         )
 
 
@@ -324,3 +327,12 @@ class CollectorResult:
     token_readings: tuple[TokenReading, ...]
     codex_summary: CodexSummary | None = None
     token_availability_records: tuple[TokenAvailabilityRecord, ...] = ()
+
+    def __post_init__(self) -> None:
+        n_avail = len(self.token_availability_records)
+        if n_avail != 1:
+            raise ValueError(
+                f"CollectorResult must carry exactly one availability record, got {n_avail}"
+            )
+        # Verify the record's service matches this collector's expected service
+        # (enforced by the collector itself at construction time)

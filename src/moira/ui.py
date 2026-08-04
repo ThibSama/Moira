@@ -19,6 +19,7 @@ from .claude_integration import setup as setup_claude_integration
 from .collectors import ClaudeCollector, CodexCollector
 from .desktop import create_shortcut, remove_shortcut
 from .exhaustion import derive_state
+from .history import HistoryStatus
 from .history_db import HistoryCoordinator
 from .history_page import HistoryPage
 from .i18n import is_french, tr
@@ -408,7 +409,22 @@ class MainWindow(Adw.ApplicationWindow):
         try:
             result = future.result()
         except Exception:
-            result = CollectorResult(quota_readings=(), token_readings=())
+            # Unexpected collector failure: synthesize one sanitized
+            # TEMPORARILY_UNAVAILABLE record so the UI always has an
+            # availability state to display.
+            now = datetime.now(UTC)
+            result = CollectorResult(
+                quota_readings=(),
+                token_readings=(),
+                token_availability_records=(
+                    TokenAvailabilityRecord(
+                        service=Service.CODEX,
+                        observed_at=now,
+                        source="moira",
+                        status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
+                    ),
+                ),
+            )
         with self.pending_lock:
             self.pending.extend(result.quota_readings)
             self.pending_tokens.extend(result.token_readings)

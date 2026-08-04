@@ -2181,7 +2181,6 @@ def test_non_exact_status_persisted_via_availability(tmp_path: Path) -> None:
         observed_at=NOW,
         source="codex-app-server",
         status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
-        detail="test",
     )
     record_token_availability(conn, avail, now=NOW)
     rows = query_token(conn, since=NOW - timedelta(hours=1))
@@ -2189,7 +2188,7 @@ def test_non_exact_status_persisted_via_availability(tmp_path: Path) -> None:
     avail_rows = query_token_availability(conn, since=NOW - timedelta(hours=1))
     assert len(avail_rows) == 1
     assert avail_rows[0].status is HistoryStatus.TEMPORARILY_UNAVAILABLE
-    assert avail_rows[0].detail == "test"
+    assert avail_rows[0].detail == ""  # detail is always empty string
     conn.close()
 
 
@@ -2209,7 +2208,6 @@ def test_availability_coexists_with_exact_data(tmp_path: Path) -> None:
         observed_at=NOW + timedelta(minutes=5),
         source="codex-app-server",
         status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
-        detail="transient failure",
     )
     record_token_availability(conn, avail, now=NOW + timedelta(minutes=5))
 
@@ -2655,16 +2653,17 @@ def test_claude_unsupported_does_not_hide_codex_data(tmp_path: Path) -> None:
 
 
 def test_v4_manifest_indexes_exist_after_fresh_create(tmp_path: Path) -> None:
-    """Fresh v4 database has all required indexes."""
+    """Fresh v4 database has all required indexes with correct columns."""
     conn = _db(tmp_path)
-    from moira.history_db import V4_MANIFEST
+    from moira.history_db import V4_CONTRACT
 
-    indexes_manifest: list[str] = V4_MANIFEST["indexes"]  # type: ignore[assignment]
-    for idx in indexes_manifest:
-        assert (
-            conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (idx,)
-            ).fetchone()
-            is not None
-        ), f"index {idx} missing"
+    for table_spec in V4_CONTRACT.tables:
+        for idx_spec in table_spec.indexes:
+            assert (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                    (idx_spec.name,),
+                ).fetchone()
+                is not None
+            ), f"index {idx_spec.name} missing"
     conn.close()

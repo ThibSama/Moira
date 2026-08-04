@@ -152,7 +152,7 @@ def test_usage_failure_preserves_quota() -> None:
     assert len(result.token_readings) == 0
     assert result.token_availability_records[0] is not None
     assert result.token_availability_records[0].status is HistoryStatus.TEMPORARILY_UNAVAILABLE
-    assert result.token_availability_records[0].detail == "Codex usage request failed"
+    assert result.token_availability_records[0].detail == ""  # always empty string
 
 
 def test_usage_rpc_error_preserves_quota() -> None:
@@ -180,7 +180,7 @@ def test_usage_rpc_error_preserves_quota() -> None:
     assert len(result.token_readings) == 0
     assert result.token_availability_records[0] is not None
     assert result.token_availability_records[0].status is HistoryStatus.TEMPORARILY_UNAVAILABLE
-    assert result.token_availability_records[0].detail == "Codex usage request rejected"
+    assert result.token_availability_records[0].detail == ""  # always empty string
 
 
 def test_usage_parse_error_produces_invalid() -> None:
@@ -208,7 +208,7 @@ def test_usage_parse_error_produces_invalid() -> None:
     assert len(result.token_readings) == 0
     assert result.token_availability_records[0] is not None
     assert result.token_availability_records[0].status is HistoryStatus.INVALID
-    assert result.token_availability_records[0].detail == "Codex usage response malformed"
+    assert result.token_availability_records[0].detail == ""  # always empty string
 
 
 def test_timeout_terminates_process_group_and_sanitizes_error() -> None:

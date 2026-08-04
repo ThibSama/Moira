@@ -30,6 +30,7 @@ import os
 import re
 import sqlite3
 import threading
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -539,82 +540,387 @@ CREATE TABLE IF NOT EXISTS codex_summaries (
 
 REQUIRED_V3_TABLES = ("schema_meta", "quota_observations", "token_events")
 
-REQUIRED_V4_TABLES = (
-    "schema_meta",
-    "quota_observations",
-    "token_events",
-    "codex_summaries",
-    "token_availability",
+# ── Typed v4 schema contract ──────────────────────────────────────────────
+#
+# Every table, column, type, constraint and index that must be present for a
+# database to be accepted as v4.  Validation reads PRAGMA table_info/index_list/
+# index_info — it never trusts a name alone.
+
+
+@dataclass(frozen=True, slots=True)
+class V4ColumnSpec:
+    """Spec for one required column in a v4 table."""
+
+    name: str
+    affinity: str  # TEXT | INTEGER | REAL
+    not_null: bool
+    default: str | None  # SQL default value literal, or None
+    pk_order: int | None  # 1-based position in primary key, None if not PK
+
+
+@dataclass(frozen=True, slots=True)
+class V4IndexSpec:
+    """Spec for one required index on a v4 table."""
+
+    name: str
+    table: str
+    columns: tuple[str, ...]
+    unique: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class V4TableSpec:
+    """Complete spec for one required v4 table."""
+
+    name: str
+    columns: tuple[V4ColumnSpec, ...]
+    indexes: tuple[V4IndexSpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class V4Contract:
+    """Immutable v4 schema contract: every table, column, type, constraint, and index.
+
+    Validation reads every object through PRAGMA table_info/index_list/index_info
+    and sqlite_master — an object is never accepted solely because its name exists.
+    """
+
+    tables: tuple[V4TableSpec, ...]
+
+
+V4_CONTRACT = V4Contract(
+    tables=(
+        V4TableSpec(
+            name="schema_meta",
+            columns=(
+                V4ColumnSpec(
+                    name="version",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=1,
+                ),
+            ),
+            indexes=(),
+        ),
+        V4TableSpec(
+            name="quota_observations",
+            columns=(
+                V4ColumnSpec(
+                    name="id",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=1,
+                ),
+                V4ColumnSpec(
+                    name="service",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="quota_label",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="percentage",
+                    affinity="REAL",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="reset_at",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="observed_at",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="source",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="bucket",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="status",
+                    affinity="TEXT",
+                    not_null=True,
+                    default="'available_exact'",
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="is_change",
+                    affinity="INTEGER",
+                    not_null=True,
+                    default="1",
+                    pk_order=None,
+                ),
+            ),
+            indexes=(
+                V4IndexSpec(
+                    name="idx_quota_obs_time",
+                    table="quota_observations",
+                    columns=("observed_at",),
+                ),
+                V4IndexSpec(
+                    name="idx_quota_obs_service",
+                    table="quota_observations",
+                    columns=("service", "quota_label"),
+                ),
+            ),
+        ),
+        V4TableSpec(
+            name="token_events",
+            columns=(
+                V4ColumnSpec(
+                    name="event_key",
+                    affinity="TEXT",
+                    not_null=False,
+                    default=None,
+                    pk_order=1,
+                ),
+                V4ColumnSpec(
+                    name="service",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="period_start",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="period_kind",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="observed_at",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="source",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="status",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="input_tokens",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="cached_input_tokens",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="output_tokens",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="reasoning_output_tokens",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="total_tokens",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=None,
+                ),
+            ),
+            indexes=(
+                V4IndexSpec(
+                    name="idx_token_events_time",
+                    table="token_events",
+                    columns=("observed_at",),
+                ),
+                V4IndexSpec(
+                    name="idx_token_events_service",
+                    table="token_events",
+                    columns=("service",),
+                ),
+                V4IndexSpec(
+                    name="idx_token_events_period",
+                    table="token_events",
+                    columns=("period_start",),
+                ),
+            ),
+        ),
+        V4TableSpec(
+            name="codex_summaries",
+            columns=(
+                V4ColumnSpec(
+                    name="service",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=1,
+                ),
+                V4ColumnSpec(
+                    name="observed_at",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=2,
+                ),
+                V4ColumnSpec(
+                    name="source",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="lifetime_tokens",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="peak_daily_tokens",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="current_streak_days",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="longest_streak_days",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="longest_running_turn_sec",
+                    affinity="INTEGER",
+                    not_null=False,
+                    default=None,
+                    pk_order=None,
+                ),
+            ),
+            indexes=(
+                V4IndexSpec(
+                    name="idx_codex_summaries_time",
+                    table="codex_summaries",
+                    columns=("observed_at",),
+                ),
+            ),
+        ),
+        V4TableSpec(
+            name="token_availability",
+            columns=(
+                V4ColumnSpec(
+                    name="service",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=1,
+                ),
+                V4ColumnSpec(
+                    name="observed_at",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=2,
+                ),
+                V4ColumnSpec(
+                    name="source",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="status",
+                    affinity="TEXT",
+                    not_null=True,
+                    default=None,
+                    pk_order=None,
+                ),
+                V4ColumnSpec(
+                    name="detail",
+                    affinity="TEXT",
+                    not_null=True,
+                    default="''",
+                    pk_order=None,
+                ),
+            ),
+            indexes=(
+                V4IndexSpec(
+                    name="idx_token_avail_service",
+                    table="token_availability",
+                    columns=("service",),
+                ),
+                V4IndexSpec(
+                    name="idx_token_avail_time",
+                    table="token_availability",
+                    columns=("observed_at",),
+                ),
+            ),
+        ),
+    ),
 )
 
-# v4 completeness manifest: every table, column, constraint and index that must
-# be present for a v4 database to be considered complete.
-V4_MANIFEST: dict[str, object] = {
-    "tables": {
-        "schema_meta": {"columns": ("version",)},
-        "quota_observations": {
-            "columns": (
-                "id",
-                "service",
-                "quota_label",
-                "percentage",
-                "reset_at",
-                "observed_at",
-                "source",
-                "bucket",
-                "status",
-                "is_change",
-            ),
-        },
-        "token_events": {
-            "columns": (
-                "event_key",
-                "service",
-                "period_start",
-                "period_kind",
-                "observed_at",
-                "source",
-                "status",
-                "input_tokens",
-                "cached_input_tokens",
-                "output_tokens",
-                "reasoning_output_tokens",
-                "total_tokens",
-            ),
-        },
-        "codex_summaries": {
-            "columns": (
-                "service",
-                "observed_at",
-                "source",
-                "lifetime_tokens",
-                "peak_daily_tokens",
-                "current_streak_days",
-                "longest_streak_days",
-                "longest_running_turn_sec",
-            ),
-        },
-        "token_availability": {
-            "columns": (
-                "service",
-                "observed_at",
-                "source",
-                "status",
-                "detail",
-            ),
-        },
-    },
-    "indexes": [
-        "idx_quota_obs_time",
-        "idx_quota_obs_service",
-        "idx_token_events_time",
-        "idx_token_events_service",
-        "idx_token_events_period",
-        "idx_codex_summaries_time",
-        "idx_token_avail_service",
-        "idx_token_avail_time",
-    ],
-}
+# Convenience set of required table names derived from the contract.
+REQUIRED_V4_TABLES: tuple[str, ...] = tuple(t.name for t in V4_CONTRACT.tables)
 
 # Historical Package 3b v3 DDL: token_events + quota but NO codex_summaries.
 # Represents the shape a real Package 3b database had before codex_summaries
@@ -731,39 +1037,134 @@ def _index_present(conn: sqlite3.Connection, index: str) -> bool:
     )
 
 
-def _validate_v4_completeness(conn: sqlite3.Connection) -> list[str]:
-    """Validate the complete v4 manifest and return a list of missing objects.
+def _validate_v4_semantics(conn: sqlite3.Connection) -> list[str]:
+    """Validate the complete v4 schema contract and return a list of violations.
 
-    Checks tables, columns, and indexes against ``V4_MANIFEST``. If the
-    returned list is empty, the database is a complete v4 instance.
+    Uses PRAGMA table_info for column names, types, nullability, defaults
+    and primary-key membership; PRAGMA index_list + PRAGMA index_info for
+    index existence and columns; sqlite_master for UNIQUE constraints.
+    Every object is validated by content, never by name alone.
     """
-    tables_manifest: dict[str, dict[str, object]] = V4_MANIFEST["tables"]  # type: ignore[assignment]
-    indexes_manifest: list[str] = V4_MANIFEST["indexes"]  # type: ignore[assignment]
-    missing: list[str] = []
+    violations: list[str] = []
 
-    existing_tables: set[str] = {
-        row[0]
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    }
+    for table_spec in V4_CONTRACT.tables:
+        table_name = table_spec.name
 
-    for table_name, spec in tables_manifest.items():
-        if table_name not in existing_tables:
-            missing.append(f"table {table_name}")
+        if not _table_present(conn, table_name):
+            violations.append(f"table {table_name} missing")
             continue
-        # Validate columns
-        columns_spec: tuple[str, ...] = spec["columns"]  # type: ignore[assignment]
-        existing_cols: set[str] = {
-            row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-        }
-        for col in columns_spec:
-            if col not in existing_cols:
-                missing.append(f"column {table_name}.{col}")
 
-    for index_name in indexes_manifest:
-        if not _index_present(conn, index_name):
-            missing.append(f"index {index_name}")
+        # Column validation via PRAGMA table_info
+        actual_cols = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        actual_by_name: dict[str, Any] = {row[1]: row for row in actual_cols}
 
-    return missing
+        for col_spec in table_spec.columns:
+            actual = actual_by_name.get(col_spec.name)
+            if actual is None:
+                violations.append(f"column {table_name}.{col_spec.name} missing")
+                continue
+
+            col_type = (actual[2] or "").upper()
+            if col_type != col_spec.affinity:
+                violations.append(
+                    f"column {table_name}.{col_spec.name} type {col_type} "
+                    f"expected {col_spec.affinity}"
+                )
+
+            actual_notnull = bool(actual[3])
+            if actual_notnull != col_spec.not_null:
+                violations.append(
+                    f"column {table_name}.{col_spec.name} notnull={actual_notnull} "
+                    f"expected {col_spec.not_null}"
+                )
+
+            actual_default = actual[4]
+            expected_default = col_spec.default
+            if actual_default != expected_default:
+                violations.append(
+                    f"column {table_name}.{col_spec.name} default={actual_default!r} "
+                    f"expected {expected_default!r}"
+                )
+
+            actual_pk = int(actual[5]) if actual[5] else 0
+            expected_pk = col_spec.pk_order or 0
+            if bool(actual_pk) != bool(expected_pk):
+                violations.append(
+                    f"column {table_name}.{col_spec.name} in PK={bool(actual_pk)} "
+                    f"expected {bool(expected_pk)}"
+                )
+            elif actual_pk and expected_pk and actual_pk != expected_pk:
+                violations.append(
+                    f"column {table_name}.{col_spec.name} PK order {actual_pk} "
+                    f"expected {expected_pk}"
+                )
+
+        # Composite PK validation
+        expected_pk_cols = tuple(c.name for c in table_spec.columns if c.pk_order is not None)
+        actual_pk_cols = tuple(
+            row[1] for row in sorted([r for r in actual_cols if r[5]], key=lambda r: int(r[5]))
+        )
+        if actual_pk_cols != expected_pk_cols:
+            violations.append(
+                f"table {table_name} PK columns {list(actual_pk_cols)} "
+                f"expected {list(expected_pk_cols)}"
+            )
+
+        # Index validation via PRAGMA index_list + index_info
+        actual_indexes = conn.execute(f"PRAGMA index_list({table_name})").fetchall()
+        actual_idx_by_name: dict[str, Any] = {row[1]: row for row in actual_indexes}
+
+        for idx_spec in table_spec.indexes:
+            actual_idx = actual_idx_by_name.get(idx_spec.name)
+            if actual_idx is None:
+                violations.append(f"index {idx_spec.name} missing")
+                continue
+
+            idx_cols = conn.execute(f"PRAGMA index_info({idx_spec.name})").fetchall()
+            actual_columns = tuple(row[2] for row in sorted(idx_cols, key=lambda r: r[0]))
+            if actual_columns != idx_spec.columns:
+                violations.append(
+                    f"index {idx_spec.name} columns {list(actual_columns)} "
+                    f"expected {list(idx_spec.columns)}"
+                )
+
+    # Validate quota_replay UNIQUE constraint
+    _check_unique_constraint(
+        conn,
+        violations,
+        "quota_observations",
+        ("service", "quota_label", "bucket", "observed_at"),
+    )
+
+    return violations
+
+
+def _check_unique_constraint(
+    conn: sqlite3.Connection,
+    violations: list[str],
+    table: str,
+    columns: tuple[str, ...],
+) -> None:
+    """Verify that a UNIQUE constraint exists covering the given columns."""
+    ddl_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    if ddl_row is None:
+        return
+    ddl = ddl_row[0] or ""
+    if "UNIQUE" not in ddl.upper():
+        violations.append(f"table {table} missing UNIQUE constraint")
+        return
+    for col in columns:
+        if col not in ddl:
+            violations.append(f"table {table} UNIQUE constraint missing column {col}")
+            return
+
+
+def _validate_v4_completeness(conn: sqlite3.Connection) -> list[str]:
+    """Thin wrapper around _validate_v4_semantics for backward compatibility."""
+    return _validate_v4_semantics(conn)
 
 
 def _has_all_v4_tables(conn: sqlite3.Connection) -> bool:
@@ -772,11 +1173,17 @@ def _has_all_v4_tables(conn: sqlite3.Connection) -> bool:
 
 
 def _create_missing_v4_objects(conn: sqlite3.Connection) -> None:
-    """Create every v4 addition that is missing from the current database.
+    """Create or repair every v4 addition that is missing or incorrect.
 
     Idempotent and transactional: only creates explicitly additive objects
-    (tables and indexes that don't exist). Never drops, renames, or alters
-    existing objects. Called inside an existing transaction.
+    (tables and non-unique secondary indexes that don't exist or have wrong
+    columns). Never drops, renames, or alters existing tables, primary keys
+    or UNIQUE constraints. Called inside an existing transaction.
+
+    Per criterion 5: missing or incorrect non-unique secondary indexes are
+    recreated (DROP INDEX + CREATE INDEX). Incompatible table semantics
+    (wrong PK, wrong affinity, missing UNIQUE) are never repaired silently
+    — they fail closed through semantic validation.
     """
     if not _table_present(conn, "codex_summaries"):
         conn.execute(
@@ -797,10 +1204,8 @@ CREATE TABLE codex_summaries (
             "CREATE INDEX IF NOT EXISTS idx_codex_summaries_time ON codex_summaries (observed_at)"
         )
     else:
-        # Table exists but index may be missing
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_codex_summaries_time ON codex_summaries (observed_at)"
-        )
+        # Table exists — repair missing or incorrect index
+        _repair_index(conn, "idx_codex_summaries_time", "codex_summaries", ("observed_at",))
 
     if not _table_present(conn, "token_availability"):
         conn.execute(
@@ -821,12 +1226,35 @@ CREATE TABLE token_availability (
             "CREATE INDEX IF NOT EXISTS idx_token_avail_time ON token_availability (observed_at)"
         )
     else:
+        _repair_index(conn, "idx_token_avail_service", "token_availability", ("service",))
+        _repair_index(conn, "idx_token_avail_time", "token_availability", ("observed_at",))
+
+
+def _repair_index(
+    conn: sqlite3.Connection,
+    index_name: str,
+    table_name: str,
+    expected_columns: tuple[str, ...],
+) -> None:
+    """Ensure a non-unique secondary index exists with the correct columns.
+
+    If the index is missing, create it. If it exists but has wrong columns,
+    drop and recreate. Never modifies UNIQUE indexes (those imply a semantic
+    constraint that can't be safely repaired).
+    """
+    if not _index_present(conn, index_name):
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_token_avail_service ON token_availability (service)"
+            f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} "
+            f"({', '.join(expected_columns)})"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_token_avail_time ON token_availability (observed_at)"
-        )
+        return
+
+    # Check columns
+    idx_cols = conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+    actual_columns = tuple(row[2] for row in sorted(idx_cols, key=lambda r: r[0]))
+    if actual_columns != expected_columns:
+        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+        conn.execute(f"CREATE INDEX {index_name} ON {table_name} ({', '.join(expected_columns)})")
 
 
 def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
@@ -986,6 +1414,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
             stmt = statement.strip()
             if stmt:
                 conn.execute(stmt)
+        # Validate the semantic v4 contract before committing the version row.
+        violations = _validate_v4_semantics(conn)
+        if violations:
+            raise SchemaVersionError(
+                "fresh v4 database failed semantic validation: " + "; ".join(violations)
+            )
         conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
         conn.execute("COMMIT")
     except Exception:
@@ -1465,7 +1899,6 @@ def query_token_availability(
             observed_at=datetime.fromisoformat(row[1]),
             source=row[2],
             status=HistoryStatus(row[3]),
-            detail=row[4],
         )
         for row in rows
     ]
