@@ -9,15 +9,28 @@ stable deterministic event key (PRIMARY KEY), allowing several events per
 15-minute bucket and idempotent replay/upsert. The v2 UNIQUE(service,bucket)
 constraint is removed. Daily usage buckets and migrated v2 buckets coexist
 with distinct period_kind values.
+
+Package 3c additions (schema stays v3):
+- ``codex_summaries``: one typed official summary record per refresh —
+  never duplicated onto daily buckets.
+- Canonical daily event keys are provider/service/period-kind/day, without
+  any source digest, so a source wording change updates the same row.
+- Legacy Package 3/3b source-digest keys are reconciled to canonical keys.
+- Range/retention boundaries are period-kind-aware: daily rows compare the
+  ``YYYY-MM-DD`` day string, migrated bucket rows compare the full ISO
+  bucket instant. ``observed_at`` remains retrieval provenance.
+- Incomplete databases are never labeled v3: a metadata table with no
+  version row is repaired transactionally only when every v3 table exists,
+  otherwise the schema fails closed.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
+import re
 import sqlite3
 import threading
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +41,7 @@ from .history import (
     SchemaVersionError,
     TokenObservation,
 )
-from .models import Service, TokenReading
+from .models import CodexSummary, Service, TokenReading
 from .persistence import state_dir
 
 SCHEMA_VERSION = 3
@@ -102,6 +115,18 @@ CREATE TABLE IF NOT EXISTS token_events (
 CREATE INDEX IF NOT EXISTS idx_token_events_time ON token_events (observed_at);
 CREATE INDEX IF NOT EXISTS idx_token_events_service ON token_events (service);
 CREATE INDEX IF NOT EXISTS idx_token_events_period ON token_events (period_start);
+CREATE TABLE IF NOT EXISTS codex_summaries (
+    service                 TEXT    NOT NULL,
+    observed_at             TEXT    NOT NULL,
+    source                  TEXT    NOT NULL,
+    lifetime_tokens         INTEGER,
+    peak_daily_tokens       INTEGER,
+    current_streak_days     INTEGER,
+    longest_streak_days     INTEGER,
+    longest_running_turn_sec INTEGER,
+    PRIMARY KEY (service, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_codex_summaries_time ON codex_summaries (observed_at);
 """
 
 SCHEMA_SQL_V2 = """\
@@ -186,19 +211,101 @@ def _bucket(dt: datetime) -> str:
     return bucket_dt.isoformat()
 
 
-def _source_digest(source: str) -> str:
-    """Return a short deterministic digest of a source string for event keys."""
-    return hashlib.sha256(source.encode()).hexdigest()[:12]
+def _make_event_key(service: Service, period_kind: str, period_start: date | datetime) -> str:
+    """Build the canonical event key: provider/service/period-kind/day.
 
-
-def _make_usage_event_key(service: Service, day: date, source: str) -> str:
-    """Build a stable deterministic event key for a daily usage event."""
-    return f"{service.value}:u:{day.isoformat()}:{_source_digest(source)}"
+    Deliberately independent of the display source: a source wording change
+    (or rename) updates the same row via INSERT OR REPLACE instead of
+    duplicating one logical service/day. Daily rows use ``YYYY-MM-DD``;
+    migrated bucket rows use the full ISO bucket instant.
+    """
+    return f"{service.value}:{period_kind}:{period_start.isoformat()}"
 
 
 def _make_migrated_event_key(service: str, bucket: str) -> str:
     """Build a stable event key for a migrated v2 token observation."""
     return f"{service}:b:{bucket}"
+
+
+def _serialize_period_start(period_start: datetime, period_kind: str) -> str:
+    """Serialize a period start for storage.
+
+    Daily rows store ``YYYY-MM-DD`` (string-comparable against day
+    boundaries); migrated bucket rows store the full ISO instant.
+    """
+    if period_kind == "day":
+        return period_start.date().isoformat()
+    return period_start.isoformat()
+
+
+def _parse_period_start(raw: str, period_kind: str) -> datetime:
+    """Parse a stored period start back into a UTC datetime.
+
+    Daily rows are midnight UTC of the activity day; bucket rows carry
+    their own offset (stored normalized to UTC).
+    """
+    if period_kind == "day":
+        return datetime.combine(date.fromisoformat(raw), time.min, tzinfo=UTC)
+    return datetime.fromisoformat(raw)
+
+
+# Legacy Package 3/3b daily key shape: ``codex:u:2026-08-04:<digest12>``.
+_LEGACY_DAILY_KEY_RE = re.compile(r"^[a-z]+:u:\d{4}-\d{2}-\d{2}:[0-9a-f]{12}$")
+
+
+def _reconcile_legacy_keys(conn: sqlite3.Connection) -> int:
+    """Collapse Package 3/3b source-digest event keys into canonical keys.
+
+    Legacy daily keys look like ``codex:u:2026-08-04:<digest12>``; the
+    canonical identity is ``codex:d:2026-08-04``. When several legacy
+    aliases map to one day, the newest observed_at wins. A canonical row
+    that is at least as new as the legacy alias is preserved untouched.
+    Idempotent: after the first pass no legacy keys remain. Returns the
+    number of rows reconciled.
+    """
+    rows = conn.execute(
+        "SELECT event_key, service, period_start, period_kind, observed_at, source, status, "
+        "input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens "
+        "FROM token_events ORDER BY observed_at ASC"
+    ).fetchall()
+    legacy = [row for row in rows if _LEGACY_DAILY_KEY_RE.match(str(row[0]))]
+    if not legacy:
+        return 0
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        reconciled = 0
+        for row in legacy:
+            event_key, service, period_start, _kind, observed_at, source, status = row[:7]
+            token_values = row[7:]
+            canonical = f"{service}:day:{period_start}"
+            existing = conn.execute(
+                "SELECT observed_at FROM token_events WHERE event_key = ?", (canonical,)
+            ).fetchone()
+            if existing is not None and existing[0] >= observed_at:
+                # Canonical row is at least as new — drop the legacy alias
+                conn.execute("DELETE FROM token_events WHERE event_key = ?", (event_key,))
+                continue
+            # Legacy alias is newer: replace any older canonical row
+            conn.execute("DELETE FROM token_events WHERE event_key = ?", (canonical,))
+            conn.execute(
+                "INSERT INTO token_events "
+                "(event_key, service, period_start, period_kind, observed_at, source, "
+                "status, input_tokens, cached_input_tokens, output_tokens, "
+                "reasoning_output_tokens, total_tokens) "
+                "VALUES (?, ?, ?, 'day', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (canonical, service, period_start, observed_at, source, status, *token_values),
+            )
+            conn.execute("DELETE FROM token_events WHERE event_key = ?", (event_key,))
+            reconciled += 1
+        conn.execute("COMMIT")
+        return reconciled
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
 
 
 def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
@@ -259,10 +366,23 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
 
     Preserves all existing token_observations rows as token_events with
     stable event keys derived from (service, bucket). Rolls back fully
-    on any failure.
+    on any failure. The v3 database is never labeled complete without its
+    required tables: a missing quota_observations table aborts the
+    migration (rollback keeps the v2 version row).
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Fail closed: v3 requires quota_observations. A v2 database missing
+        # it is incomplete and must never be labeled v3.
+        has_quota = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='quota_observations'"
+            ).fetchone()
+            is not None
+        )
+        if not has_quota:
+            raise SchemaVersionError("history database is incomplete: quota_observations missing")
+
         # Check if token_observations exists (it might not if v2 was clean)
         has_v2_tokens = (
             conn.execute(
@@ -297,6 +417,23 @@ CREATE TABLE IF NOT EXISTS token_events (
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_token_events_period ON token_events (period_start)"
+        )
+        conn.execute(
+            """\
+CREATE TABLE IF NOT EXISTS codex_summaries (
+    service                 TEXT    NOT NULL,
+    observed_at             TEXT    NOT NULL,
+    source                  TEXT    NOT NULL,
+    lifetime_tokens         INTEGER,
+    peak_daily_tokens       INTEGER,
+    current_streak_days     INTEGER,
+    longest_streak_days     INTEGER,
+    longest_running_turn_sec INTEGER,
+    PRIMARY KEY (service, observed_at)
+)"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_summaries_time ON codex_summaries (observed_at)"
         )
 
         # Migrate existing v2 token rows
@@ -340,6 +477,18 @@ CREATE TABLE IF NOT EXISTS token_events (
         raise
 
 
+REQUIRED_V3_TABLES = ("schema_meta", "quota_observations", "token_events")
+
+
+def _has_all_v3_tables(conn: sqlite3.Connection) -> bool:
+    """Return True when every table required by schema v3 exists."""
+    present = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    return all(table in present for table in REQUIRED_V3_TABLES)
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Initialize or migrate the schema. Throws on irrecoverable mismatch.
 
@@ -349,6 +498,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
     non-v3 database — migrations run their own targeted DDL inside explicit
     transactions. Failed migration leaves version, tables, indexes and rows
     exactly as they were before.
+
+    Fail-closed completeness: an incomplete database is never labeled v3.
+    A metadata table with no version row is repaired transactionally only
+    when every v3 table exists; otherwise (or when a version row claims v3
+    but tables are missing) init_schema raises SchemaVersionError.
     """
     # Detect the existing version before creating anything
     has_meta = (
@@ -360,21 +514,45 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if has_meta:
         row = conn.execute("SELECT version FROM schema_meta").fetchone()
         if row is None:
-            # Table exists but no version row — insert for a fresh v3
-            conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
+            # Table exists but no version row. Repair transactionally only
+            # when the v3 tables are complete; otherwise fail closed.
+            if not _has_all_v3_tables(conn):
+                raise SchemaVersionError(
+                    "history database is incomplete: cannot label it v3 without all required tables"
+                )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
             return
         if row[0] == 1:
             _migrate_v1_to_v2(conn)
             _migrate_v2_to_v3(conn)
+            _reconcile_legacy_keys(conn)
             return
         if row[0] == 2:
             _migrate_v2_to_v3(conn)
+            _reconcile_legacy_keys(conn)
             return
         if row[0] != SCHEMA_VERSION:
             raise SchemaVersionError(
                 f"history database schema version {row[0]} does not match expected {SCHEMA_VERSION}"
             )
-        return  # Already at v3
+        # Already at v3: verify completeness — never trust a version label
+        # on a database missing required tables.
+        if not _has_all_v3_tables(conn):
+            raise SchemaVersionError(
+                "history database is incomplete: version row claims v3 but "
+                "required tables are missing"
+            )
+        _reconcile_legacy_keys(conn)
+        return
 
     # Fresh database: create v3 directly
     conn.executescript(SCHEMA_SQL_V3)
@@ -484,16 +662,17 @@ def record_token(
 ) -> bool:
     """Record a token observation as a token_events row (v3 schema compat).
 
-    Generates a stable event key from (service, bucket) for deduplication.
-    Returns True. Purges old rows after a successful write.
+    Generates the canonical event key from (service, period_kind,
+    period_start) for idempotent upsert. Returns True. Purges old rows
+    after a successful write.
 
     Only total_tokens is populated; breakdown columns are NULL (schema v3
     columns retained for backward compatibility but no longer written).
     """
     clock = now or datetime.now(UTC)
-    bucket = _bucket(obs.observed_at)
+    period_start_iso = _serialize_period_start(obs.period_start, obs.period_kind)
     observed_iso = obs.observed_at.isoformat()
-    event_key = _make_migrated_event_key(obs.service.value, bucket)
+    event_key = _make_event_key(obs.service, obs.period_kind, obs.period_start)
 
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -502,11 +681,12 @@ def record_token(
             "(event_key, service, period_start, period_kind, observed_at, source, "
             "status, input_tokens, cached_input_tokens, output_tokens, "
             "reasoning_output_tokens, total_tokens) "
-            "VALUES (?, ?, ?, 'bucket', ?, ?, ?, NULL, NULL, NULL, NULL, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)",
             (
                 event_key,
                 obs.service.value,
-                bucket,
+                period_start_iso,
+                obs.period_kind,
                 observed_iso,
                 obs.source,
                 obs.status.value,
@@ -532,13 +712,17 @@ def record_token_events(
 ) -> int:
     """Record validated daily token usage readings as token_events.
 
-    Each TokenReading produces one token_events row with a stable event key
-    derived from (service, day, source). Idempotent: replay of the same
-    (service, day, source) upserts the values via INSERT OR REPLACE.
+    Each TokenReading produces one token_events row with the canonical event
+    key derived from (service, period_kind='day', day) — independent of the
+    display source, so a source wording change updates the same row via
+    INSERT OR REPLACE. Idempotent: replay of the same (service, day) upserts
+    the values.
 
-    Only readings with status ``available_exact`` and a non-None tokens
-    value are stored. Non-available, error, and empty readings are skipped
-    silently.
+    Availability policy: AVAILABLE_EXACT readings always upsert the canonical
+    row. Non-exact statuses (UNSUPPORTED, TEMPORARILY_UNAVAILABLE, INVALID)
+    are persisted as sanitized secondary state on the same canonical key, but
+    they never replace an existing exact row for that day — older exact data
+    is never hidden. A later exact reading replaces any non-exact row.
 
     Returns the number of events written. Purges old rows after write.
     """
@@ -551,26 +735,50 @@ def record_token_events(
         for reading in readings:
             if not isinstance(reading, TokenReading):
                 continue
-            if reading.status != "available_exact":
-                continue
-            if reading.tokens is None:
+
+            event_key = _make_event_key(reading.service, "day", reading.day)
+
+            if reading.status is HistoryStatus.AVAILABLE_EXACT:
+                if reading.tokens is None:
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO token_events "
+                    "(event_key, service, period_start, period_kind, observed_at, source, "
+                    "status, input_tokens, cached_input_tokens, output_tokens, "
+                    "reasoning_output_tokens, total_tokens) "
+                    "VALUES (?, ?, ?, 'day', ?, ?, 'available_exact', NULL, NULL, NULL, NULL, ?)",
+                    (
+                        event_key,
+                        reading.service.value,
+                        reading.day.isoformat(),
+                        observed_iso,
+                        reading.source,
+                        reading.tokens,
+                    ),
+                )
+                written += 1
                 continue
 
-            event_key = _make_usage_event_key(reading.service, reading.day, reading.source)
-
+            # Non-exact availability: sanitized secondary state on the same
+            # canonical day key. Never hide older exact data.
+            existing = conn.execute(
+                "SELECT status FROM token_events WHERE event_key = ?", (event_key,)
+            ).fetchone()
+            if existing is not None and existing[0] == "available_exact":
+                continue
             conn.execute(
                 "INSERT OR REPLACE INTO token_events "
                 "(event_key, service, period_start, period_kind, observed_at, source, "
                 "status, input_tokens, cached_input_tokens, output_tokens, "
                 "reasoning_output_tokens, total_tokens) "
-                "VALUES (?, ?, ?, 'day', ?, ?, 'available_exact', NULL, NULL, NULL, NULL, ?)",
+                "VALUES (?, ?, ?, 'day', ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
                 (
                     event_key,
                     reading.service.value,
                     reading.day.isoformat(),
                     observed_iso,
                     reading.source,
-                    reading.tokens,
+                    reading.status.value,
                 ),
             )
             written += 1
@@ -589,17 +797,29 @@ def record_token_events(
 def _purge(conn: sqlite3.Connection, now: datetime) -> int:
     """Delete rows older than 90 days. Returns count of deleted rows.
 
-    Token events use period_start (logical day), not observed_at
-    (retrieval time), as the retention boundary.
+    Boundaries are period-kind-aware:
+    - Daily token rows compare the ``YYYY-MM-DD`` period_start day string
+      against the 90-day-old day — a row exactly 90 days old is kept.
+    - Migrated bucket rows compare the full ISO bucket instant.
+    Quota rows use observed_at (retrieval time) as before.
     """
-    boundary = (now - timedelta(days=RETENTION_DAYS)).isoformat()
+    day_boundary = (now - timedelta(days=RETENTION_DAYS)).date().isoformat()
+    instant_boundary = (now - timedelta(days=RETENTION_DAYS)).isoformat()
     quota_deleted = conn.execute(
-        "DELETE FROM quota_observations WHERE observed_at < ?", (boundary,)
+        "DELETE FROM quota_observations WHERE observed_at < ?", (instant_boundary,)
     ).rowcount
     token_deleted = conn.execute(
-        "DELETE FROM token_events WHERE period_start < ?", (boundary,)
+        "DELETE FROM token_events WHERE period_kind = 'day' AND period_start < ?",
+        (day_boundary,),
     ).rowcount
-    return quota_deleted + token_deleted
+    token_deleted += conn.execute(
+        "DELETE FROM token_events WHERE period_kind = 'bucket' AND period_start < ?",
+        (instant_boundary,),
+    ).rowcount
+    summary_deleted = conn.execute(
+        "DELETE FROM codex_summaries WHERE observed_at < ?", (instant_boundary,)
+    ).rowcount
+    return quota_deleted + token_deleted + summary_deleted
 
 
 def query_quota(
@@ -648,72 +868,166 @@ def query_token(
 ) -> list[TokenObservation]:
     """Return token observations since a given UTC time, optionally filtered.
 
-    Range filtering uses period_start (the logical day boundary), not
-    observed_at (retrieval time). Reads from token_events (v3) table.
-    Only total_tokens is populated; breakdown columns exist in the schema
-    but are no longer written.
+    Range filtering is period-kind-aware: daily rows compare the
+    ``YYYY-MM-DD`` period_start day string against ``since.date()``;
+    migrated bucket rows compare the full ISO bucket instant against
+    ``since``. Rows are ordered by activity period (period_start), with
+    ``observed_at`` retained as retrieval provenance only.
+
+    Reads from token_events (v3) table. Only total_tokens is populated;
+    breakdown columns exist in the schema but are no longer written.
     """
-    since_iso = since.isoformat()
-    clauses = ["period_start >= ?"]
-    params: list[object] = [since_iso]
+    day_boundary = since.date().isoformat()
+    instant_boundary = since.isoformat()
+    clauses = [
+        "(period_kind = 'day' AND period_start >= ?) "
+        "OR (period_kind = 'bucket' AND period_start >= ?)"
+    ]
+    params: list[object] = [day_boundary, instant_boundary]
     if service is not None:
         clauses.append("service = ?")
         params.append(service.value)
     where = " AND ".join(clauses)
     rows = conn.execute(
-        f"SELECT service, observed_at, source, status, total_tokens "
+        "SELECT service, period_start, period_kind, observed_at, source, status, total_tokens "
         f"FROM token_events WHERE {where} ORDER BY period_start ASC, observed_at ASC",
         params,
     ).fetchall()
     return [
         TokenObservation(
             service=Service(row[0]),
+            period_start=_parse_period_start(row[1], row[2]),
+            period_kind=row[2],
+            observed_at=datetime.fromisoformat(row[3]),
+            source=row[4],
+            status=HistoryStatus(row[5]),
+            tokens=row[6],
+        )
+        for row in rows
+    ]
+
+
+def record_codex_summary(
+    conn: sqlite3.Connection,
+    summary: CodexSummary,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Record one official Codex summary record (one row per refresh).
+
+    The summary is a typed snapshot keyed by (service, observed_at) —
+    never duplicated onto daily buckets. Replay of the same instant
+    replaces the row (idempotent). Purges old rows after a successful write.
+    """
+    clock = now or datetime.now(UTC)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO codex_summaries "
+            "(service, observed_at, source, lifetime_tokens, peak_daily_tokens, "
+            "current_streak_days, longest_streak_days, longest_running_turn_sec) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                summary.service.value,
+                summary.observed_at.isoformat(),
+                summary.source,
+                summary.lifetime_tokens,
+                summary.peak_daily_tokens,
+                summary.current_streak_days,
+                summary.longest_streak_days,
+                summary.longest_running_turn_sec,
+            ),
+        )
+        _purge(conn, clock)
+        conn.execute("COMMIT")
+        return True
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+
+
+def query_codex_summaries(
+    conn: sqlite3.Connection,
+    *,
+    since: datetime,
+    service: Service | None = None,
+) -> list[CodexSummary]:
+    """Return persisted official Codex summary records since ``since``.
+
+    Newest observed_at first. Each record is one typed snapshot per
+    refresh, independent of the daily bucket rows.
+    """
+    clauses = ["observed_at >= ?"]
+    params: list[object] = [since.isoformat()]
+    if service is not None:
+        clauses.append("service = ?")
+        params.append(service.value)
+    where = " AND ".join(clauses)
+    rows = conn.execute(
+        "SELECT service, observed_at, source, lifetime_tokens, peak_daily_tokens, "
+        "current_streak_days, longest_streak_days, longest_running_turn_sec "
+        f"FROM codex_summaries WHERE {where} ORDER BY observed_at DESC",
+        params,
+    ).fetchall()
+    return [
+        CodexSummary(
+            service=Service(row[0]),
             observed_at=datetime.fromisoformat(row[1]),
             source=row[2],
-            status=HistoryStatus(row[3]),
-            tokens=row[4],
+            lifetime_tokens=row[3],
+            peak_daily_tokens=row[4],
+            current_streak_days=row[5],
+            longest_streak_days=row[6],
+            longest_running_turn_sec=row[7],
         )
         for row in rows
     ]
 
 
 def query_24h(conn: sqlite3.Connection, *, now: datetime | None = None) -> dict[str, list[Any]]:
-    """Return quota and token observations from the last 24 hours."""
+    """Return quota, token, and summary observations from the last 24 hours."""
     clock = now or datetime.now(UTC)
     since = clock - timedelta(hours=24)
     return {
         "quota": query_quota(conn, since=since),
         "tokens": query_token(conn, since=since),
+        "summaries": query_codex_summaries(conn, since=since),
     }
 
 
 def query_7d(conn: sqlite3.Connection, *, now: datetime | None = None) -> dict[str, list[Any]]:
-    """Return quota and token observations from the last 7 days."""
+    """Return quota, token, and summary observations from the last 7 days."""
     clock = now or datetime.now(UTC)
     since = clock - timedelta(days=7)
     return {
         "quota": query_quota(conn, since=since),
         "tokens": query_token(conn, since=since),
+        "summaries": query_codex_summaries(conn, since=since),
     }
 
 
 def query_30d(conn: sqlite3.Connection, *, now: datetime | None = None) -> dict[str, list[Any]]:
-    """Return quota and token observations from the last 30 days."""
+    """Return quota, token, and summary observations from the last 30 days."""
     clock = now or datetime.now(UTC)
     since = clock - timedelta(days=30)
     return {
         "quota": query_quota(conn, since=since),
         "tokens": query_token(conn, since=since),
+        "summaries": query_codex_summaries(conn, since=since),
     }
 
 
 def query_90d(conn: sqlite3.Connection, *, now: datetime | None = None) -> dict[str, list[Any]]:
-    """Return quota and token observations from the last 90 days."""
+    """Return quota, token, and summary observations from the last 90 days."""
     clock = now or datetime.now(UTC)
     since = clock - timedelta(days=90)
     return {
         "quota": query_quota(conn, since=since),
         "tokens": query_token(conn, since=since),
+        "summaries": query_codex_summaries(conn, since=since),
     }
 
 
@@ -723,8 +1037,9 @@ def delete_all(conn: sqlite3.Connection) -> int:
     try:
         q = conn.execute("DELETE FROM quota_observations").rowcount
         t = conn.execute("DELETE FROM token_events").rowcount
+        s = conn.execute("DELETE FROM codex_summaries").rowcount
         conn.execute("COMMIT")
-        return q + t
+        return q + t + s
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -739,10 +1054,12 @@ def record_refresh(
     *,
     now: datetime | None = None,
 ) -> None:
-    """Record fresh validated quota and token observations from a refresh batch.
+    """Record fresh validated quota, token, and summary observations from a refresh batch.
 
-    Handles both QuotaReading and TokenReading objects. Only AVAILABLE
-    readings are stored. Non-available/error readings are silently skipped.
+    Handles QuotaReading (only AVAILABLE stored), TokenReading (exact and
+    non-exact availability stored via canonical day keys), and CodexSummary
+    (one typed record per refresh). Non-available quota readings are
+    silently skipped.
 
     Failure is caught by the caller; this function raises on DB errors so
     the caller can produce a sanitized diagnostic.
@@ -754,6 +1071,7 @@ def record_refresh(
     # Separate readings by type
     quota_readings: list[QuotaReading] = []
     token_readings: list[TokenReading] = []
+    summary: CodexSummary | None = None
 
     for reading in readings:
         if isinstance(reading, QuotaReading):
@@ -763,11 +1081,9 @@ def record_refresh(
                 continue
             quota_readings.append(reading)
         elif isinstance(reading, TokenReading):
-            if reading.status != "available_exact":
-                continue
-            if reading.tokens is None:
-                continue
             token_readings.append(reading)
+        elif isinstance(reading, CodexSummary):
+            summary = reading
 
     # Write quota observations
     for reading in quota_readings:
@@ -784,9 +1100,13 @@ def record_refresh(
         )
         record_quota(conn, obs, now=clock)
 
-    # Write token events
+    # Write token events (exact + sanitized availability states)
     if token_readings:
         record_token_events(conn, token_readings, now=clock)
+
+    # Write the official summary as one typed record, never duplicated
+    if summary is not None:
+        record_codex_summary(conn, summary, now=clock)
 
 
 def write_history_safely(

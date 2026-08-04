@@ -9,7 +9,15 @@ import subprocess
 import time
 
 from .history import HistoryStatus
-from .models import CollectorResult, QuotaReading, QuotaStatus, Service, TokenReading, utc_now
+from .models import (
+    CodexSummary,
+    CollectorResult,
+    QuotaReading,
+    QuotaStatus,
+    Service,
+    TokenReading,
+    utc_now,
+)
 from .parsers import ParseError, parse_codex_rate_limits, parse_codex_usage
 
 
@@ -89,7 +97,7 @@ class CodexCollector:
                         day=now.date(),
                         retrieved_at=now,
                         source="codex-app-server",
-                        status=HistoryStatus.UNSUPPORTED.value,
+                        status=HistoryStatus.UNSUPPORTED,
                         detail="codex CLI not found",
                     ),
                 ),
@@ -125,7 +133,7 @@ class CodexCollector:
 
             quota_readings: list[QuotaReading] = []
             token_readings: list[TokenReading] = []
-            codex_summary: dict[str, object] | None = None
+            codex_summary: CodexSummary | None = None
 
             # ── Rate limits (quota) — independent deadline ──
             rate_deadline = time.monotonic() + 10
@@ -187,15 +195,14 @@ class CodexCollector:
                             day=now.date(),
                             retrieved_at=now,
                             source=self.USAGE_SOURCE,
-                            status=HistoryStatus.TEMPORARILY_UNAVAILABLE.value,
+                            status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
                             detail="Codex usage request rejected",
                         )
                     )
                 else:
                     daily, summary_parsed = parse_codex_usage(usage_response, now)
                     token_readings.extend(daily)
-                    if summary_parsed is not None:
-                        codex_summary = {k: v for k, v in summary_parsed.items() if v is not None}
+                    codex_summary = summary_parsed
             except ParseError:
                 # Malformed success body → invalid
                 token_readings.append(
@@ -204,7 +211,7 @@ class CodexCollector:
                         day=now.date(),
                         retrieved_at=now,
                         source=self.USAGE_SOURCE,
-                        status=HistoryStatus.INVALID.value,
+                        status=HistoryStatus.INVALID,
                         detail="Codex usage response malformed",
                     )
                 )
@@ -216,7 +223,7 @@ class CodexCollector:
                         day=now.date(),
                         retrieved_at=now,
                         source=self.USAGE_SOURCE,
-                        status=HistoryStatus.TEMPORARILY_UNAVAILABLE.value,
+                        status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
                         detail="Codex usage request failed",
                     )
                 )
@@ -247,7 +254,7 @@ class CodexCollector:
                         day=now.date(),
                         retrieved_at=now,
                         source="codex-app-server",
-                        status=HistoryStatus.TEMPORARILY_UNAVAILABLE.value,
+                        status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
                         detail="Codex app-server request failed",
                     ),
                 ),

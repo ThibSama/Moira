@@ -13,10 +13,11 @@ import time
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
-from moira.history import QuotaObservation
+from moira.history import HistoryStatus, QuotaObservation, TokenObservation
 from moira.history_view import (
     MAX_CHART_POINTS,
     ChartPoint,
@@ -1625,3 +1626,290 @@ def test_build_series_stats_text_translator_injected() -> None:
     result = build_series_stats_text(stats, french, target_tz=UTC)
     assert "Premier: 2026-08-02 10:00" in result
     assert "Dernier: 2026-08-02 14:00" in result
+
+
+# ── Package 3c: typed availability, official summary, day-based totals ──
+
+
+def _token_obs(
+    day: datetime,
+    *,
+    service: Service = Service.CODEX,
+    observed: datetime | None = None,
+    source: str = "codex-app-server:account/usage/read",
+    status: HistoryStatus = HistoryStatus.AVAILABLE_EXACT,
+    tokens: int | None = 500,
+    period_kind: str = "day",
+) -> TokenObservation:
+    from datetime import time as time_type
+
+    period_start = datetime.combine(day.date(), time_type.min, tzinfo=UTC)
+    return TokenObservation(
+        service=service,
+        period_start=period_start,
+        period_kind=period_kind,
+        observed_at=observed or day,
+        source=source,
+        status=status,
+        tokens=tokens,
+    )
+
+
+def test_token_summary_uses_activity_day_not_retrieval_time() -> None:
+    """Earliest/latest derive from the activity day (period_start), while
+    observed_at remains retrieval provenance."""
+    from moira.history_view import TokenSummary
+
+    obs = [
+        _token_obs(NOW - timedelta(days=2), observed=NOW, tokens=100),
+        _token_obs(NOW, observed=NOW, tokens=200),
+    ]
+    view = prepare_history_view(
+        [_obs(pct=50.0)], range_label="7d", filter_label="All", token_observations=obs
+    )
+    summaries = view.token_summaries
+    assert len(summaries) == 1
+    ts = summaries[0]
+    assert isinstance(ts, TokenSummary)
+    assert ts.total_tokens == 300
+    # Activity days, not the shared retrieval instant
+    assert ts.earliest_day == (NOW - timedelta(days=2)).date().isoformat()
+    assert ts.latest_day == NOW.date().isoformat()
+
+
+def test_token_summary_grouped_by_period_kind() -> None:
+    """Daily and migrated bucket rows are separate summaries."""
+    bucket_obs = _token_obs(NOW, tokens=400, period_kind="bucket")
+    day_obs = _token_obs(NOW, tokens=500)
+    view = prepare_history_view(
+        [_obs(pct=50.0)],
+        range_label="7d",
+        filter_label="All",
+        token_observations=[bucket_obs, day_obs],
+    )
+    kinds = {ts.period_kind for ts in view.token_summaries}
+    assert kinds == {"day", "bucket"}
+
+
+def test_codex_summaries_in_view_newest_per_service() -> None:
+    """The view carries the newest official summary record per service,
+    separate from daily totals."""
+    from moira.models import CodexSummary
+
+    older = CodexSummary(
+        service=Service.CODEX,
+        source="codex-app-server:account/usage/read",
+        observed_at=NOW,
+        lifetime_tokens=100,
+    )
+    newer = CodexSummary(
+        service=Service.CODEX,
+        source="codex-app-server:account/usage/read",
+        observed_at=NOW + timedelta(minutes=1),
+        lifetime_tokens=200,
+    )
+    view = prepare_history_view(
+        [_obs(pct=50.0)],
+        range_label="7d",
+        filter_label="All",
+        codex_summaries=[older, newer],
+    )
+    assert len(view.codex_summaries) == 1
+    assert view.codex_summaries[0].lifetime_tokens == 200
+
+
+def test_token_availability_latest_status_per_service() -> None:
+    """Availability state is typed and reflects the latest observation."""
+    from moira.history_view import TokenAvailabilityState
+
+    obs = [
+        _token_obs(NOW, status=HistoryStatus.INVALID, tokens=None),
+        _token_obs(
+            NOW + timedelta(minutes=1), status=HistoryStatus.TEMPORARILY_UNAVAILABLE, tokens=None
+        ),
+    ]
+    view = prepare_history_view(
+        [_obs(pct=50.0)], range_label="24h", filter_label="All", token_observations=obs
+    )
+    assert len(view.token_availability) == 1
+    state = view.token_availability[0]
+    assert isinstance(state, TokenAvailabilityState)
+    assert state.service is Service.CODEX
+    assert state.status is HistoryStatus.TEMPORARILY_UNAVAILABLE
+    assert view.token_summaries == ()  # no exact data
+
+
+def test_availability_never_hides_exact_data() -> None:
+    """An invalid row alongside exact rows keeps the exact totals visible."""
+    obs = [
+        _token_obs(NOW, tokens=500),
+        _token_obs(NOW + timedelta(minutes=1), status=HistoryStatus.INVALID, tokens=None),
+    ]
+    view = prepare_history_view(
+        [_obs(pct=50.0)], range_label="24h", filter_label="All", token_observations=obs
+    )
+    assert len(view.token_summaries) == 1
+    assert view.token_summaries[0].total_tokens == 500
+    # Availability still reported for the service (latest status)
+    assert view.token_availability[0].status is HistoryStatus.INVALID
+
+
+def test_availability_state_is_frozen() -> None:
+    from moira.history_view import TokenAvailabilityState
+
+    state = TokenAvailabilityState(service=Service.CODEX, status=HistoryStatus.INVALID)
+    with pytest.raises(AttributeError):
+        state.status = HistoryStatus.UNSUPPORTED  # type: ignore[misc]
+
+
+def test_history_view_result_deeply_immutable() -> None:
+    """token_summaries/availability/codex_summaries are tuples (deeply immutable)."""
+    from moira.models import CodexSummary
+
+    obs = [_token_obs(NOW, tokens=500)]
+    summary = CodexSummary(service=Service.CODEX, source="s", observed_at=NOW, lifetime_tokens=100)
+    view = prepare_history_view(
+        [_obs(pct=50.0)],
+        range_label="24h",
+        filter_label="All",
+        token_observations=obs,
+        codex_summaries=[summary],
+    )
+    assert isinstance(view.token_summaries, tuple)
+    assert isinstance(view.token_availability, tuple)
+    assert isinstance(view.codex_summaries, tuple)
+    with pytest.raises(AttributeError):
+        view.codex_summaries = ()  # type: ignore[misc]
+
+
+def test_build_token_summary_text() -> None:
+    from moira.history_view import TokenSummary, build_token_summary_text
+
+    ts = TokenSummary(
+        service=Service.CODEX,
+        source="codex-app-server:account/usage/read",
+        period_kind="day",
+        total_tokens=1234,
+        event_count=2,
+        earliest_day="2026-08-01",
+        latest_day="2026-08-02",
+    )
+    text = build_token_summary_text(ts, lambda s: s)
+    assert "Codex token activity" in text
+    assert "Daily total: 1,234" in text
+    assert "2026-08-01–2026-08-02" in text
+    assert "Source: codex-app-server:account/usage/read" in text
+
+
+def test_build_token_summary_text_bucket_kind() -> None:
+    from moira.history_view import TokenSummary, build_token_summary_text
+
+    ts = TokenSummary(
+        service=Service.CODEX,
+        source="migrated",
+        period_kind="bucket",
+        total_tokens=425,
+        event_count=2,
+        earliest_day="2026-08-02",
+        latest_day="2026-08-02",
+    )
+    text = build_token_summary_text(ts, lambda s: s)
+    assert "15-min samples" in text
+    assert "Total: 425" in text
+
+
+def test_build_codex_summary_text() -> None:
+    from moira.history_view import build_codex_summary_text
+    from moira.models import CodexSummary
+
+    s = CodexSummary(
+        service=Service.CODEX,
+        source="codex-app-server:account/usage/read",
+        observed_at=NOW,
+        lifetime_tokens=50000,
+        peak_daily_tokens=3000,
+        current_streak_days=7,
+        longest_streak_days=14,
+        longest_running_turn_sec=1500,
+    )
+    text = build_codex_summary_text(s, lambda s_: s_)
+    assert "Codex summary" in text
+    assert "Lifetime: 50,000" in text
+    assert "Peak day: 3,000" in text
+    assert "Current streak: 7" in text
+    assert "Longest streak: 14" in text
+    assert "Longest turn: 1,500s" in text
+
+
+def test_build_codex_summary_text_empty() -> None:
+    from moira.history_view import build_codex_summary_text
+    from moira.models import CodexSummary
+
+    s = CodexSummary(
+        service=Service.CODEX, source="codex-app-server:account/usage/read", observed_at=NOW
+    )
+    text = build_codex_summary_text(s, lambda s_: s_)
+    assert "Codex summary" in text
+    assert "—" in text
+
+
+def test_build_token_availability_note_mapping() -> None:
+    from moira.history_view import build_token_availability_note
+
+    assert build_token_availability_note(HistoryStatus.UNSUPPORTED, lambda s: s) == (
+        "Exact token usage is not available"
+    )
+    assert build_token_availability_note(HistoryStatus.TEMPORARILY_UNAVAILABLE, lambda s: s) == (
+        "Exact tokens temporarily unavailable"
+    )
+    assert build_token_availability_note(HistoryStatus.INVALID, lambda s: s) == (
+        "Exact token data invalid"
+    )
+
+
+def test_build_texts_french_translated() -> None:
+    from moira.history_view import (
+        TokenSummary,
+        build_codex_summary_text,
+        build_token_availability_note,
+        build_token_summary_text,
+    )
+    from moira.i18n import tr
+    from moira.models import CodexSummary
+
+    with patch.dict("os.environ", {"LANG": "fr_FR.UTF-8"}):
+        ts = TokenSummary(
+            service=Service.CODEX,
+            source="codex-app-server:account/usage/read",
+            period_kind="day",
+            total_tokens=100,
+            event_count=1,
+            earliest_day="2026-08-01",
+            latest_day="2026-08-01",
+        )
+        text = build_token_summary_text(ts, tr)
+        assert "activité des jetons" in text
+        assert "Total journalier" in text
+
+        s = CodexSummary(
+            service=Service.CODEX,
+            source="codex-app-server:account/usage/read",
+            observed_at=NOW,
+            lifetime_tokens=1,
+            peak_daily_tokens=1,
+            current_streak_days=1,
+            longest_streak_days=1,
+            longest_running_turn_sec=1,
+        )
+        summary_text = build_codex_summary_text(s, tr)
+        assert "Résumé Codex" in summary_text
+        assert "Durée de vie" in summary_text
+        assert "Pic journalier" in summary_text
+        assert "Série actuelle" in summary_text
+        assert "Série la plus longue" in summary_text
+        assert "Tour le plus long" in summary_text
+
+        note = build_token_availability_note(HistoryStatus.TEMPORARILY_UNAVAILABLE, tr)
+        assert note == "Jetons exacts temporairement indisponibles"
+        invalid = build_token_availability_note(HistoryStatus.INVALID, tr)
+        assert invalid == "Données de jetons exactes invalides"

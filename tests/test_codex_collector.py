@@ -3,7 +3,7 @@ import signal
 from unittest.mock import patch
 
 from moira.collectors import CodexCollector
-from moira.models import CollectorResult, QuotaStatus
+from moira.models import CodexSummary, CollectorResult, HistoryStatus, QuotaStatus, Service
 
 
 class FakePipe:
@@ -57,7 +57,13 @@ def usage_response() -> dict[str, object]:
     return {
         "id": 3,
         "result": {
-            "summary": {"lifetime": 50000, "peak": 3000, "streak": 7, "longestTurn": 1500},
+            "summary": {
+                "lifetimeTokens": 50000,
+                "peakDailyTokens": 3000,
+                "currentStreakDays": 7,
+                "longestStreakDays": 14,
+                "longestRunningTurnSec": 1500,
+            },
             "dailyUsageBuckets": [
                 {"startDate": "2026-08-04", "tokens": 1700},
             ],
@@ -103,10 +109,17 @@ def test_handshake_requests_both_surfaces_independently() -> None:
     assert result.quota_readings[0].quota_label == "Weekly"
     assert len(result.token_readings) == 1
     assert result.token_readings[0].tokens == 1700
-    assert result.token_readings[0].status == "available_exact"
-    # codex_summary is populated
+    assert result.token_readings[0].status is HistoryStatus.AVAILABLE_EXACT
+    # codex_summary is a typed immutable CodexSummary with official fields
     assert result.codex_summary is not None
-    assert result.codex_summary["lifetime"] == 50000
+    assert isinstance(result.codex_summary, CodexSummary)
+    assert result.codex_summary.lifetime_tokens == 50000
+    assert result.codex_summary.peak_daily_tokens == 3000
+    assert result.codex_summary.current_streak_days == 7
+    assert result.codex_summary.longest_streak_days == 14
+    assert result.codex_summary.longest_running_turn_sec == 1500
+    assert result.codex_summary.service == Service.CODEX
+    assert result.codex_summary.source == CodexCollector.USAGE_SOURCE
 
 
 def test_usage_failure_preserves_quota() -> None:

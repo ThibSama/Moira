@@ -1,31 +1,33 @@
 """Typed history domain objects separating quota observations from optional
 exact-token observations.
 
-Both record types carry service, UTC time, source, and a status describing
-the telemetry availability. Token data is always optional and never estimated.
+Both record types carry service, UTC time, source, and a typed availability
+state describing the telemetry availability. Token data is always optional
+and never estimated.
 
 All datetimes are normalized to UTC. Labels and sources must be non-empty.
-Percentages are in 0–100. Token counts are non-negative integers.
+Percentages are in 0–100. Token counts are non-negative int64 values.
 AVAILABLE_EXACT requires exact data under a documented total policy;
 non-available statuses carry no counts.
+
+``HistoryStatus`` is defined in ``models.py`` (the provider-neutral typed
+availability model) and re-exported here for backward compatibility.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from enum import StrEnum
+from datetime import UTC, date, datetime, time
 
-from .models import QuotaReading, QuotaStatus, Service
+from .models import HistoryStatus, QuotaReading, QuotaStatus, Service, _validate_int64
 
-
-class HistoryStatus(StrEnum):
-    """Availability status for a telemetry observation."""
-
-    AVAILABLE_EXACT = "available_exact"
-    UNSUPPORTED = "unsupported"
-    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
-    INVALID = "invalid"
+__all__ = [
+    "HistoryStatus",
+    "QuotaObservation",
+    "SchemaVersionError",
+    "TokenObservation",
+    "HistoryWriteResult",
+]
 
 
 class SchemaVersionError(ValueError):
@@ -54,11 +56,7 @@ def _validate_percentage(value: float) -> float:
 
 
 def _validate_non_negative_int(value: int | None, field_name: str) -> int | None:
-    if value is None:
-        return None
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError(f"{field_name} must be a non-negative integer")
-    return value
+    return _validate_int64(value, field_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,75 +105,66 @@ class QuotaObservation:
         )
 
 
+_VALID_PERIOD_KINDS = ("day", "bucket")
+
+
 @dataclass(frozen=True, slots=True)
 class TokenObservation:
     """An optional exact-token observation from the Codex structured surface.
 
-    Represents one daily bucket (``dailyUsageBuckets[{startDate,tokens}]``).
-    Only ``tokens`` is stored — the API exposes no input/output/cache/reasoning
-    breakdown. Summary fields (lifetime, peak, streak, longest-turn) are provider
-    aggregates stored separately. Token counts are never estimated or derived from
-    percentages.
+    Represents one persisted token event. ``period_start`` is the logical
+    start of the activity period (UTC midnight for daily rows, the 15-minute
+    bucket instant for migrated v2 rows) and ``period_kind`` is ``day`` or
+    ``bucket``. Ordering and earliest/latest are derived from the activity
+    day (``period_start.date()``); ``observed_at`` remains retrieval
+    provenance only.
 
-    AVAILABLE_EXACT requires total_tokens. Non-available statuses carry no counts.
+    AVAILABLE_EXACT requires total_tokens. Non-available statuses carry no
+    counts. The official aggregate summary is a separate typed
+    ``CodexSummary`` record — never duplicated onto daily events.
     """
 
     service: Service
+    period_start: datetime
+    period_kind: str
     observed_at: datetime
     source: str
     status: HistoryStatus
     tokens: int | None = None
-    summary_lifetime: int | None = None
-    summary_peak: int | None = None
-    summary_streak: int | None = None
-    summary_longest_turn: int | None = None
 
     def __post_init__(self) -> None:
+        if self.period_kind not in _VALID_PERIOD_KINDS:
+            raise ValueError(f"period_kind must be one of {_VALID_PERIOD_KINDS}")
         _validate_non_empty(self.source, "source")
+        if not isinstance(self.status, HistoryStatus):
+            raise ValueError("status must be a HistoryStatus value")
+        object.__setattr__(self, "period_start", _ensure_utc(self.period_start))
         object.__setattr__(self, "observed_at", _ensure_utc(self.observed_at))
         object.__setattr__(self, "tokens", _validate_non_negative_int(self.tokens, "tokens"))
-        object.__setattr__(
-            self,
-            "summary_lifetime",
-            _validate_non_negative_int(self.summary_lifetime, "summary_lifetime"),
-        )
-        object.__setattr__(
-            self,
-            "summary_peak",
-            _validate_non_negative_int(self.summary_peak, "summary_peak"),
-        )
-        object.__setattr__(
-            self,
-            "summary_streak",
-            _validate_non_negative_int(self.summary_streak, "summary_streak"),
-        )
-        object.__setattr__(
-            self,
-            "summary_longest_turn",
-            _validate_non_negative_int(self.summary_longest_turn, "summary_longest_turn"),
-        )
 
         if self.status is HistoryStatus.AVAILABLE_EXACT:
             if self.tokens is None:
                 raise ValueError("AVAILABLE_EXACT requires total_tokens")
         else:
-            if any(
-                v is not None
-                for v in (
-                    self.tokens,
-                    self.summary_lifetime,
-                    self.summary_peak,
-                    self.summary_streak,
-                    self.summary_longest_turn,
-                )
-            ):
+            if self.tokens is not None:
                 raise ValueError("non-available statuses must not carry token counts")
+
+    @property
+    def day(self) -> date:
+        """Return the activity day (``period_start`` date part).
+
+        This is the canonical ordering/labeling key for daily identity —
+        independent of retrieval time.
+        """
+        return self.period_start.date()
 
     @classmethod
     def unsupported(cls, service: Service, observed_at: datetime, source: str) -> TokenObservation:
-        """Create an UNSUPPORTED token observation."""
+        """Create an UNSUPPORTED token observation for the activity day of retrieval."""
         return cls(
             service=service,
+            period_start=_day_start(observed_at),
+            period_kind="day",
             observed_at=observed_at,
             source=source,
             status=HistoryStatus.UNSUPPORTED,
@@ -188,6 +177,8 @@ class TokenObservation:
         """Create a TEMPORARILY_UNAVAILABLE token observation."""
         return cls(
             service=service,
+            period_start=_day_start(observed_at),
+            period_kind="day",
             observed_at=observed_at,
             source=source,
             status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
@@ -198,6 +189,8 @@ class TokenObservation:
         """Create an INVALID token observation for malformed telemetry."""
         return cls(
             service=service,
+            period_start=_day_start(observed_at),
+            period_kind="day",
             observed_at=observed_at,
             source=source,
             status=HistoryStatus.INVALID,
@@ -207,6 +200,11 @@ class TokenObservation:
     def has_exact_tokens(self) -> bool:
         """Return True if this observation carries exact token counts."""
         return self.status is HistoryStatus.AVAILABLE_EXACT and self.tokens is not None
+
+
+def _day_start(dt: datetime) -> datetime:
+    """Return UTC midnight of ``dt``'s date (the activity day start)."""
+    return datetime.combine(dt.date(), time.min, tzinfo=UTC)
 
 
 class HistoryWriteResult:

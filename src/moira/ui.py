@@ -22,7 +22,14 @@ from .exhaustion import derive_state
 from .history_db import HistoryCoordinator
 from .history_page import HistoryPage
 from .i18n import is_french, tr
-from .models import CollectorResult, QuotaReading, QuotaStatus, Service, TokenReading
+from .models import (
+    CodexSummary,
+    CollectorResult,
+    QuotaReading,
+    QuotaStatus,
+    Service,
+    TokenReading,
+)
 from .ntfy import Notification, send
 from .persistence import (
     VALID_REFRESH_MINUTES,
@@ -217,6 +224,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.refreshing = False
         self.pending: list[QuotaReading] = []
         self.pending_tokens: list[TokenReading] = []
+        self.pending_summary: CodexSummary | None = None
         self.pending_lock = threading.Lock()
         self.completed = 0
         self._refresh_timer_id: int | None = None
@@ -384,6 +392,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.refreshing = True
         self.pending = []
         self.pending_tokens = []
+        self.pending_summary = None
         self.completed = 0
         self.claude_card.status.set_text(_("Loading…"))
         self.codex_card.status.set_text(_("Loading…"))
@@ -400,6 +409,8 @@ class MainWindow(Adw.ApplicationWindow):
         with self.pending_lock:
             self.pending.extend(result.quota_readings)
             self.pending_tokens.extend(result.token_readings)
+            if result.codex_summary is not None:
+                self.pending_summary = result.codex_summary
             self.completed += 1
             complete = self.completed == 2
         if complete:
@@ -428,14 +439,18 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _record_history(self, readings: list[QuotaReading], now: datetime) -> None:
-        """Enqueue fresh quota and token observations for off-thread history writing.
+        """Enqueue fresh quota, token, and summary observations for off-thread history writing.
 
         Never blocks the GTK thread. If the worker is busy, the newest batch
         replaces any pending batch (newest-wins) and a sanitized status is set.
         History failure does not affect quota state, display, or alerts.
+        The official Codex summary travels as one typed record — never
+        duplicated onto daily buckets.
         """
         combined: list[Any] = list(readings)
         combined.extend(self.pending_tokens)
+        if self.pending_summary is not None:
+            combined.append(self.pending_summary)
         self._history_coordinator.enqueue(combined, now)
 
     def _on_close_request(self, *_: Any) -> bool:

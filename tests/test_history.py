@@ -13,6 +13,7 @@ import sqlite3
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from datetime import time as time_type
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from moira.history import (
     HistoryStatus,
     HistoryWriteResult,
     QuotaObservation,
+    SchemaVersionError,
     TokenObservation,
 )
 from moira.history_db import (
@@ -42,14 +44,17 @@ from moira.history_db import (
     query_24h,
     query_30d,
     query_90d,
+    query_codex_summaries,
     query_quota,
     query_token,
+    record_codex_summary,
     record_quota,
     record_refresh,
     record_token,
+    record_token_events,
     write_history_safely,
 )
-from moira.models import QuotaReading, QuotaStatus, Service
+from moira.models import QuotaReading, QuotaStatus, Service, TokenReading
 
 NOW = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
 RESET = NOW + timedelta(days=5)
@@ -91,6 +96,30 @@ def _reading(
     ):
         return QuotaReading(service, label, pct, reset, retrieved, "fixture", status)
     return QuotaReading(service, label, pct, reset, retrieved, "fixture", status, "detail")
+
+
+def _token_obs(
+    service: Service = Service.CLAUDE,
+    *,
+    period_start: datetime | None = None,
+    period_kind: str = "day",
+    observed_at: datetime = NOW,
+    source: str = "fixture",
+    status: HistoryStatus = HistoryStatus.AVAILABLE_EXACT,
+    tokens: int | None = None,
+) -> TokenObservation:
+    """Construct a TokenObservation; day-kind defaults to the activity day."""
+    if period_start is None:
+        period_start = datetime.combine(observed_at.date(), time_type.min, tzinfo=UTC)
+    return TokenObservation(
+        service=service,
+        period_start=period_start,
+        period_kind=period_kind,
+        observed_at=observed_at,
+        source=source,
+        status=status,
+        tokens=tokens,
+    )
 
 
 def _db(tmp_path: Path) -> sqlite3.Connection:
@@ -554,13 +583,7 @@ def test_token_invalid_factory() -> None:
 
 
 def test_token_available_exact_has_tokens() -> None:
-    obs = TokenObservation(
-        service=Service.CLAUDE,
-        observed_at=NOW,
-        source="fixture",
-        status=HistoryStatus.AVAILABLE_EXACT,
-        tokens=380,
-    )
+    obs = _token_obs(tokens=380)
     assert obs.has_exact_tokens
 
 
@@ -577,13 +600,7 @@ def test_token_record_unsupported(tmp_path: Path) -> None:
 
 def test_token_record_exact(tmp_path: Path) -> None:
     conn = _db(tmp_path)
-    obs = TokenObservation(
-        service=Service.CODEX,
-        observed_at=NOW,
-        source="codex-app-server",
-        status=HistoryStatus.AVAILABLE_EXACT,
-        tokens=380,
-    )
+    obs = _token_obs(service=Service.CODEX, source="codex-app-server", tokens=380)
     record_token(conn, obs, now=NOW)
     rows = query_token(conn, since=NOW - timedelta(hours=1))
     assert len(rows) == 1
@@ -663,54 +680,29 @@ def test_quota_observation_normalizes_non_utc_timezone() -> None:
 
 def test_token_available_exact_requires_total() -> None:
     with pytest.raises(ValueError, match="total_tokens"):
-        TokenObservation(
-            service=Service.CLAUDE,
-            observed_at=NOW,
-            source="fixture",
-            status=HistoryStatus.AVAILABLE_EXACT,
-            tokens=None,
-        )
+        _token_obs(tokens=None)
 
 
 def test_token_available_exact_requires_tokens() -> None:
     """AVAILABLE_EXACT requires a non-None tokens value (the one daily total)."""
     with pytest.raises(ValueError, match="total_tokens"):
-        TokenObservation(
-            service=Service.CLAUDE,
-            observed_at=NOW,
-            source="fixture",
-            status=HistoryStatus.AVAILABLE_EXACT,
-        )
+        _token_obs()
 
 
 def test_token_non_available_must_not_carry_counts() -> None:
     with pytest.raises(ValueError, match="must not carry"):
-        TokenObservation(
-            service=Service.CLAUDE,
-            observed_at=NOW,
-            source="fixture",
-            status=HistoryStatus.UNSUPPORTED,
-            tokens=100,
-        )
+        _token_obs(status=HistoryStatus.UNSUPPORTED, tokens=100)
 
 
 def test_token_rejects_negative_count() -> None:
     with pytest.raises(ValueError, match="non-negative"):
-        TokenObservation(
-            service=Service.CLAUDE,
-            observed_at=NOW,
-            source="fixture",
-            status=HistoryStatus.AVAILABLE_EXACT,
-            tokens=-1,
-        )
+        _token_obs(tokens=-1)
 
 
 def test_token_rejects_naive_timestamp() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
-        TokenObservation(
-            service=Service.CLAUDE,
+        _token_obs(
             observed_at=datetime(2026, 8, 2, 12, 0, 0),
-            source="fixture",
             status=HistoryStatus.UNSUPPORTED,
         )
 
@@ -1755,4 +1747,480 @@ def test_v2_to_v3_migration_rollback(tmp_path: Path) -> None:
     assert row[0] == 2  # unchanged
     rows = conn.execute("SELECT COUNT(*) FROM token_observations_bak").fetchone()
     assert rows[0] >= 1  # data survived
+    conn.close()
+
+
+# ── Package 3c: canonical daily identity, period-kind boundaries, summary ──
+
+
+def _token_reading(
+    day: datetime | None = None,
+    *,
+    source: str = "codex-app-server:account/usage/read",
+    tokens: int | None = 500,
+    status: HistoryStatus = HistoryStatus.AVAILABLE_EXACT,
+    retrieved: datetime | None = None,
+) -> TokenReading:
+    day_date = (day or NOW).date()
+    return TokenReading(
+        service=Service.CODEX,
+        day=day_date,
+        retrieved_at=retrieved or NOW,
+        source=source,
+        status=status,
+        tokens=tokens,
+    )
+
+
+def test_canonical_daily_identity_ignores_source_digest(tmp_path: Path) -> None:
+    """Canonical identity is provider/service/period-kind/day — a source
+    wording change updates one row instead of duplicating it."""
+    conn = _db(tmp_path)
+    first = _token_reading(NOW, source="codex-app-server:account/usage/read")
+    record_token_events(conn, [first], now=NOW)
+    rows = query_token(conn, since=NOW - timedelta(hours=1))
+    assert len(rows) == 1
+    assert rows[0].tokens == 500
+    assert rows[0].source == "codex-app-server:account/usage/read"
+
+    # Source wording/rename changes — same logical service/day
+    renamed = _token_reading(NOW, source="codex-app-server:v2/usage/read", tokens=700)
+    record_token_events(conn, [renamed], now=NOW + timedelta(minutes=1))
+    rows = query_token(conn, since=NOW - timedelta(hours=1))
+    assert len(rows) == 1  # one row, not two
+    assert rows[0].tokens == 700
+    assert rows[0].source == "codex-app-server:v2/usage/read"
+    conn.close()
+
+
+def test_event_keys_have_no_source_digest(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    record_token_events(conn, [_token_reading(NOW)], now=NOW)
+    key = conn.execute("SELECT event_key FROM token_events").fetchone()[0]
+    assert key == "codex:day:2026-08-02"
+    conn.close()
+
+
+def test_legacy_source_digest_keys_reconciled(tmp_path: Path) -> None:
+    """Package 3/3b keys like codex:u:<day>:<digest> collapse to canonical
+    keys; the newest alias wins and newer canonical rows are preserved."""
+    conn = _db(tmp_path)
+    digest_a = "a" * 12
+    digest_b = "b" * 12
+    conn.execute(
+        "INSERT INTO token_events (event_key, service, period_start, period_kind, "
+        "observed_at, source, status, total_tokens) VALUES (?, ?, ?, 'day', ?, ?, ?, ?)",
+        (
+            f"codex:u:2026-08-01:{digest_a}",
+            "codex",
+            "2026-08-01",
+            "2026-08-01T08:00:00+00:00",
+            "old-source-a",
+            "available_exact",
+            100,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO token_events (event_key, service, period_start, period_kind, "
+        "observed_at, source, status, total_tokens) VALUES (?, ?, ?, 'day', ?, ?, ?, ?)",
+        (
+            f"codex:u:2026-08-01:{digest_b}",
+            "codex",
+            "2026-08-01",
+            "2026-08-01T09:00:00+00:00",
+            "old-source-b",
+            "available_exact",
+            200,
+        ),
+    )
+    # A canonical row written by the new code that is NEWER than both aliases
+    conn.execute(
+        "INSERT INTO token_events (event_key, service, period_start, period_kind, "
+        "observed_at, source, status, total_tokens) VALUES (?, ?, ?, 'day', ?, ?, ?, ?)",
+        (
+            "codex:day:2026-08-01",
+            "codex",
+            "2026-08-01",
+            "2026-08-01T10:00:00+00:00",
+            "codex-app-server:account/usage/read",
+            "available_exact",
+            300,
+        ),
+    )
+    conn.close()
+
+    conn = _connect(tmp_path / "history.sqlite3")
+    init_schema(conn)
+    rows = conn.execute("SELECT event_key FROM token_events").fetchall()
+    assert [r[0] for r in rows] == ["codex:day:2026-08-01"]
+    row = conn.execute(
+        "SELECT total_tokens, source FROM token_events WHERE event_key = 'codex:day:2026-08-01'"
+    ).fetchone()
+    # Newer canonical row preserved (300 > 200)
+    assert row[0] == 300
+    assert row[1] == "codex-app-server:account/usage/read"
+    conn.close()
+
+
+def test_legacy_reconcile_newest_alias_wins(tmp_path: Path) -> None:
+    """Two legacy aliases for one day merge to the newest alias."""
+    conn = _db(tmp_path)
+    conn.execute(
+        "INSERT INTO token_events (event_key, service, period_start, period_kind, "
+        "observed_at, source, status, total_tokens) VALUES (?, ?, ?, 'day', ?, ?, ?, ?)",
+        (
+            f"codex:u:2026-08-03:{'a' * 12}",
+            "codex",
+            "2026-08-03",
+            "2026-08-03T08:00:00+00:00",
+            "source-a",
+            "available_exact",
+            100,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO token_events (event_key, service, period_start, period_kind, "
+        "observed_at, source, status, total_tokens) VALUES (?, ?, ?, 'day', ?, ?, ?, ?)",
+        (
+            f"codex:u:2026-08-03:{'b' * 12}",
+            "codex",
+            "2026-08-03",
+            "2026-08-03T12:00:00+00:00",
+            "source-b",
+            "available_exact",
+            250,
+        ),
+    )
+    conn.close()
+    conn = _connect(tmp_path / "history.sqlite3")
+    init_schema(conn)
+    row = conn.execute(
+        "SELECT total_tokens, source FROM token_events WHERE event_key = 'codex:day:2026-08-03'"
+    ).fetchone()
+    assert row[0] == 250
+    assert row[1] == "source-b"
+    conn.close()
+
+
+def test_incomplete_schema_without_version_fails_closed(tmp_path: Path) -> None:
+    """A metadata table with no version row and missing v3 tables must fail
+    closed — never label an incomplete database v3."""
+    db_path = tmp_path / "history.sqlite3"
+    conn = _connect(db_path)
+    conn.executescript(
+        "CREATE TABLE schema_meta (version INTEGER PRIMARY KEY);"
+        "CREATE TABLE quota_observations (id INTEGER PRIMARY KEY);"
+    )
+    # No version row, token_events missing
+    conn.close()
+    conn = _connect(db_path)
+    with pytest.raises(SchemaVersionError, match="incomplete"):
+        init_schema(conn)
+    conn.close()
+    # The version row must NOT have been written
+    conn = _connect(db_path)
+    row = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row is None
+    conn.close()
+
+
+def test_incomplete_schema_without_version_repaired_transactionally(tmp_path: Path) -> None:
+    """A complete v3 table set with no version row is repaired transactionally."""
+    conn = _db(tmp_path)
+    conn.execute("DELETE FROM schema_meta")
+    conn.close()
+    conn = _connect(tmp_path / "history.sqlite3")
+    init_schema(conn)
+    row = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row[0] == SCHEMA_VERSION
+    conn.close()
+
+
+def test_v3_version_row_with_missing_table_fails_closed(tmp_path: Path) -> None:
+    """A version row claiming v3 with missing tables must fail closed."""
+    conn = _db(tmp_path)
+    conn.execute("DROP TABLE token_events")
+    conn.close()
+    conn = _connect(tmp_path / "history.sqlite3")
+    with pytest.raises(SchemaVersionError, match="incomplete"):
+        init_schema(conn)
+    conn.close()
+
+
+def test_v2_migration_missing_quota_table_keeps_v2_label(tmp_path: Path) -> None:
+    """A v2 database missing quota_observations rolls back and keeps its v2
+    label — never labeled v3."""
+    from moira.history_db import SCHEMA_SQL_V2
+
+    db_path = tmp_path / "history.sqlite3"
+    conn = _connect(db_path)
+    conn.executescript(SCHEMA_SQL_V2)
+    conn.execute("INSERT INTO schema_meta (version) VALUES (2)")
+    conn.execute("DROP TABLE quota_observations")
+    conn.close()
+    conn = _connect(db_path)
+    with pytest.raises(SchemaVersionError, match="incomplete"):
+        init_schema(conn)
+    conn.close()
+    conn = _connect(db_path)
+    row = conn.execute("SELECT version FROM schema_meta").fetchone()
+    assert row[0] == 2  # still v2
+    conn.close()
+
+
+def test_query_token_preserves_period_start_and_kind(tmp_path: Path) -> None:
+    """Domain reads preserve period_start and period_kind; observed_at stays
+    retrieval provenance."""
+    conn = _db(tmp_path)
+    record_token_events(conn, [_token_reading(NOW)], now=NOW)
+    rows = query_token(conn, since=NOW - timedelta(hours=1))
+    assert len(rows) == 1
+    obs = rows[0]
+    assert obs.period_kind == "day"
+    assert obs.period_start == datetime(2026, 8, 2, 0, 0, tzinfo=UTC)
+    assert obs.day.isoformat() == "2026-08-02"
+    assert obs.observed_at == NOW  # retrieval provenance
+    conn.close()
+
+
+def test_query_token_day_boundaries_24h_7d_90d(tmp_path: Path) -> None:
+    """Daily rows respect day-string boundaries: a row on the boundary day
+    is included, a row outside the range is excluded."""
+    conn = _db(tmp_path)
+    now = datetime(2026, 8, 8, 12, 0, 0, tzinfo=UTC)
+    # 6 days ago → inside the 7d boundary day (Aug 2), outside 24h
+    inside_7d = _token_reading(now - timedelta(days=6), tokens=100)
+    # 25 hours ago → day Aug 7, the 24h boundary day → included
+    inside_24h = _token_reading(now - timedelta(hours=25), tokens=200)
+    # 91 days ago → outside 90d
+    outside_90d = _token_reading(now - timedelta(days=91), tokens=300)
+    record_token_events(conn, [inside_7d, inside_24h, outside_90d], now=now)
+
+    r24 = query_token(conn, since=now - timedelta(hours=24))
+    assert sorted(o.tokens or 0 for o in r24) == [200]
+    r7 = query_token(conn, since=now - timedelta(days=7))
+    assert sorted(o.tokens or 0 for o in r7) == [100, 200]
+    r90 = query_token(conn, since=now - timedelta(days=90))
+    assert sorted(o.tokens or 0 for o in r90) == [100, 200]
+    conn.close()
+
+
+def test_query_token_bucket_boundaries(tmp_path: Path) -> None:
+    """Migrated bucket rows compare the full ISO bucket instant."""
+    conn = _db(tmp_path)
+    now = datetime(2026, 8, 8, 12, 0, 0, tzinfo=UTC)
+    bucket_inside = datetime(2026, 8, 7, 12, 0, 0, tzinfo=UTC)
+    bucket_outside = datetime(2026, 8, 1, 12, 0, 0, tzinfo=UTC)
+    record_token(
+        conn,
+        _token_obs(
+            service=Service.CODEX,
+            period_start=bucket_inside,
+            period_kind="bucket",
+            observed_at=now,
+            source="migrated",
+            tokens=400,
+        ),
+        now=now,
+    )
+    record_token(
+        conn,
+        _token_obs(
+            service=Service.CODEX,
+            period_start=bucket_outside,
+            period_kind="bucket",
+            observed_at=now,
+            source="migrated",
+            tokens=500,
+        ),
+        now=now,
+    )
+    # 7d boundary: Aug 1 12:00 is exactly the boundary → included
+    r7 = query_token(conn, since=now - timedelta(days=7))
+    assert sorted(o.tokens or 0 for o in r7) == [400, 500]
+    # 24h boundary: only the Aug 7 bucket
+    r24 = query_token(conn, since=now - timedelta(hours=24))
+    assert [o.tokens or 0 for o in r24] == [400]
+    conn.close()
+
+
+def test_retention_day_rows_boundary_kept(tmp_path: Path) -> None:
+    """A daily row exactly 90 days old is kept (strict less-than)."""
+    conn = _db(tmp_path)
+    boundary_day = NOW - timedelta(days=RETENTION_DAYS)
+    record_token_events(conn, [_token_reading(boundary_day, tokens=111)], now=NOW)
+    record_token_events(conn, [_token_reading(NOW - timedelta(days=91), tokens=222)], now=NOW)
+    rows = query_token(conn, since=NOW - timedelta(days=RETENTION_DAYS))
+    assert [o.tokens for o in rows] == [111]
+    conn.close()
+
+
+def test_retention_bucket_rows_boundary_kept(tmp_path: Path) -> None:
+    """A bucket row exactly 90 days old is kept."""
+    conn = _db(tmp_path)
+    boundary = NOW - timedelta(days=RETENTION_DAYS)
+    record_token(
+        conn,
+        _token_obs(
+            service=Service.CODEX,
+            period_start=boundary,
+            period_kind="bucket",
+            observed_at=NOW,
+            source="migrated",
+            tokens=333,
+        ),
+        now=NOW,
+    )
+    record_token(
+        conn,
+        _token_obs(
+            service=Service.CODEX,
+            period_start=boundary - timedelta(minutes=1),
+            period_kind="bucket",
+            observed_at=NOW,
+            source="migrated",
+            tokens=444,
+        ),
+        now=NOW,
+    )
+    rows = query_token(conn, since=NOW - timedelta(days=RETENTION_DAYS))
+    assert [o.tokens for o in rows] == [333]
+    conn.close()
+
+
+def test_record_and_query_codex_summary(tmp_path: Path) -> None:
+    """Official summary persists as one typed record and reads back."""
+    from moira.models import CodexSummary
+
+    conn = _db(tmp_path)
+    summary = CodexSummary(
+        service=Service.CODEX,
+        source="codex-app-server:account/usage/read",
+        observed_at=NOW,
+        lifetime_tokens=50000,
+        peak_daily_tokens=3000,
+        current_streak_days=7,
+        longest_streak_days=14,
+        longest_running_turn_sec=1500,
+    )
+    record_codex_summary(conn, summary, now=NOW)
+    summaries = query_codex_summaries(conn, since=NOW - timedelta(hours=1))
+    assert len(summaries) == 1
+    assert summaries[0].lifetime_tokens == 50000
+    assert summaries[0].peak_daily_tokens == 3000
+    assert summaries[0].current_streak_days == 7
+    assert summaries[0].longest_streak_days == 14
+    assert summaries[0].longest_running_turn_sec == 1500
+    conn.close()
+
+
+def test_summary_replay_idempotent_and_newest_wins(tmp_path: Path) -> None:
+    from moira.models import CodexSummary
+
+    conn = _db(tmp_path)
+    s1 = CodexSummary(service=Service.CODEX, source="s", observed_at=NOW, lifetime_tokens=100)
+    record_codex_summary(conn, s1, now=NOW)
+    record_codex_summary(conn, s1, now=NOW)  # replay — no duplicate
+    later = CodexSummary(
+        service=Service.CODEX,
+        source="s",
+        observed_at=NOW + timedelta(minutes=1),
+        lifetime_tokens=200,
+    )
+    record_codex_summary(conn, later, now=NOW)
+    summaries = query_codex_summaries(conn, since=NOW - timedelta(hours=1))
+    assert len(summaries) == 2  # two distinct instants
+    assert summaries[0].lifetime_tokens == 200  # newest first
+    conn.close()
+
+
+def test_summary_never_duplicated_per_daily_bucket(tmp_path: Path) -> None:
+    """One refresh writes one summary record even with many daily buckets."""
+    from moira.models import CodexSummary
+
+    conn = _db(tmp_path)
+    summary = CodexSummary(
+        service=Service.CODEX,
+        source="codex-app-server:account/usage/read",
+        observed_at=NOW,
+        lifetime_tokens=99999,
+    )
+    readings = [_token_reading(NOW - timedelta(days=d), tokens=10 * d + 1) for d in range(5)]
+    batch: list[Any] = list(readings) + [summary]
+    record_refresh(conn, batch, now=NOW)
+    count = conn.execute("SELECT COUNT(*) FROM codex_summaries").fetchone()[0]
+    assert count == 1
+    rows = query_token(conn, since=NOW - timedelta(days=7))
+    assert len(rows) == 5  # five daily buckets
+    conn.close()
+
+
+def test_non_exact_status_never_hides_exact_data(tmp_path: Path) -> None:
+    """An INVALID/TEMPORARILY_UNAVAILABLE reading for a day that already has
+    exact data never replaces it."""
+    conn = _db(tmp_path)
+    exact = _token_reading(NOW, tokens=500)
+    record_token_events(conn, [exact], now=NOW)
+    invalid = _token_reading(NOW, tokens=None, status=HistoryStatus.INVALID)
+    record_token_events(conn, [invalid], now=NOW + timedelta(minutes=1))
+    rows = query_token(conn, since=NOW - timedelta(hours=1))
+    assert len(rows) == 1
+    assert rows[0].status is HistoryStatus.AVAILABLE_EXACT
+    assert rows[0].tokens == 500
+    conn.close()
+
+
+def test_non_exact_status_persisted_when_no_exact_data(tmp_path: Path) -> None:
+    """Without exact data, the sanitized availability state is persisted."""
+    conn = _db(tmp_path)
+    temp = _token_reading(NOW, tokens=None, status=HistoryStatus.TEMPORARILY_UNAVAILABLE)
+    record_token_events(conn, [temp], now=NOW)
+    rows = query_token(conn, since=NOW - timedelta(hours=1))
+    assert len(rows) == 1
+    assert rows[0].status is HistoryStatus.TEMPORARILY_UNAVAILABLE
+    assert rows[0].tokens is None
+    conn.close()
+
+
+def test_later_exact_replaces_non_exact(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    invalid = _token_reading(NOW, tokens=None, status=HistoryStatus.INVALID)
+    record_token_events(conn, [invalid], now=NOW)
+    exact = _token_reading(NOW, tokens=800)
+    record_token_events(conn, [exact], now=NOW + timedelta(minutes=1))
+    rows = query_token(conn, since=NOW - timedelta(hours=1))
+    assert len(rows) == 1
+    assert rows[0].status is HistoryStatus.AVAILABLE_EXACT
+    assert rows[0].tokens == 800
+    conn.close()
+
+
+def test_record_refresh_end_to_end_with_summary(tmp_path: Path) -> None:
+    """Quota + daily buckets + summary in one batch persist together."""
+    from moira.models import CodexSummary, TokenReading
+
+    conn = _db(tmp_path)
+    summary = CodexSummary(
+        service=Service.CODEX,
+        source="codex-app-server:account/usage/read",
+        observed_at=NOW,
+        lifetime_tokens=123456,
+    )
+    reading = TokenReading(
+        service=Service.CODEX,
+        day=NOW.date(),
+        retrieved_at=NOW,
+        source="codex-app-server:account/usage/read",
+        status=HistoryStatus.AVAILABLE_EXACT,
+        tokens=777,
+    )
+    record_refresh(conn, [_reading(pct=50.0), reading, summary], now=NOW)
+    quota = query_quota(conn, since=NOW - timedelta(hours=1))
+    assert len(quota) == 1
+    tokens = query_token(conn, since=NOW - timedelta(hours=1))
+    assert len(tokens) == 1
+    assert tokens[0].tokens == 777
+    summaries = query_codex_summaries(conn, since=NOW - timedelta(hours=1))
+    assert len(summaries) == 1
+    assert summaries[0].lifetime_tokens == 123456
     conn.close()

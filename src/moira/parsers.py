@@ -5,11 +5,23 @@ import re
 from datetime import UTC, date, datetime
 from typing import Any
 
-from .models import QuotaReading, QuotaStatus, Service, TokenReading
+from .models import (
+    INT64_MAX,
+    CodexSummary,
+    HistoryStatus,
+    QuotaReading,
+    QuotaStatus,
+    Service,
+    TokenReading,
+)
 
 ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 PERCENT_RE = r"(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
 ISO_RE = r"(?P<iso>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2}))"
+
+# Canonical source string for the Codex usage surface. Stable across
+# releases so daily event identity never depends on source wording.
+USAGE_SOURCE = "codex-app-server:account/usage/read"
 
 
 class ParseError(ValueError):
@@ -169,82 +181,102 @@ def parse_codex_rate_limits(payload: dict[str, Any], retrieved_at: datetime) -> 
 def _validate_single_token(value: Any, name: str) -> int | None:
     """Validate a single integer token field from the usage surface.
 
-    Returns the integer, or None if the field is absent. Booleans, floats,
-    strings, negatives, and overflow values all fail closed.
+    Returns the integer, or None if the field is absent (nullable int64).
+    Booleans, every float (including integral floats), strings, negatives,
+    and values above signed int64 all fail closed.
     """
     if value is None:
         return None
     if isinstance(value, bool):
         raise ParseError(f"Codex usage {name} is boolean (expected integer)")
-    if not isinstance(value, (int, float)):
+    if not isinstance(value, int):
         raise ParseError(f"Codex usage {name} has wrong type {type(value).__name__}")
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ParseError(f"Codex usage {name} is not a finite number")
-        if value != math.floor(value):
-            raise ParseError(f"Codex usage {name} must be a whole number")
-        value = int(value)
     if value < 0:
         raise ParseError(f"Codex usage {name} is negative")
-    return int(value)
+    if value > INT64_MAX:
+        raise ParseError(f"Codex usage {name} exceeds signed int64")
+    return value
 
 
-def _parse_codex_summary(summary: dict[str, Any]) -> dict[str, int | None]:
-    """Parse the optional summary block from account/usage/read.
+# Official generated-schema mapping for the required summary object.
+# All five fields are nullable int64. Unknown additive fields are ignored.
+_CODEX_SUMMARY_FIELDS: tuple[tuple[str, str], ...] = (
+    ("lifetimeTokens", "lifetime_tokens"),
+    ("peakDailyTokens", "peak_daily_tokens"),
+    ("currentStreakDays", "current_streak_days"),
+    ("longestStreakDays", "longest_streak_days"),
+    ("longestRunningTurnSec", "longest_running_turn_sec"),
+)
 
-    All summary fields are nullable integers. Missing keys → None.
-    Booleans, floats, negatives → ParseError.
+
+def _parse_codex_summary(
+    summary: dict[str, Any], source: str, observed_at: datetime
+) -> CodexSummary:
+    """Parse the required summary object from account/usage/read.
+
+    Mirrors the generated schema: the summary is a required object with five
+    nullable int64 fields. Missing keys → None (nullable). Booleans, floats,
+    strings, negatives, and int64 overflow → ParseError. Unknown additive
+    fields are ignored.
     """
-    fields: dict[str, int | None] = {}
-    for key in ("lifetime", "peak", "streak", "longestTurn"):
-        raw = summary.get(key)
-        if raw is None:
-            fields[key] = None
-        else:
-            fields[key] = _validate_single_token(raw, f"summary.{key}")
-    return fields
+    kwargs: dict[str, int | None] = {}
+    for official, attr in _CODEX_SUMMARY_FIELDS:
+        raw = summary.get(official)
+        kwargs[attr] = _validate_single_token(raw, f"summary.{official}")
+    return CodexSummary(
+        service=Service.CODEX,
+        source=source,
+        observed_at=observed_at,
+        lifetime_tokens=kwargs["lifetime_tokens"],
+        peak_daily_tokens=kwargs["peak_daily_tokens"],
+        current_streak_days=kwargs["current_streak_days"],
+        longest_streak_days=kwargs["longest_streak_days"],
+        longest_running_turn_sec=kwargs["longest_running_turn_sec"],
+    )
 
 
 def parse_codex_usage(
     payload: dict[str, Any], retrieved_at: datetime
-) -> tuple[list[TokenReading], dict[str, int | None] | None]:
+) -> tuple[list[TokenReading], CodexSummary]:
     """Parse Codex app-server's documented account/usage/read response.
 
-    Parses the official ``summary`` and ``dailyUsageBuckets[{startDate,tokens}]``
-    contract. Each bucket becomes one TokenReading with a single ``tokens``
-    field — no input/output/cache/reasoning breakdown. Summary fields
-    (lifetime, peak, streak, longestTurn) are returned separately.
+    Mirrors the generated protocol schema: ``summary`` is a REQUIRED object
+    with the five official nullable int64 fields (``lifetimeTokens``,
+    ``peakDailyTokens``, ``currentStreakDays``, ``longestStreakDays``,
+    ``longestRunningTurnSec``); ``dailyUsageBuckets`` may be null and holds
+    ``[{startDate, tokens}]`` entries. Unknown additive fields are ignored.
 
-    Returns (daily_readings, summary_dict). summary_dict is None when the
-    summary block is absent or null. Fails closed on malformed, contradictory,
-    or absent data: malformed success → INVALID TokenReading, transport/provider
-    failure → handled by caller.
+    Each bucket becomes one TokenReading with a single ``tokens`` field —
+    no input/output/cache/reasoning breakdown. The summary is returned as
+    one typed ``CodexSummary`` record, separate from the daily readings.
+
+    Returns (daily_readings, summary). Fails closed on malformed,
+    contradictory, or absent data: a missing/malformed required summary or
+    malformed buckets raises ParseError → the caller produces an INVALID
+    token state while quotas survive. Transport/provider failures are
+    handled by the caller.
     """
     result = payload.get("result")
     if not isinstance(result, dict):
         raise ParseError("Codex usage result missing")
 
-    # ── Parse summary (optional) ──
+    # ── Parse summary (REQUIRED) ──
     summary_raw = result.get("summary")
-    summary: dict[str, int | None] | None = None
-    if isinstance(summary_raw, dict):
-        try:
-            summary = _parse_codex_summary(summary_raw)
-        except ParseError:
-            # Summary malformed → still parse daily buckets, but note the error
-            summary = None
+    if not isinstance(summary_raw, dict):
+        raise ParseError("Codex usage summary missing or not an object")
+    summary = _parse_codex_summary(summary_raw, USAGE_SOURCE, retrieved_at)
 
-    # ── Parse dailyUsageBuckets ──
+    # ── Parse dailyUsageBuckets (nullable) ──
     buckets = result.get("dailyUsageBuckets")
     if buckets is None:
-        # Null buckets → no daily data, but summary may still exist
+        # Null buckets → no daily data, but the summary still exists
         return ([], summary)
     if not isinstance(buckets, list):
         raise ParseError("Codex usage dailyUsageBuckets is not a list")
     if not buckets:
         return ([], summary)
 
-    source = "codex-app-server:account/usage/read"
+    source = USAGE_SOURCE
     readings: list[TokenReading] = []
     seen_days: set[date] = set()
 
@@ -275,7 +307,7 @@ def parse_codex_usage(
                 day=day,
                 retrieved_at=retrieved_at,
                 source=source,
-                status="available_exact",
+                status=HistoryStatus.AVAILABLE_EXACT,
                 tokens=tokens,
             )
         )

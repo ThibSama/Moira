@@ -20,8 +20,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from .history import QuotaObservation, SchemaVersionError, TokenObservation
-from .models import Service
+from .history import HistoryStatus, QuotaObservation, SchemaVersionError, TokenObservation
+from .models import CodexSummary, Service
 
 # Soft cap for chart points. Mandatory points (first/last/resets/extrema)
 # may exceed this; the cap is expanded to accommodate them.
@@ -62,28 +62,39 @@ class SeriesView:
 
 @dataclass(frozen=True, slots=True)
 class TokenSummary:
-    """Aggregate token activity for one service in the selected range.
+    """Aggregate token activity for one service/period-kind in the selected range.
 
     Empty when no exact token data is available. Totals are the sum of all
-    token events in the range. Provenance is the source string.
-    Summary fields (lifetime, peak, streak, longest_turn) come from the
-    official Codex summary block and are displayed separately.
+    exact token events in the range. Earliest/latest use the activity day
+    (``period_start`` date part), independent of retrieval provenance.
+    The official Codex summary is a separate typed ``CodexSummary`` record
+    displayed apart from daily totals.
     """
 
     service: Service
     source: str
+    period_kind: str
     total_tokens: int
     event_count: int
     earliest_day: str | None
     latest_day: str | None
-    summary_lifetime: int | None = None
-    summary_peak: int | None = None
-    summary_streak: int | None = None
-    summary_longest_turn: int | None = None
 
     @property
     def has_data(self) -> bool:
         return self.event_count > 0
+
+
+@dataclass(frozen=True, slots=True)
+class TokenAvailabilityState:
+    """Typed, provider-neutral availability state for one service.
+
+    Only sanitized ``HistoryStatus`` enum values — never an arbitrary
+    status string. Carries the latest observed availability for the
+    service in the selected range.
+    """
+
+    service: Service
+    status: HistoryStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +110,8 @@ class HistoryViewResult:
     range_label: str
     filter_label: str
     token_summaries: tuple[TokenSummary, ...] = ()
+    token_availability: tuple[TokenAvailabilityState, ...] = ()
+    codex_summaries: tuple[CodexSummary, ...] = ()
 
 
 def _detect_resets(observations: list[QuotaObservation]) -> list[bool]:
@@ -258,62 +271,145 @@ def _group_observations(
 def _build_token_summaries(
     token_observations: list[TokenObservation],
 ) -> tuple[TokenSummary, ...]:
-    """Build TokenSummary objects from token observations, grouped by service+source.
+    """Build TokenSummary objects grouped by (service, period_kind).
 
-    Only AVAILABLE_EXACT observations contribute to totals. Summary fields
-    (lifetime, peak, streak, longest_turn) come from observations that carry
-    them.
+    Only AVAILABLE_EXACT observations contribute to totals. Earliest/latest
+    use the activity day (period_start date part); observed_at remains
+    retrieval provenance. The source shown is the latest observation's
+    source. The official aggregate summary is NOT folded in here — it is a
+    separate typed CodexSummary record displayed apart from daily totals.
     """
     if not token_observations:
         return ()
 
-    # Group by (service, source)
+    # Group by (service, period_kind) — canonical daily identity is
+    # independent of the display source.
     groups: dict[tuple[Service, str], list[TokenObservation]] = {}
     for obs in token_observations:
         if not obs.has_exact_tokens:
             continue
-        key = (obs.service, obs.source)
+        key = (obs.service, obs.period_kind)
         groups.setdefault(key, []).append(obs)
 
     summaries: list[TokenSummary] = []
-    for (service, source), obs_list in sorted(groups.items()):
-        total_sum = 0
-        days: list[datetime] = []
-        # Collect summary fields from the first observation that has them
-        summary_lifetime: int | None = None
-        summary_peak: int | None = None
-        summary_streak: int | None = None
-        summary_longest_turn: int | None = None
-
-        for obs in obs_list:
-            total_sum += obs.tokens or 0
-            days.append(obs.observed_at)
-            if summary_lifetime is None:
-                summary_lifetime = obs.summary_lifetime
-            if summary_peak is None:
-                summary_peak = obs.summary_peak
-            if summary_streak is None:
-                summary_streak = obs.summary_streak
-            if summary_longest_turn is None:
-                summary_longest_turn = obs.summary_longest_turn
-
-        days.sort()
+    for (service, period_kind), obs_list in sorted(
+        groups.items(), key=lambda item: (item[0][0].value, item[0][1])
+    ):
+        total_sum = sum(obs.tokens or 0 for obs in obs_list)
+        ordered = sorted(obs_list, key=lambda o: (o.day, o.observed_at))
         summaries.append(
             TokenSummary(
                 service=service,
-                source=source,
+                source=ordered[-1].source,
+                period_kind=period_kind,
                 total_tokens=total_sum,
                 event_count=len(obs_list),
-                earliest_day=days[0].strftime("%Y-%m-%d") if days else None,
-                latest_day=days[-1].strftime("%Y-%m-%d") if days else None,
-                summary_lifetime=summary_lifetime,
-                summary_peak=summary_peak,
-                summary_streak=summary_streak,
-                summary_longest_turn=summary_longest_turn,
+                earliest_day=ordered[0].day.isoformat(),
+                latest_day=ordered[-1].day.isoformat(),
             )
         )
 
     return tuple(summaries)
+
+
+def _build_token_availability(
+    token_observations: list[TokenObservation],
+) -> tuple[TokenAvailabilityState, ...]:
+    """Build the latest sanitized availability state per service.
+
+    Unsupported/temporary/invalid is a sanitized secondary state: it never
+    hides older exact data (exact rows keep their status) and never hides
+    quota charts (this is a note, not a diagnostic).
+    """
+    if not token_observations:
+        return ()
+    latest: dict[Service, TokenObservation] = {}
+    for obs in token_observations:
+        current = latest.get(obs.service)
+        if current is None or obs.observed_at > current.observed_at:
+            latest[obs.service] = obs
+    return tuple(
+        sorted(
+            (
+                TokenAvailabilityState(service=service, status=obs.status)
+                for service, obs in latest.items()
+            ),
+            key=lambda state: state.service.value,
+        )
+    )
+
+
+def _build_codex_summaries(summary_observations: list[CodexSummary]) -> tuple[CodexSummary, ...]:
+    """Keep only the newest official summary record per service.
+
+    Each record is one typed snapshot per refresh; the view displays the
+    latest one.
+    """
+    newest: dict[Service, CodexSummary] = {}
+    for summary in summary_observations:
+        current = newest.get(summary.service)
+        if current is None or summary.observed_at > current.observed_at:
+            newest[summary.service] = summary
+    return tuple(sorted(newest.values(), key=lambda s: s.service.value))
+
+
+# ── Pure display-text builders (translator injected, GTK-free) ──
+
+
+def build_token_summary_text(ts: TokenSummary, translator: Callable[[str], str]) -> str:
+    """Build the complete token-activity label as a pure function.
+
+    Daily totals (period_kind='day') and migrated 15-minute samples
+    (period_kind='bucket') are labeled separately.
+    """
+    _ = translator
+    parts: list[str] = [f"{ts.service.value.title()} {_('token activity')}"]
+    if ts.period_kind != "day":
+        parts[0] += f" ({_('15-min samples')})"
+    total_label = _("Daily total") if ts.period_kind == "day" else _("Total")
+    parts.append(f"{total_label}: {ts.total_tokens:,}")
+    if ts.earliest_day and ts.latest_day:
+        parts.append(f"{ts.earliest_day}–{ts.latest_day}")
+    parts.append(f"{_('Source')}: {ts.source}")
+    return _(" · ").join(parts)
+
+
+def build_codex_summary_text(summary: CodexSummary, translator: Callable[[str], str]) -> str:
+    """Build the official summary label as a pure function.
+
+    The official five-field summary is displayed separately from daily
+    totals. A fully-null summary renders as an em-dash placeholder.
+    """
+    _ = translator
+    fields: list[str] = []
+    if summary.lifetime_tokens is not None:
+        fields.append(f"{_('Lifetime')}: {summary.lifetime_tokens:,}")
+    if summary.peak_daily_tokens is not None:
+        fields.append(f"{_('Peak day')}: {summary.peak_daily_tokens:,}")
+    if summary.current_streak_days is not None:
+        fields.append(f"{_('Current streak')}: {summary.current_streak_days}")
+    if summary.longest_streak_days is not None:
+        fields.append(f"{_('Longest streak')}: {summary.longest_streak_days}")
+    if summary.longest_running_turn_sec is not None:
+        fields.append(f"{_('Longest turn')}: {summary.longest_running_turn_sec:,}s")
+    if not fields:
+        return f"{_('Codex summary')}: —"
+    return f"{_('Codex summary')} · " + _(" · ").join(fields)
+
+
+def build_token_availability_note(status: HistoryStatus, translator: Callable[[str], str]) -> str:
+    """Build the sanitized availability note text for one status.
+
+    Unsupported/temporary/invalid map to fixed sanitized strings — never
+    raw details. This note is secondary: it never hides older exact data
+    or quota charts.
+    """
+    _ = translator
+    if status is HistoryStatus.TEMPORARILY_UNAVAILABLE:
+        return _("Exact tokens temporarily unavailable")
+    if status is HistoryStatus.INVALID:
+        return _("Exact token data invalid")
+    return _("Exact token usage is not available")
 
 
 def prepare_history_view(
@@ -324,12 +420,15 @@ def prepare_history_view(
     diagnostic: str = "ok",
     max_points: int = MAX_CHART_POINTS,
     token_observations: list[TokenObservation] | None = None,
+    codex_summaries: list[CodexSummary] | None = None,
 ) -> HistoryViewResult:
     """Prepare an immutable HistoryViewResult from raw observations.
 
     Pure deterministic function. No I/O, no side effects.
     Each metric is rendered independently — Claude five-hour, Claude weekly,
-    and Codex weekly are never merged.
+    and Codex weekly are never merged. Persisted daily totals and the
+    official summary are carried separately; availability states are
+    sanitized secondary notes that never hide quota series.
     """
     groups = _group_observations(observations)
     series: list[SeriesView] = []
@@ -338,12 +437,15 @@ def prepare_history_view(
         stats = _build_stats(label, service, obs_list, resets)
         points = _reduce_points(obs_list, resets, max_points)
         series.append(SeriesView(stats=stats, points=points))
+    token_obs = token_observations or []
     return HistoryViewResult(
         series=tuple(series),
         diagnostic=diagnostic,
         range_label=range_label,
         filter_label=filter_label,
-        token_summaries=_build_token_summaries(token_observations or []),
+        token_summaries=_build_token_summaries(token_obs),
+        token_availability=_build_token_availability(token_obs),
+        codex_summaries=_build_codex_summaries(codex_summaries or []),
     )
 
 
@@ -394,10 +496,12 @@ def _safe_read(
             result = range_func(conn, now=now)
             quota_obs: list[QuotaObservation] = result.get("quota", [])
             token_obs: list[TokenObservation] = result.get("tokens", [])
+            summary_obs: list[CodexSummary] = result.get("summaries", [])
             if service is not None:
                 quota_obs = [o for o in quota_obs if o.service is service]
                 token_obs = [o for o in token_obs if o.service is service]
-            if not quota_obs and not token_obs:
+                summary_obs = [s for s in summary_obs if s.service is service]
+            if not quota_obs and not token_obs and not summary_obs:
                 return (
                     req_id,
                     HistoryViewResult(
@@ -412,6 +516,7 @@ def _safe_read(
                 range_label=range_label,
                 filter_label=filter_label,
                 token_observations=token_obs,
+                codex_summaries=summary_obs,
             )
             return (req_id, view)
         finally:

@@ -30,6 +30,9 @@ from .history_view import (  # noqa: E402
     SeriesStats,
     SeriesView,
     TokenSummary,
+    build_codex_summary_text,
+    build_token_availability_note,
+    build_token_summary_text,
 )
 from .i18n import tr  # noqa: E402
 from .models import Service  # noqa: E402
@@ -264,14 +267,28 @@ class HistoryPage(Gtk.Box):
             for s in view.series:
                 self._stats_box.append(self._series_stats_label(s))
 
-        # Token summaries
+        # Persisted daily totals (token activity), shown per service/kind
         token_summaries = getattr(view, "token_summaries", ())
-        if token_summaries:
-            for ts in token_summaries:
-                self._stats_box.append(self._token_summary_label(ts))
-            self._token_note.set_text("")
-        else:
-            self._token_note.set_text(_("Exact token usage is not available"))
+        for ts in token_summaries:
+            self._stats_box.append(self._token_summary_label(ts))
+
+        # Official Codex summary — displayed separately from daily totals
+        codex_summaries = getattr(view, "codex_summaries", ())
+        for cs in codex_summaries:
+            self._stats_box.append(self._codex_summary_label(cs))
+
+        # Availability note: sanitized secondary state. Never hides older
+        # exact data or quota charts — exact data simply suppresses the note.
+        availability = getattr(view, "token_availability", ())
+        notes: list[str] = []
+        for state in availability:
+            if any(ts.service is state.service for ts in token_summaries):
+                continue  # exact data is displayed for this service
+            text = build_token_availability_note(state.status, tr)
+            notes.append(f"{state.service.value.title()}: {text}")
+        if not token_summaries and not availability:
+            notes.append(_("Exact token usage is not available"))
+        self._token_note.set_text(_(" · ").join(notes))
 
         return False
 
@@ -283,26 +300,15 @@ class HistoryPage(Gtk.Box):
 
     @staticmethod
     def _token_summary_label(ts: TokenSummary) -> Gtk.Widget:
-        """Build a label showing token activity and summary for one service."""
-        _ = tr
-        parts: list[str] = [f"{ts.service.value.title()} {_('token activity')}"]
-        parts.append(f"{_('Daily total')}: {ts.total_tokens:,}")
-        if ts.earliest_day:
-            parts.append(f"{ts.earliest_day}–{ts.latest_day}")
-        # Official summary fields shown separately
-        summary_fields: list[str] = []
-        if ts.summary_lifetime is not None:
-            summary_fields.append(f"{_('Lifetime')}: {ts.summary_lifetime:,}")
-        if ts.summary_peak is not None:
-            summary_fields.append(f"{_('Peak')}: {ts.summary_peak:,}")
-        if ts.summary_streak is not None:
-            summary_fields.append(f"{_('Streak')}: {ts.summary_streak:,}")
-        if ts.summary_longest_turn is not None:
-            summary_fields.append(f"{_('Longest turn')}: {ts.summary_longest_turn:,}")
-        if summary_fields:
-            parts.append(f"{_('Summary')}: " + " · ".join(summary_fields))
-        parts.append(f"{_('Source')}: {ts.source}")
-        return Gtk.Label(label=_(" · ").join(parts), xalign=0, wrap=True)
+        """Build a label showing persisted daily token activity."""
+        text = build_token_summary_text(ts, tr)
+        return Gtk.Label(label=text, xalign=0, wrap=True)
+
+    @staticmethod
+    def _codex_summary_label(cs: Any) -> Gtk.Widget:
+        """Build a label showing the official Codex summary, apart from daily totals."""
+        text = build_codex_summary_text(cs, tr)
+        return Gtk.Label(label=text, xalign=0, wrap=True)
 
 
 def build_series_stats_text(
