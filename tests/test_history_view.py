@@ -1719,17 +1719,29 @@ def test_codex_summaries_in_view_newest_per_service() -> None:
 
 
 def test_token_availability_latest_status_per_service() -> None:
-    """Availability state is typed and reflects the latest observation."""
+    """Availability state is typed and reflects the latest availability record."""
     from moira.history_view import TokenAvailabilityState
+    from moira.models import TokenAvailabilityRecord
 
-    obs = [
-        _token_obs(NOW, status=HistoryStatus.INVALID, tokens=None),
-        _token_obs(
-            NOW + timedelta(minutes=1), status=HistoryStatus.TEMPORARILY_UNAVAILABLE, tokens=None
+    records = [
+        TokenAvailabilityRecord(
+            service=Service.CODEX,
+            observed_at=NOW,
+            source="codex-app-server",
+            status=HistoryStatus.INVALID,
+            detail="malformed",
+        ),
+        TokenAvailabilityRecord(
+            service=Service.CODEX,
+            observed_at=NOW + timedelta(minutes=1),
+            source="codex-app-server",
+            status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
+            detail="timeout",
         ),
     ]
     view = prepare_history_view(
-        [_obs(pct=50.0)], range_label="24h", filter_label="All", token_observations=obs
+        [_obs(pct=50.0)], range_label="24h", filter_label="All",
+        token_availability_records=records
     )
     assert len(view.token_availability) == 1
     state = view.token_availability[0]
@@ -1740,13 +1752,22 @@ def test_token_availability_latest_status_per_service() -> None:
 
 
 def test_availability_never_hides_exact_data() -> None:
-    """An invalid row alongside exact rows keeps the exact totals visible."""
-    obs = [
-        _token_obs(NOW, tokens=500),
-        _token_obs(NOW + timedelta(minutes=1), status=HistoryStatus.INVALID, tokens=None),
+    """An invalid availability alongside exact data coexists."""
+    from moira.models import TokenAvailabilityRecord
+
+    exact_obs = [_token_obs(NOW, tokens=500)]
+    avail_records = [
+        TokenAvailabilityRecord(
+            service=Service.CODEX,
+            observed_at=NOW + timedelta(minutes=1),
+            source="codex-app-server",
+            status=HistoryStatus.INVALID,
+            detail="malformed",
+        ),
     ]
     view = prepare_history_view(
-        [_obs(pct=50.0)], range_label="24h", filter_label="All", token_observations=obs
+        [_obs(pct=50.0)], range_label="24h", filter_label="All",
+        token_observations=exact_obs, token_availability_records=avail_records,
     )
     assert len(view.token_summaries) == 1
     assert view.token_summaries[0].total_tokens == 500

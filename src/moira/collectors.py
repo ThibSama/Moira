@@ -15,6 +15,7 @@ from .models import (
     QuotaReading,
     QuotaStatus,
     Service,
+    TokenAvailabilityRecord,
     TokenReading,
     utc_now,
 )
@@ -91,15 +92,13 @@ class CodexCollector:
                         "codex CLI not found",
                     ),
                 ),
-                token_readings=(
-                    TokenReading(
-                        service=Service.CODEX,
-                        day=now.date(),
-                        retrieved_at=now,
-                        source="codex-app-server",
-                        status=HistoryStatus.UNSUPPORTED,
-                        detail="codex CLI not found",
-                    ),
+                token_readings=(),
+                token_availability=TokenAvailabilityRecord(
+                    service=Service.CODEX,
+                    observed_at=now,
+                    source="codex-app-server",
+                    status=HistoryStatus.UNSUPPORTED,
+                    detail="codex CLI not found",
                 ),
             )
 
@@ -134,6 +133,7 @@ class CodexCollector:
             quota_readings: list[QuotaReading] = []
             token_readings: list[TokenReading] = []
             codex_summary: CodexSummary | None = None
+            token_availability: TokenAvailabilityRecord | None = None
 
             # ── Rate limits (quota) — independent deadline ──
             rate_deadline = time.monotonic() + 10
@@ -189,49 +189,48 @@ class CodexCollector:
                 usage_response = _read_response(process, 3, usage_deadline)
                 if "error" in usage_response:
                     # Auth/RPC-level rejection → temporarily unavailable
-                    token_readings.append(
-                        TokenReading(
-                            service=Service.CODEX,
-                            day=now.date(),
-                            retrieved_at=now,
-                            source=self.USAGE_SOURCE,
-                            status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
-                            detail="Codex usage request rejected",
-                        )
+                    token_availability = TokenAvailabilityRecord(
+                        service=Service.CODEX,
+                        observed_at=now,
+                        source=self.USAGE_SOURCE,
+                        status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
+                        detail="Codex usage request rejected",
                     )
                 else:
                     daily, summary_parsed = parse_codex_usage(usage_response, now)
                     token_readings.extend(daily)
                     codex_summary = summary_parsed
+                    # Successful response → AVAILABLE_EXACT (even with null buckets)
+                    token_availability = TokenAvailabilityRecord(
+                        service=Service.CODEX,
+                        observed_at=now,
+                        source=self.USAGE_SOURCE,
+                        status=HistoryStatus.AVAILABLE_EXACT,
+                    )
             except ParseError:
                 # Malformed success body → invalid
-                token_readings.append(
-                    TokenReading(
-                        service=Service.CODEX,
-                        day=now.date(),
-                        retrieved_at=now,
-                        source=self.USAGE_SOURCE,
-                        status=HistoryStatus.INVALID,
-                        detail="Codex usage response malformed",
-                    )
+                token_availability = TokenAvailabilityRecord(
+                    service=Service.CODEX,
+                    observed_at=now,
+                    source=self.USAGE_SOURCE,
+                    status=HistoryStatus.INVALID,
+                    detail="Codex usage response malformed",
                 )
             except (OSError, TimeoutError, json.JSONDecodeError):
                 # Transport/provider failure → temporarily unavailable
-                token_readings.append(
-                    TokenReading(
-                        service=Service.CODEX,
-                        day=now.date(),
-                        retrieved_at=now,
-                        source=self.USAGE_SOURCE,
-                        status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
-                        detail="Codex usage request failed",
-                    )
+                token_availability = TokenAvailabilityRecord(
+                    service=Service.CODEX,
+                    observed_at=now,
+                    source=self.USAGE_SOURCE,
+                    status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
+                    detail="Codex usage request failed",
                 )
 
             return CollectorResult(
                 quota_readings=tuple(quota_readings),
                 token_readings=tuple(token_readings),
                 codex_summary=codex_summary,
+                token_availability=token_availability,
             )
 
         except (OSError, TimeoutError, subprocess.SubprocessError, json.JSONDecodeError):
@@ -248,15 +247,13 @@ class CodexCollector:
                         "Codex app-server request failed",
                     ),
                 ),
-                token_readings=(
-                    TokenReading(
-                        service=Service.CODEX,
-                        day=now.date(),
-                        retrieved_at=now,
-                        source="codex-app-server",
-                        status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
-                        detail="Codex app-server request failed",
-                    ),
+                token_readings=(),
+                token_availability=TokenAvailabilityRecord(
+                    service=Service.CODEX,
+                    observed_at=now,
+                    source="codex-app-server",
+                    status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
+                    detail="Codex app-server request failed",
                 ),
             )
         finally:

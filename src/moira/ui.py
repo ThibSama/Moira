@@ -28,6 +28,7 @@ from .models import (
     QuotaReading,
     QuotaStatus,
     Service,
+    TokenAvailabilityRecord,
     TokenReading,
 )
 from .ntfy import Notification, send
@@ -225,6 +226,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.pending: list[QuotaReading] = []
         self.pending_tokens: list[TokenReading] = []
         self.pending_summary: CodexSummary | None = None
+        self.pending_availability: TokenAvailabilityRecord | None = None
         self.pending_lock = threading.Lock()
         self.completed = 0
         self._refresh_timer_id: int | None = None
@@ -393,6 +395,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.pending = []
         self.pending_tokens = []
         self.pending_summary = None
+        self.pending_availability = None
         self.completed = 0
         self.claude_card.status.set_text(_("Loading…"))
         self.codex_card.status.set_text(_("Loading…"))
@@ -411,6 +414,8 @@ class MainWindow(Adw.ApplicationWindow):
             self.pending_tokens.extend(result.token_readings)
             if result.codex_summary is not None:
                 self.pending_summary = result.codex_summary
+            if result.token_availability is not None:
+                self.pending_availability = result.token_availability
             self.completed += 1
             complete = self.completed == 2
         if complete:
@@ -451,6 +456,8 @@ class MainWindow(Adw.ApplicationWindow):
         combined.extend(self.pending_tokens)
         if self.pending_summary is not None:
             combined.append(self.pending_summary)
+        if self.pending_availability is not None:
+            combined.append(self.pending_availability)
         self._history_coordinator.enqueue(combined, now)
 
     def _on_close_request(self, *_: Any) -> bool:

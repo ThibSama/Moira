@@ -258,6 +258,54 @@ class TokenReading:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenAvailabilityRecord:
+    """A single typed availability observation per provider attempt.
+
+    Separate from daily token events: persisted independently so that
+    a temporary/unavailable/invalid state after exact data coexists with
+    and never alters exact totals. One observation per (service, observed_at)
+    — each provider attempt writes exactly one row.
+
+    The status is a frozen HistoryStatus value; detail is a sanitized
+    fixed string, never raw exception text.
+    """
+
+    service: Service
+    observed_at: datetime
+    source: str
+    status: HistoryStatus
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        if self.observed_at.tzinfo is None:
+            raise ValueError("observed_at must be timezone-aware")
+        if not self.source.strip():
+            raise ValueError("source must not be empty")
+        if not isinstance(self.status, HistoryStatus):
+            raise ValueError("status must be a HistoryStatus value")
+        object.__setattr__(self, "detail", str(self.detail or ""))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "service": self.service.value,
+            "observed_at": self.observed_at.isoformat(),
+            "source": self.source,
+            "status": self.status.value,
+            "detail": self.detail,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TokenAvailabilityRecord:
+        return cls(
+            service=Service(data["service"]),
+            observed_at=datetime.fromisoformat(data["observed_at"]),
+            source=str(data["source"]),
+            status=HistoryStatus(data["status"]),
+            detail=str(data.get("detail", "")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class CollectorResult:
     """Typed output from a single collector refresh.
 
@@ -266,8 +314,11 @@ class CollectorResult:
     codex_summary carries the official aggregate summary (lifetime, peak,
     streaks, longest turn) as one typed immutable record when available
     from the usage surface.
+    token_availability carries the provider-neutral availability observation
+    for this attempt — always emitted, one per collection.
     """
 
     quota_readings: tuple[QuotaReading, ...]
     token_readings: tuple[TokenReading, ...]
     codex_summary: CodexSummary | None = None
+    token_availability: TokenAvailabilityRecord | None = None

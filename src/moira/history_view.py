@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .history import HistoryStatus, QuotaObservation, SchemaVersionError, TokenObservation
-from .models import CodexSummary, Service
+from .models import CodexSummary, Service, TokenAvailabilityRecord
 
 # Soft cap for chart points. Mandatory points (first/last/resets/extrema)
 # may exceed this; the cap is expanded to accommodate them.
@@ -312,27 +312,28 @@ def _build_token_summaries(
     return tuple(summaries)
 
 
-def _build_token_availability(
-    token_observations: list[TokenObservation],
+def _build_token_availability_from_records(
+    avail_records: list[TokenAvailabilityRecord],
 ) -> tuple[TokenAvailabilityState, ...]:
     """Build the latest sanitized availability state per service.
 
-    Unsupported/temporary/invalid is a sanitized secondary state: it never
-    hides older exact data (exact rows keep their status) and never hides
-    quota charts (this is a note, not a diagnostic).
+    Reads from dedicated token_availability records — one per provider
+    attempt. Only the latest observed_at per service is kept.
+    Independent from daily token_events: a non-exact state after exact
+    daily data coexists with and never alters exact totals.
     """
-    if not token_observations:
+    if not avail_records:
         return ()
-    latest: dict[Service, TokenObservation] = {}
-    for obs in token_observations:
-        current = latest.get(obs.service)
-        if current is None or obs.observed_at > current.observed_at:
-            latest[obs.service] = obs
+    latest: dict[Service, TokenAvailabilityRecord] = {}
+    for rec in avail_records:
+        current = latest.get(rec.service)
+        if current is None or rec.observed_at > current.observed_at:
+            latest[rec.service] = rec
     return tuple(
         sorted(
             (
-                TokenAvailabilityState(service=service, status=obs.status)
-                for service, obs in latest.items()
+                TokenAvailabilityState(service=service, status=rec.status)
+                for service, rec in latest.items()
             ),
             key=lambda state: state.service.value,
         )
@@ -421,6 +422,7 @@ def prepare_history_view(
     max_points: int = MAX_CHART_POINTS,
     token_observations: list[TokenObservation] | None = None,
     codex_summaries: list[CodexSummary] | None = None,
+    token_availability_records: list[TokenAvailabilityRecord] | None = None,
 ) -> HistoryViewResult:
     """Prepare an immutable HistoryViewResult from raw observations.
 
@@ -428,7 +430,8 @@ def prepare_history_view(
     Each metric is rendered independently — Claude five-hour, Claude weekly,
     and Codex weekly are never merged. Persisted daily totals and the
     official summary are carried separately; availability states are
-    sanitized secondary notes that never hide quota series.
+    sanitized secondary notes from dedicated records that never hide quota
+    series.
     """
     groups = _group_observations(observations)
     series: list[SeriesView] = []
@@ -438,13 +441,14 @@ def prepare_history_view(
         points = _reduce_points(obs_list, resets, max_points)
         series.append(SeriesView(stats=stats, points=points))
     token_obs = token_observations or []
+    avail_records = token_availability_records or []
     return HistoryViewResult(
         series=tuple(series),
         diagnostic=diagnostic,
         range_label=range_label,
         filter_label=filter_label,
         token_summaries=_build_token_summaries(token_obs),
-        token_availability=_build_token_availability(token_obs),
+        token_availability=_build_token_availability_from_records(avail_records),
         codex_summaries=_build_codex_summaries(codex_summaries or []),
     )
 
@@ -473,7 +477,7 @@ def _safe_read(
     """Perform the SQLite read on the worker thread with proper error handling."""
     from pathlib import Path
 
-    from .history_db import _connect, init_schema
+    from .history_db import _connect, init_schema, query_token_availability
 
     path = Path(db_path) if not isinstance(db_path, Path) else db_path
 
@@ -497,11 +501,17 @@ def _safe_read(
             quota_obs: list[QuotaObservation] = result.get("quota", [])
             token_obs: list[TokenObservation] = result.get("tokens", [])
             summary_obs: list[CodexSummary] = result.get("summaries", [])
+            # Query token_availability separately (dedicated table)
+            since = now - __import__("datetime").timedelta(days=90)
+            avail_records: list[TokenAvailabilityRecord] = query_token_availability(
+                conn, since=since
+            )
             if service is not None:
                 quota_obs = [o for o in quota_obs if o.service is service]
                 token_obs = [o for o in token_obs if o.service is service]
                 summary_obs = [s for s in summary_obs if s.service is service]
-            if not quota_obs and not token_obs and not summary_obs:
+                avail_records = [a for a in avail_records if a.service is service]
+            if not quota_obs and not token_obs and not summary_obs and not avail_records:
                 return (
                     req_id,
                     HistoryViewResult(
@@ -517,6 +527,7 @@ def _safe_read(
                 filter_label=filter_label,
                 token_observations=token_obs,
                 codex_summaries=summary_obs,
+                token_availability_records=avail_records,
             )
             return (req_id, view)
         finally:

@@ -41,10 +41,10 @@ from .history import (
     SchemaVersionError,
     TokenObservation,
 )
-from .models import CodexSummary, Service, TokenReading
+from .models import CodexSummary, Service, TokenAvailabilityRecord, TokenReading
 from .persistence import state_dir
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 RETENTION_DAYS = 90
 BUCKET_MINUTES = 15
 
@@ -78,6 +78,66 @@ def _connect(path: Path | None = None, *, timeout: float = 5.0) -> sqlite3.Conne
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
+
+SCHEMA_SQL_V4 = """\
+CREATE TABLE IF NOT EXISTS schema_meta (
+    version INTEGER PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS quota_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    service         TEXT    NOT NULL,
+    quota_label     TEXT    NOT NULL,
+    percentage      REAL    NOT NULL,
+    reset_at        TEXT    NOT NULL,
+    observed_at     TEXT    NOT NULL,
+    source          TEXT    NOT NULL,
+    bucket          TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'available_exact',
+    is_change       INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (service, quota_label, bucket, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_quota_obs_time ON quota_observations (observed_at);
+CREATE INDEX IF NOT EXISTS idx_quota_obs_service ON quota_observations (service, quota_label);
+CREATE TABLE IF NOT EXISTS token_events (
+    event_key               TEXT PRIMARY KEY,
+    service                 TEXT    NOT NULL,
+    period_start            TEXT    NOT NULL,
+    period_kind             TEXT    NOT NULL,
+    observed_at             TEXT    NOT NULL,
+    source                  TEXT    NOT NULL,
+    status                  TEXT    NOT NULL,
+    input_tokens            INTEGER,
+    cached_input_tokens     INTEGER,
+    output_tokens           INTEGER,
+    reasoning_output_tokens INTEGER,
+    total_tokens            INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_token_events_time ON token_events (observed_at);
+CREATE INDEX IF NOT EXISTS idx_token_events_service ON token_events (service);
+CREATE INDEX IF NOT EXISTS idx_token_events_period ON token_events (period_start);
+CREATE TABLE IF NOT EXISTS codex_summaries (
+    service                 TEXT    NOT NULL,
+    observed_at             TEXT    NOT NULL,
+    source                  TEXT    NOT NULL,
+    lifetime_tokens         INTEGER,
+    peak_daily_tokens       INTEGER,
+    current_streak_days     INTEGER,
+    longest_streak_days     INTEGER,
+    longest_running_turn_sec INTEGER,
+    PRIMARY KEY (service, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_codex_summaries_time ON codex_summaries (observed_at);
+CREATE TABLE IF NOT EXISTS token_availability (
+    service     TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (service, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_token_avail_service ON token_availability (service);
+CREATE INDEX IF NOT EXISTS idx_token_avail_time ON token_availability (observed_at);
+"""
 
 SCHEMA_SQL_V3 = """\
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -479,30 +539,98 @@ CREATE TABLE IF NOT EXISTS codex_summaries (
 
 REQUIRED_V3_TABLES = ("schema_meta", "quota_observations", "token_events")
 
+REQUIRED_V4_TABLES = (
+    "schema_meta",
+    "quota_observations",
+    "token_events",
+    "codex_summaries",
+    "token_availability",
+)
 
-def _has_all_v3_tables(conn: sqlite3.Connection) -> bool:
-    """Return True when every table required by schema v3 exists."""
+
+def _has_all_v4_tables(conn: sqlite3.Connection) -> bool:
+    """Return True when every table required by schema v4 exists."""
     present = {
         row[0]
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
-    return all(table in present for table in REQUIRED_V3_TABLES)
+    return all(table in present for table in REQUIRED_V4_TABLES)
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """Transactionally migrate a v3 schema to v4.
+
+    Preserves all existing quota, token_events, and codex_summaries rows.
+    Creates the ``token_availability`` table (the only v4 addition).
+    Rolls back fully on any failure. Requires every v3 table to exist
+    before beginning — incomplete v3 databases fail closed.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not _has_all_v4_tables(conn):
+            # Some required tables are still missing — this v3 database
+            # is incomplete. Check the v3 set first for a clearer error.
+            missing_v3 = [
+                t
+                for t in REQUIRED_V3_TABLES
+                if t
+                not in {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+            ]
+            if missing_v3:
+                raise SchemaVersionError("history database is incomplete: missing tables from v3")
+            # v3 tables exist but v4 tables don't — create the v4 additions
+            conn.execute(
+                """\
+CREATE TABLE IF NOT EXISTS token_availability (
+    service     TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (service, observed_at)
+)"""
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_token_avail_service ON token_availability (service)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_token_avail_time "
+                "ON token_availability (observed_at)"
+            )
+
+        conn.execute("UPDATE schema_meta SET version = 4 WHERE version = 3")
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
     """Initialize or migrate the schema. Throws on irrecoverable mismatch.
 
-    Inspects the existing schema version BEFORE any v3 DDL. If the database
-    is fresh (no schema_meta table), creates v3 directly. If at v1 or v2,
-    runs the incremental migration path. The v3 DDL is never applied to a
-    non-v3 database — migrations run their own targeted DDL inside explicit
-    transactions. Failed migration leaves version, tables, indexes and rows
-    exactly as they were before.
+    Inspects the existing schema version BEFORE any DDL. If the database
+    is fresh (no schema_meta table), creates v4 directly inside an
+    explicit all-or-nothing transaction. If at v1, v2, or v3, runs the
+    incremental migration path. Failed migration leaves version, tables,
+    indexes and rows exactly as they were before.
 
-    Fail-closed completeness: an incomplete database is never labeled v3.
+    Fail-closed completeness: an incomplete database is never labeled v4.
     A metadata table with no version row is repaired transactionally only
-    when every v3 table exists; otherwise (or when a version row claims v3
-    but tables are missing) init_schema raises SchemaVersionError.
+    when every v4 table exists; otherwise (or when a version row claims a
+    known version but required tables are missing) init_schema raises
+    SchemaVersionError.
+
+    Fresh-init atomicity: forced DDL or metadata failure inside the
+    fresh-init transaction leaves no falsely labeled schema — the
+    version row and all tables are committed together or not at all.
     """
     # Detect the existing version before creating anything
     has_meta = (
@@ -515,10 +643,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
         row = conn.execute("SELECT version FROM schema_meta").fetchone()
         if row is None:
             # Table exists but no version row. Repair transactionally only
-            # when the v3 tables are complete; otherwise fail closed.
-            if not _has_all_v3_tables(conn):
+            # when the v4 tables are complete; otherwise fail closed.
+            if not _has_all_v4_tables(conn):
                 raise SchemaVersionError(
-                    "history database is incomplete: cannot label it v3 without all required tables"
+                    "history database is incomplete: cannot label it v4 without all required tables"
                 )
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -534,30 +662,43 @@ def init_schema(conn: sqlite3.Connection) -> None:
         if row[0] == 1:
             _migrate_v1_to_v2(conn)
             _migrate_v2_to_v3(conn)
+            _migrate_v3_to_v4(conn)
             _reconcile_legacy_keys(conn)
             return
         if row[0] == 2:
             _migrate_v2_to_v3(conn)
+            _migrate_v3_to_v4(conn)
+            _reconcile_legacy_keys(conn)
+            return
+        if row[0] == 3:
+            _migrate_v3_to_v4(conn)
             _reconcile_legacy_keys(conn)
             return
         if row[0] != SCHEMA_VERSION:
             raise SchemaVersionError(
                 f"history database schema version {row[0]} does not match expected {SCHEMA_VERSION}"
             )
-        # Already at v3: verify completeness — never trust a version label
+        # Already at v4: verify completeness — never trust a version label
         # on a database missing required tables.
-        if not _has_all_v3_tables(conn):
+        if not _has_all_v4_tables(conn):
             raise SchemaVersionError(
-                "history database is incomplete: version row claims v3 but "
+                "history database is incomplete: version row claims v4 but "
                 "required tables are missing"
             )
         _reconcile_legacy_keys(conn)
         return
 
-    # Fresh database: create v3 directly
-    conn.executescript(SCHEMA_SQL_V3)
+    # Fresh database: create v4 inside an explicit all-or-nothing transaction.
+    # Partial creation from forced DDL or metadata failure leaves no falsely
+    # labeled schema — the version row and all tables commit together or
+    # roll back together. exec script is NOT used so that the version row
+    # and DDL stay inside a single transaction.
     conn.execute("BEGIN IMMEDIATE")
     try:
+        for statement in SCHEMA_SQL_V4.split(";"):
+            stmt = statement.strip()
+            if stmt:
+                conn.execute(stmt)
         conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
         conn.execute("COMMIT")
     except Exception:
@@ -660,15 +801,20 @@ def record_token(
     *,
     now: datetime | None = None,
 ) -> bool:
-    """Record a token observation as a token_events row (v3 schema compat).
+    """Record a token observation as a token_events row.
+
+    Only AVAILABLE_EXACT observations are written to token_events.
+    Non-exact availability states are handled separately via
+    token_availability — they never appear in token_events.
 
     Generates the canonical event key from (service, period_kind,
-    period_start) for idempotent upsert. Returns True. Purges old rows
-    after a successful write.
+    period_start) for idempotent upsert. Returns True if written.
+    Purges old rows after a successful write.
 
-    Only total_tokens is populated; breakdown columns are NULL (schema v3
-    columns retained for backward compatibility but no longer written).
+    Only total_tokens is populated; breakdown columns are NULL.
     """
+    if obs.status is not HistoryStatus.AVAILABLE_EXACT:
+        return False
     clock = now or datetime.now(UTC)
     period_start_iso = _serialize_period_start(obs.period_start, obs.period_kind)
     observed_iso = obs.observed_at.isoformat()
@@ -712,17 +858,16 @@ def record_token_events(
 ) -> int:
     """Record validated daily token usage readings as token_events.
 
+    Only AVAILABLE_EXACT readings are written to token_events. Non-exact
+    availability states (UNSUPPORTED, TEMPORARILY_UNAVAILABLE, INVALID) are
+    handled separately by the caller via token_availability — they never
+    appear in token_events.
+
     Each TokenReading produces one token_events row with the canonical event
     key derived from (service, period_kind='day', day) — independent of the
     display source, so a source wording change updates the same row via
     INSERT OR REPLACE. Idempotent: replay of the same (service, day) upserts
     the values.
-
-    Availability policy: AVAILABLE_EXACT readings always upsert the canonical
-    row. Non-exact statuses (UNSUPPORTED, TEMPORARILY_UNAVAILABLE, INVALID)
-    are persisted as sanitized secondary state on the same canonical key, but
-    they never replace an existing exact row for that day — older exact data
-    is never hidden. A later exact reading replaces any non-exact row.
 
     Returns the number of events written. Purges old rows after write.
     """
@@ -736,49 +881,26 @@ def record_token_events(
             if not isinstance(reading, TokenReading):
                 continue
 
+            # Only AVAILABLE_EXACT rows are stored in token_events
+            if reading.status is not HistoryStatus.AVAILABLE_EXACT:
+                continue
+            if reading.tokens is None:
+                continue
+
             event_key = _make_event_key(reading.service, "day", reading.day)
-
-            if reading.status is HistoryStatus.AVAILABLE_EXACT:
-                if reading.tokens is None:
-                    continue
-                conn.execute(
-                    "INSERT OR REPLACE INTO token_events "
-                    "(event_key, service, period_start, period_kind, observed_at, source, "
-                    "status, input_tokens, cached_input_tokens, output_tokens, "
-                    "reasoning_output_tokens, total_tokens) "
-                    "VALUES (?, ?, ?, 'day', ?, ?, 'available_exact', NULL, NULL, NULL, NULL, ?)",
-                    (
-                        event_key,
-                        reading.service.value,
-                        reading.day.isoformat(),
-                        observed_iso,
-                        reading.source,
-                        reading.tokens,
-                    ),
-                )
-                written += 1
-                continue
-
-            # Non-exact availability: sanitized secondary state on the same
-            # canonical day key. Never hide older exact data.
-            existing = conn.execute(
-                "SELECT status FROM token_events WHERE event_key = ?", (event_key,)
-            ).fetchone()
-            if existing is not None and existing[0] == "available_exact":
-                continue
             conn.execute(
                 "INSERT OR REPLACE INTO token_events "
                 "(event_key, service, period_start, period_kind, observed_at, source, "
                 "status, input_tokens, cached_input_tokens, output_tokens, "
                 "reasoning_output_tokens, total_tokens) "
-                "VALUES (?, ?, ?, 'day', ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
+                "VALUES (?, ?, ?, 'day', ?, ?, 'available_exact', NULL, NULL, NULL, NULL, ?)",
                 (
                     event_key,
                     reading.service.value,
                     reading.day.isoformat(),
                     observed_iso,
                     reading.source,
-                    reading.status.value,
+                    reading.tokens,
                 ),
             )
             written += 1
@@ -819,7 +941,10 @@ def _purge(conn: sqlite3.Connection, now: datetime) -> int:
     summary_deleted = conn.execute(
         "DELETE FROM codex_summaries WHERE observed_at < ?", (instant_boundary,)
     ).rowcount
-    return quota_deleted + token_deleted + summary_deleted
+    avail_deleted = conn.execute(
+        "DELETE FROM token_availability WHERE observed_at < ?", (instant_boundary,)
+    ).rowcount
+    return quota_deleted + token_deleted + summary_deleted + avail_deleted
 
 
 def query_quota(
@@ -880,8 +1005,8 @@ def query_token(
     day_boundary = since.date().isoformat()
     instant_boundary = since.isoformat()
     clauses = [
-        "(period_kind = 'day' AND period_start >= ?) "
-        "OR (period_kind = 'bucket' AND period_start >= ?)"
+        "((period_kind = 'day' AND period_start >= ?) "
+        "OR (period_kind = 'bucket' AND period_start >= ?))"
     ]
     params: list[object] = [day_boundary, instant_boundary]
     if service is not None:
@@ -987,6 +1112,78 @@ def query_codex_summaries(
     ]
 
 
+def record_token_availability(
+    conn: sqlite3.Connection,
+    avail: TokenAvailabilityRecord,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Record one token availability observation per provider attempt.
+
+    Keyed by (service, observed_at) — each attempt writes exactly one
+    row via INSERT OR REPLACE. Independent from daily token_events:
+    a non-exact state after exact daily data coexists with and never
+    alters exact totals. Purges old rows after a successful write.
+    """
+    clock = now or datetime.now(UTC)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO token_availability "
+            "(service, observed_at, source, status, detail) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                avail.service.value,
+                avail.observed_at.isoformat(),
+                avail.source,
+                avail.status.value,
+                avail.detail,
+            ),
+        )
+        _purge(conn, clock)
+        conn.execute("COMMIT")
+        return True
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+
+
+def query_token_availability(
+    conn: sqlite3.Connection,
+    *,
+    since: datetime,
+    service: Service | None = None,
+) -> list[TokenAvailabilityRecord]:
+    """Return token availability observations since ``since``.
+
+    Newest observed_at first. One row per provider attempt.
+    """
+    clauses = ["observed_at >= ?"]
+    params: list[object] = [since.isoformat()]
+    if service is not None:
+        clauses.append("service = ?")
+        params.append(service.value)
+    where = " AND ".join(clauses)
+    rows = conn.execute(
+        "SELECT service, observed_at, source, status, detail "
+        f"FROM token_availability WHERE {where} ORDER BY observed_at DESC",
+        params,
+    ).fetchall()
+    return [
+        TokenAvailabilityRecord(
+            service=Service(row[0]),
+            observed_at=datetime.fromisoformat(row[1]),
+            source=row[2],
+            status=HistoryStatus(row[3]),
+            detail=row[4],
+        )
+        for row in rows
+    ]
+
+
 def query_24h(conn: sqlite3.Connection, *, now: datetime | None = None) -> dict[str, list[Any]]:
     """Return quota, token, and summary observations from the last 24 hours."""
     clock = now or datetime.now(UTC)
@@ -1038,8 +1235,9 @@ def delete_all(conn: sqlite3.Connection) -> int:
         q = conn.execute("DELETE FROM quota_observations").rowcount
         t = conn.execute("DELETE FROM token_events").rowcount
         s = conn.execute("DELETE FROM codex_summaries").rowcount
+        a = conn.execute("DELETE FROM token_availability").rowcount
         conn.execute("COMMIT")
-        return q + t + s
+        return q + t + s + a
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -1056,10 +1254,12 @@ def record_refresh(
 ) -> None:
     """Record fresh validated quota, token, and summary observations from a refresh batch.
 
-    Handles QuotaReading (only AVAILABLE stored), TokenReading (exact and
-    non-exact availability stored via canonical day keys), and CodexSummary
-    (one typed record per refresh). Non-available quota readings are
-    silently skipped.
+    Handles QuotaReading (only AVAILABLE stored), TokenReading (exact daily
+    tokens stored to token_events), CodexSummary (one typed record per
+    refresh), and TokenAvailabilityRecord (one per provider attempt).
+    Non-available quota readings are silently skipped.
+    Non-exact TokenReadings are converted to token_availability writes by
+    the caller (collector) — token_events only stores AVAILABLE_EXACT rows.
 
     Failure is caught by the caller; this function raises on DB errors so
     the caller can produce a sanitized diagnostic.
@@ -1072,6 +1272,7 @@ def record_refresh(
     quota_readings: list[QuotaReading] = []
     token_readings: list[TokenReading] = []
     summary: CodexSummary | None = None
+    avail: TokenAvailabilityRecord | None = None
 
     for reading in readings:
         if isinstance(reading, QuotaReading):
@@ -1084,6 +1285,8 @@ def record_refresh(
             token_readings.append(reading)
         elif isinstance(reading, CodexSummary):
             summary = reading
+        elif isinstance(reading, TokenAvailabilityRecord):
+            avail = reading
 
     # Write quota observations
     for reading in quota_readings:
@@ -1100,13 +1303,17 @@ def record_refresh(
         )
         record_quota(conn, obs, now=clock)
 
-    # Write token events (exact + sanitized availability states)
+    # Write token events (only AVAILABLE_EXACT rows)
     if token_readings:
         record_token_events(conn, token_readings, now=clock)
 
     # Write the official summary as one typed record, never duplicated
     if summary is not None:
         record_codex_summary(conn, summary, now=clock)
+
+    # Write the token availability observation — one per provider attempt
+    if avail is not None:
+        record_token_availability(conn, avail, now=clock)
 
 
 def write_history_safely(

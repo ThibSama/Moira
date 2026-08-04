@@ -152,8 +152,8 @@ def _v1_db(tmp_path: Path) -> sqlite3.Connection:
 # ── Schema and versioning ──
 
 
-def test_schema_version_is_3() -> None:
-    assert SCHEMA_VERSION == 3
+def test_schema_version_is_4() -> None:
+    assert SCHEMA_VERSION == 4
 
 
 def test_init_schema_creates_tables(tmp_path: Path) -> None:
@@ -213,9 +213,9 @@ def test_populated_v1_migrates_without_loss(tmp_path: Path) -> None:
     # Open and init_schema should trigger migration v1 → v2 → v3
     conn = _connect(tmp_path / "history.sqlite3")
     init_schema(conn)
-    # Verify version is now 3
+    # Verify version is now 4
     row = conn.execute("SELECT version FROM schema_meta").fetchone()
-    assert row[0] == 3
+    assert row[0] == 4
     # Verify the row survived
     rows = query_quota(conn, since=NOW - timedelta(hours=1))
     assert len(rows) == 1
@@ -240,10 +240,10 @@ def test_v1_migration_rollback_on_failure(tmp_path: Path) -> None:
 
 
 def test_fresh_db_created_at_v3(tmp_path: Path) -> None:
-    """A brand-new database is created at v3 without needing migration."""
+    """A brand-new database is created at v4 without needing migration."""
     conn = _db(tmp_path)
     row = conn.execute("SELECT version FROM schema_meta").fetchone()
-    assert row[0] == 3
+    assert row[0] == 4
     conn.close()
 
 
@@ -588,13 +588,13 @@ def test_token_available_exact_has_tokens() -> None:
 
 
 def test_token_record_unsupported(tmp_path: Path) -> None:
+    """record_token only stores AVAILABLE_EXACT. Non-exact returns False."""
     conn = _db(tmp_path)
     obs = TokenObservation.unsupported(Service.CLAUDE, NOW, "fixture")
-    record_token(conn, obs, now=NOW)
+    result = record_token(conn, obs, now=NOW)
+    assert result is False  # non-exact not stored in token_events
     rows = query_token(conn, since=NOW - timedelta(hours=1))
-    assert len(rows) == 1
-    assert rows[0].status is HistoryStatus.UNSUPPORTED
-    assert rows[0].tokens is None
+    assert len(rows) == 0
     conn.close()
 
 
@@ -1706,7 +1706,7 @@ def test_v2_to_v3_migration_preserves_token_rows(tmp_path: Path) -> None:
     conn = _connect(db_path)
     init_schema(conn)
     row = conn.execute("SELECT version FROM schema_meta").fetchone()
-    assert row[0] == 3
+    assert row[0] == 4
     rows = query_token(conn, since=NOW - timedelta(hours=2))
     assert len(rows) == 2
     total = sum(r.tokens or 0 for r in rows)
@@ -2170,28 +2170,59 @@ def test_non_exact_status_never_hides_exact_data(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_non_exact_status_persisted_when_no_exact_data(tmp_path: Path) -> None:
-    """Without exact data, the sanitized availability state is persisted."""
+def test_non_exact_status_persisted_via_availability(tmp_path: Path) -> None:
+    """Non-exact availability is persisted in token_availability, not token_events."""
     conn = _db(tmp_path)
-    temp = _token_reading(NOW, tokens=None, status=HistoryStatus.TEMPORARILY_UNAVAILABLE)
-    record_token_events(conn, [temp], now=NOW)
+    from moira.history_db import record_token_availability, query_token_availability
+    from moira.models import TokenAvailabilityRecord
+
+    avail = TokenAvailabilityRecord(
+        service=Service.CODEX,
+        observed_at=NOW,
+        source="codex-app-server",
+        status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
+        detail="test",
+    )
+    record_token_availability(conn, avail, now=NOW)
     rows = query_token(conn, since=NOW - timedelta(hours=1))
-    assert len(rows) == 1
-    assert rows[0].status is HistoryStatus.TEMPORARILY_UNAVAILABLE
-    assert rows[0].tokens is None
+    assert len(rows) == 0  # token_events is empty
+    avail_rows = query_token_availability(conn, since=NOW - timedelta(hours=1))
+    assert len(avail_rows) == 1
+    assert avail_rows[0].status is HistoryStatus.TEMPORARILY_UNAVAILABLE
+    assert avail_rows[0].detail == "test"
     conn.close()
 
 
-def test_later_exact_replaces_non_exact(tmp_path: Path) -> None:
+def test_availability_coexists_with_exact_data(tmp_path: Path) -> None:
+    """Availability state coexists with exact daily data — never alters totals."""
     conn = _db(tmp_path)
-    invalid = _token_reading(NOW, tokens=None, status=HistoryStatus.INVALID)
-    record_token_events(conn, [invalid], now=NOW)
+    from moira.history_db import record_token_availability, query_token_availability
+    from moira.models import TokenAvailabilityRecord
+
+    # Write exact data first
     exact = _token_reading(NOW, tokens=800)
-    record_token_events(conn, [exact], now=NOW + timedelta(minutes=1))
+    record_token_events(conn, [exact], now=NOW)
+
+    # Then write a non-exact availability observation (e.g. temporary outage)
+    avail = TokenAvailabilityRecord(
+        service=Service.CODEX,
+        observed_at=NOW + timedelta(minutes=5),
+        source="codex-app-server",
+        status=HistoryStatus.TEMPORARILY_UNAVAILABLE,
+        detail="transient failure",
+    )
+    record_token_availability(conn, avail, now=NOW + timedelta(minutes=5))
+
+    # Exact data survives unchanged
     rows = query_token(conn, since=NOW - timedelta(hours=1))
     assert len(rows) == 1
     assert rows[0].status is HistoryStatus.AVAILABLE_EXACT
     assert rows[0].tokens == 800
+
+    # Availability is tracked independently
+    avail_rows = query_token_availability(conn, since=NOW - timedelta(hours=1))
+    assert len(avail_rows) == 1
+    assert avail_rows[0].status is HistoryStatus.TEMPORARILY_UNAVAILABLE
     conn.close()
 
 

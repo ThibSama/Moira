@@ -120,10 +120,13 @@ def test_handshake_requests_both_surfaces_independently() -> None:
     assert result.codex_summary.longest_running_turn_sec == 1500
     assert result.codex_summary.service == Service.CODEX
     assert result.codex_summary.source == CodexCollector.USAGE_SOURCE
+    # Token availability is always emitted — one per provider attempt
+    assert result.token_availability is not None
+    assert result.token_availability.status is HistoryStatus.AVAILABLE_EXACT
 
 
 def test_usage_failure_preserves_quota() -> None:
-    """When usage request fails, quota survives with a TEMPORARILY_UNAVAILABLE token."""
+    """When usage request fails, quota survives. Availability is TEMPORARILY_UNAVAILABLE."""
     events: list[str] = []
     process = FakeProcess(events)
 
@@ -145,14 +148,15 @@ def test_usage_failure_preserves_quota() -> None:
 
     assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
     assert result.quota_readings[0].quota_label == "Weekly"
-    # Usage failure produces a temporarily_unavailable token reading
-    assert len(result.token_readings) == 1
-    assert result.token_readings[0].status == "temporarily_unavailable"
-    assert result.token_readings[0].detail == "Codex usage request failed"
+    # Usage failure produces token_availability, not TokenReadings
+    assert len(result.token_readings) == 0
+    assert result.token_availability is not None
+    assert result.token_availability.status is HistoryStatus.TEMPORARILY_UNAVAILABLE
+    assert result.token_availability.detail == "Codex usage request failed"
 
 
 def test_usage_rpc_error_preserves_quota() -> None:
-    """When usage returns an RPC error, quota survives with temporarily_unavailable token."""
+    """When usage returns an RPC error, quota survives. Availability is TEMPORARILY_UNAVAILABLE."""
     events: list[str] = []
     process = FakeProcess(events)
 
@@ -173,12 +177,14 @@ def test_usage_rpc_error_preserves_quota() -> None:
         result = CodexCollector().collect()
 
     assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
-    assert len(result.token_readings) == 1
-    assert result.token_readings[0].status == "temporarily_unavailable"
+    assert len(result.token_readings) == 0
+    assert result.token_availability is not None
+    assert result.token_availability.status is HistoryStatus.TEMPORARILY_UNAVAILABLE
+    assert result.token_availability.detail == "Codex usage request rejected"
 
 
 def test_usage_parse_error_produces_invalid() -> None:
-    """Malformed usage response body produces an INVALID token reading."""
+    """Malformed usage response body produces an INVALID availability observation."""
     events: list[str] = []
     process = FakeProcess(events)
 
@@ -199,9 +205,10 @@ def test_usage_parse_error_produces_invalid() -> None:
         result = CodexCollector().collect()
 
     assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
-    assert len(result.token_readings) == 1
-    assert result.token_readings[0].status == "invalid"
-    assert result.token_readings[0].detail == "Codex usage response malformed"
+    assert len(result.token_readings) == 0
+    assert result.token_availability is not None
+    assert result.token_availability.status is HistoryStatus.INVALID
+    assert result.token_availability.detail == "Codex usage response malformed"
 
 
 def test_timeout_terminates_process_group_and_sanitizes_error() -> None:
@@ -216,9 +223,10 @@ def test_timeout_terminates_process_group_and_sanitizes_error() -> None:
         result = CodexCollector().collect()
     assert result.quota_readings[0].status is QuotaStatus.ERROR
     assert result.quota_readings[0].detail == "Codex app-server request failed"
-    # Token reading shows temporarily unavailable
-    assert len(result.token_readings) == 1
-    assert result.token_readings[0].status == "temporarily_unavailable"
+    # Availability shows temporarily_unavailable
+    assert len(result.token_readings) == 0
+    assert result.token_availability is not None
+    assert result.token_availability.status is HistoryStatus.TEMPORARILY_UNAVAILABLE
     kill.assert_called_once_with(4242, signal.SIGTERM)
 
 
@@ -249,6 +257,9 @@ def test_rate_limit_parse_error_preserves_tokens() -> None:
     assert len(result.token_readings) == 1
     assert result.token_readings[0].tokens == 1700
     assert result.token_readings[0].status == "available_exact"
+    # Availability is AVAILABLE_EXACT
+    assert result.token_availability is not None
+    assert result.token_availability.status is HistoryStatus.AVAILABLE_EXACT
 
 
 def test_independent_deadlines() -> None:
@@ -283,14 +294,17 @@ def test_independent_deadlines() -> None:
     assert rate_deadlines[0] != usage_deadlines[0]
     assert result.quota_readings[0].status is QuotaStatus.AVAILABLE
     assert result.token_readings[0].status == "available_exact"
+    assert result.token_availability is not None
+    assert result.token_availability.status is HistoryStatus.AVAILABLE_EXACT
 
 
 def test_codex_not_found_produces_unsupported() -> None:
-    """When codex CLI is not found, quota is UNAVAILABLE and tokens are UNSUPPORTED."""
+    """When codex CLI is not found, quota is UNAVAILABLE and availability is UNSUPPORTED."""
     with patch("moira.collectors.shutil.which", return_value=None):
         result = CodexCollector().collect()
 
     assert len(result.quota_readings) == 1
     assert result.quota_readings[0].status is QuotaStatus.UNAVAILABLE
-    assert len(result.token_readings) == 1
-    assert result.token_readings[0].status == "unsupported"
+    assert len(result.token_readings) == 0
+    assert result.token_availability is not None
+    assert result.token_availability.status is HistoryStatus.UNSUPPORTED

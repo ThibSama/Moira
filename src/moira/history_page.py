@@ -35,7 +35,7 @@ from .history_view import (  # noqa: E402
     build_token_summary_text,
 )
 from .i18n import tr  # noqa: E402
-from .models import Service  # noqa: E402
+from .models import HistoryStatus, Service  # noqa: E402
 
 _ = tr
 
@@ -277,13 +277,16 @@ class HistoryPage(Gtk.Box):
         for cs in codex_summaries:
             self._stats_box.append(self._codex_summary_label(cs))
 
-        # Availability note: sanitized secondary state. Never hides older
-        # exact data or quota charts — exact data simply suppresses the note.
+        # Availability note: sanitized secondary state from dedicated records.
+        # Show the note for every non-exact state, even alongside exact totals
+        # — a temporary/unavailable/invalid state coexists with exact data.
+        # Suppress only when latest availability is AVAILABLE_EXACT (i.e. the
+        # current run succeeded).
         availability = getattr(view, "token_availability", ())
         notes: list[str] = []
         for state in availability:
-            if any(ts.service is state.service for ts in token_summaries):
-                continue  # exact data is displayed for this service
+            if state.status is HistoryStatus.AVAILABLE_EXACT:
+                continue  # suppress: latest attempt succeeded
             text = build_token_availability_note(state.status, tr)
             notes.append(f"{state.service.value.title()}: {text}")
         if not token_summaries and not availability:
