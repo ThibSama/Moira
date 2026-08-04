@@ -32,7 +32,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, tzinfo
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -629,6 +629,143 @@ def build_token_availability_note(status: HistoryStatus, translator: Callable[[s
     if status is HistoryStatus.INVALID:
         return _("Exact token data invalid")
     return _("Exact token usage is not available")
+
+
+def build_history_summary_text(
+    view: HistoryViewResult,
+    translator: Callable[[str], str],
+) -> str:
+    """Build the sanitized copyable History summary for the current result.
+
+    Pure and GTK-free: reuses the individual section builders (series stats,
+    token summaries, daily indicators, official summaries, availability
+    notes). Contains no secrets, raw errors, database paths, or payloads.
+    """
+    _ = translator
+    sections: list[str] = []
+    if view.diagnostic not in ("ok", "empty range"):
+        sections.append(view.diagnostic)
+    for series in view.series:
+        sections.append(build_series_stats_text(series.stats, translator))
+    for ts in view.token_summaries:
+        sections.append(build_token_summary_text(ts, translator))
+    for ds in view.daily_token_stats:
+        sections.append(build_daily_token_stats_text(ds, view.range_label, translator))
+    for summary in view.codex_summaries:
+        sections.append(build_codex_summary_text(summary, translator))
+    availability = view.token_availability
+    notes: list[str] = []
+    for state in availability:
+        if state.status is HistoryStatus.AVAILABLE_EXACT:
+            continue
+        note = build_token_availability_note(state.status, translator)
+        notes.append(f"{state.service.value.title()}: {note}")
+    # The availability note belongs to data states only; error diagnostics
+    # (schema/database) are reported alone without a token note.
+    if view.diagnostic == "ok" and not view.token_summaries and not view.token_availability:
+        notes.append(_("Exact token usage is not available"))
+    if notes:
+        sections.append(_(" · ").join(notes))
+    return "\n".join(sections)
+
+
+def build_series_stats_text(
+    stats: SeriesStats,
+    translator: Callable[[str], str],
+    *,
+    target_tz: tzinfo | None = None,
+    converter: Callable[[datetime], datetime] | None = None,
+    tz_provider: Callable[[], tzinfo] | None = None,
+) -> str:
+    """Build the complete per-series statistics text as a pure function.
+
+    GTK only wraps this text in a label. The translator is injected
+    so tests don't depend on the locale. Timezone resolution is
+    injectable via target_tz/converter/tz_provider.
+    """
+    _ = translator
+    parts: list[str] = [f"{stats.service.value.title()} {stats.label}"]
+    if stats.count == 0:
+        parts.append(_("No observations"))
+    else:
+        if stats.latest is not None:
+            parts.append(f"{_('Latest')}: {stats.latest:.1f}%")
+        if stats.minimum is not None:
+            parts.append(f"{_('Min')}: {stats.minimum:.1f}%")
+        if stats.maximum is not None:
+            parts.append(f"{_('Max')}: {stats.maximum:.1f}%")
+        parts.append(f"{_('Count')}: {stats.count}")
+        if stats.reset_count > 0:
+            parts.append(f"{_('Resets')}: {stats.reset_count}")
+        if stats.first_observed is not None:
+            ft = format_observation_time(
+                stats.first_observed,
+                target_tz=target_tz,
+                converter=converter,
+                tz_provider=tz_provider,
+            )
+            parts.append(f"{_('First')}: {ft}")
+        if stats.last_observed is not None:
+            lt = format_observation_time(
+                stats.last_observed,
+                target_tz=target_tz,
+                converter=converter,
+                tz_provider=tz_provider,
+            )
+            parts.append(f"{_('Last')}: {lt}")
+    return _(" · ").join(parts)
+
+
+def _system_local_converter(utc_dt: datetime) -> datetime:
+    """Convert a UTC datetime to the OS local timezone using system rules.
+
+    Uses datetime.astimezone() with no arguments, which resolves the
+    correct offset for each observation instant, including DST
+    transitions. This is not a fixed offset — the OS timezone database
+    is authoritative.
+    """
+    if utc_dt.tzinfo is None:
+        raise ValueError("naive timestamps are not allowed; use timezone-aware datetimes")
+    return utc_dt.astimezone()
+
+
+def format_observation_time(
+    utc_dt: datetime,
+    target_tz: tzinfo | None = None,
+    *,
+    tz_provider: Callable[[], tzinfo] | None = None,
+    converter: Callable[[datetime], datetime] | None = None,
+) -> str:
+    """Format a UTC datetime in the target timezone for display only.
+
+    Resolution order:
+      1. ``target_tz`` explicit → deterministic pure function.
+      2. ``converter`` given → called per observation (supports DST).
+      3. ``tz_provider`` given → called once, fixed offset for all.
+      4. Both None → UTC fallback.
+
+    Naive timestamps (no tzinfo) raise ValueError (fail-closed).
+    """
+    if utc_dt.tzinfo is None:
+        raise ValueError("naive timestamps are not allowed; use timezone-aware datetimes")
+    if target_tz is not None:
+        local_dt = utc_dt.astimezone(target_tz)
+    elif converter is not None:
+        local_dt = converter(utc_dt)
+    elif tz_provider is not None:
+        tz = tz_provider()
+        local_dt = utc_dt.astimezone(tz)
+    else:
+        local_dt = utc_dt.astimezone(UTC)
+    return local_dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _format_local(utc_dt: datetime) -> str:
+    """Format a UTC datetime in the system local timezone for display only.
+
+    Uses _system_local_converter for DST-correct per-observation offsets.
+    """
+    return format_observation_time(utc_dt, converter=_system_local_converter)
 
 
 def prepare_history_view(

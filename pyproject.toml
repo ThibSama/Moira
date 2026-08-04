@@ -40,6 +40,7 @@ select = ["E", "F", "I", "UP", "B"]
 "src/moira/secrets.py" = ["E402"]
 "src/moira/history_chart.py" = ["E402"]
 "src/moira/history_page.py" = ["E402"]
+"tests/test_package5_ui.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.11"

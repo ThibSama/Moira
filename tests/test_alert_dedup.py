@@ -16,6 +16,11 @@ AFTER_OLD_RESET = OLD_RESET + timedelta(hours=1)
 NEW_RESET_POST = OLD_RESET + timedelta(days=5)
 
 
+def base_key(key: str) -> str:
+    """Strip the per-channel suffix from a dedup key."""
+    return key.rsplit(":", 1)[0]
+
+
 def reading(
     service: Service = Service.CLAUDE,
     label: str = "Weekly",
@@ -37,7 +42,7 @@ def reading(
 
 
 def test_exhaustion_alert_fires_at_100_pct() -> None:
-    settings = Settings(thresholds=[50, 75, 90, 100])
+    settings = Settings(thresholds=[50, 75, 90, 100], ntfy_enabled=True)
     alerts = evaluate_alerts([reading(pct=80)], [reading(pct=100)], settings, set())
     exh = [a for a in alerts if a.key.startswith("exhausted:")]
     assert len(exh) == 1
@@ -45,7 +50,7 @@ def test_exhaustion_alert_fires_at_100_pct() -> None:
 
 
 def test_exhaustion_alert_deduplicated() -> None:
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     first = evaluate_alerts([], [reading(pct=100)], settings, set())
     assert len(first) == 1
     second = evaluate_alerts([reading(pct=100)], [reading(pct=100)], settings, {first[0].key})
@@ -53,14 +58,14 @@ def test_exhaustion_alert_deduplicated() -> None:
 
 
 def test_no_exhaustion_alert_below_100() -> None:
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     alerts = evaluate_alerts([reading(pct=80)], [reading(pct=99)], settings, set())
     exh = [a for a in alerts if a.key.startswith("exhausted:")]
     assert len(exh) == 0
 
 
 def test_stale_100_does_not_fire_exhaustion() -> None:
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     stale = reading(pct=100, status=QuotaStatus.STALE)
     alerts = evaluate_alerts([], [stale], settings, set())
     exh = [a for a in alerts if a.key.startswith("exhausted:")]
@@ -72,17 +77,17 @@ def test_stale_100_does_not_fire_exhaustion() -> None:
 
 def test_100_pct_threshold_suppressed_when_exhaustion_fires() -> None:
     """A duplicate generic 100% alert must be suppressed."""
-    settings = Settings(thresholds=[50, 75, 90, 100])
+    settings = Settings(thresholds=[50, 75, 90, 100], ntfy_enabled=True)
     alerts = evaluate_alerts([reading(pct=80)], [reading(pct=100)], settings, set())
     # Should have exhaustion, but NOT a threshold:100 alert
     thresholds = [a for a in alerts if a.key.startswith("threshold:")]
-    assert all("100" not in a.key.rsplit(":", 1)[-1] for a in thresholds)
+    assert all("100" not in base_key(a.key).rsplit(":", 1)[-1] for a in thresholds)
     exh = [a for a in alerts if a.key.startswith("exhausted:")]
     assert len(exh) == 1
 
 
 def test_sub_100_threshold_still_fires() -> None:
-    settings = Settings(thresholds=[50, 75, 90])
+    settings = Settings(thresholds=[50, 75, 90], ntfy_enabled=True)
     alerts = evaluate_alerts([reading(pct=49)], [reading(pct=76)], settings, set())
     thresholds = [a for a in alerts if a.key.startswith("threshold:")]
     assert len(thresholds) == 2  # 50 and 75
@@ -92,7 +97,7 @@ def test_sub_100_threshold_still_fires() -> None:
 
 
 def test_recovery_alert_fires_when_exhaustion_clears() -> None:
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     alerts = evaluate_alerts(
         [reading(pct=100, reset=RESET)],
         [reading(pct=50, reset=NEW_RESET)],
@@ -104,7 +109,7 @@ def test_recovery_alert_fires_when_exhaustion_clears() -> None:
 
 
 def test_recovery_alert_deduplicated() -> None:
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     sent: set[str] = set()
     first = evaluate_alerts(
         [reading(pct=100, reset=RESET)],
@@ -124,7 +129,7 @@ def test_recovery_alert_deduplicated() -> None:
 
 
 def test_no_recovery_when_not_previously_exhausted() -> None:
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     alerts = evaluate_alerts(
         [reading(pct=80)],
         [reading(pct=50, reset=NEW_RESET)],
@@ -139,7 +144,7 @@ def test_no_recovery_when_not_previously_exhausted() -> None:
 
 
 def test_codex_exhaustion_alert() -> None:
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     alerts = evaluate_alerts(
         [],
         [reading(service=Service.CODEX, pct=100)],
@@ -156,7 +161,7 @@ def test_codex_exhaustion_alert() -> None:
 
 def test_exhaustion_independent_from_thresholds() -> None:
     """Exhaustion fires even with empty thresholds list."""
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     alerts = evaluate_alerts([reading(pct=50)], [reading(pct=100)], settings, set())
     exh = [a for a in alerts if a.key.startswith("exhausted:")]
     assert len(exh) == 1
@@ -168,7 +173,7 @@ def test_exhaustion_independent_from_thresholds() -> None:
 def test_reset_suppressed_during_exhaustion_recovery() -> None:
     """A reset alert should not fire when transitioning from exhausted to recovered,
     since the recovery event already covers that."""
-    settings = Settings(thresholds=[], reset_alerts=True)
+    settings = Settings(thresholds=[], reset_alerts=True, ntfy_enabled=True)
     alerts = evaluate_alerts(
         [reading(pct=100, reset=RESET)],
         [reading(pct=50, reset=NEW_RESET)],
@@ -186,7 +191,7 @@ def test_expired_100_pct_produces_no_exhaustion_alert() -> None:
     """An AVAILABLE weekly reading at 100% whose reset_at has passed must not
     produce an exhaustion alert."""
     past_reset = NOW - timedelta(hours=1)
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     alerts = evaluate_alerts(
         [],
         [reading(pct=100, reset=past_reset)],
@@ -201,7 +206,7 @@ def test_expired_100_pct_produces_no_exhaustion_alert() -> None:
 def test_expired_100_pct_produces_no_recovery_alert() -> None:
     """An expired 100% reading must not produce a recovery alert either."""
     past_reset = NOW - timedelta(hours=1)
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     alerts = evaluate_alerts(
         [reading(pct=100, reset=past_reset)],
         [reading(pct=100, reset=past_reset)],
@@ -220,7 +225,7 @@ def test_ui_and_alerts_equivalent_for_exhausted_reading() -> None:
     """is_weekly_exhausted (UI) and evaluate_alerts agree on a current exhausted reading."""
     from moira.exhaustion import is_weekly_exhausted
 
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     r = reading(pct=100, reset=RESET)
     alerts = evaluate_alerts([], [r], settings, set(), now=NOW)
     exh_alerts = [a for a in alerts if a.key.startswith("exhausted:")]
@@ -235,7 +240,7 @@ def test_ui_and_alerts_equivalent_for_expired_reading() -> None:
 
     past_reset = NOW - timedelta(hours=1)
     r = reading(pct=100, reset=past_reset)
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     alerts = evaluate_alerts([], [r], settings, set(), now=NOW)
     exh_alerts = [a for a in alerts if a.key.startswith("exhausted:")]
     assert is_weekly_exhausted(r, now=NOW) is False
@@ -253,7 +258,7 @@ def test_threshold_100_suppressed_while_90_fires() -> None:
     would fire. The 100% threshold should NOT appear. The 90% threshold should
     appear if crossed.
     """
-    settings = Settings(thresholds=[90, 100])
+    settings = Settings(thresholds=[90, 100], ntfy_enabled=True)
     alerts = evaluate_alerts(
         [reading(pct=80)],
         [reading(pct=100)],
@@ -266,14 +271,14 @@ def test_threshold_100_suppressed_while_90_fires() -> None:
 
     threshold_alerts = [a for a in alerts if a.key.startswith("threshold:")]
     # Only the 90% threshold should fire (crossed from 80→100), NOT the 100% one.
-    threshold_values = {a.key.rsplit(":", 1)[-1] for a in threshold_alerts}
+    threshold_values = {base_key(a.key).rsplit(":", 1)[-1] for a in threshold_alerts}
     assert "90" in threshold_values
     assert "100" not in threshold_values
 
 
 def test_lower_thresholds_fire_normally_at_non_100_crossing() -> None:
     """Lower threshold crossings not involving 100% are governed normally."""
-    settings = Settings(thresholds=[50, 75, 90, 100])
+    settings = Settings(thresholds=[50, 75, 90, 100], ntfy_enabled=True)
     alerts = evaluate_alerts(
         [reading(pct=49)],
         [reading(pct=95)],
@@ -282,7 +287,7 @@ def test_lower_thresholds_fire_normally_at_non_100_crossing() -> None:
         now=NOW,
     )
     threshold_alerts = [a for a in alerts if a.key.startswith("threshold:")]
-    threshold_values = {a.key.rsplit(":", 1)[-1] for a in threshold_alerts}
+    threshold_values = {base_key(a.key).rsplit(":", 1)[-1] for a in threshold_alerts}
     assert threshold_values == {"50", "75", "90"}
     assert "100" not in threshold_values
 
@@ -293,7 +298,7 @@ def test_lower_thresholds_fire_normally_at_non_100_crossing() -> None:
 def test_recovery_after_new_window_deduplicated() -> None:
     """Recovery when a new weekly window appears after the old reset has passed.
     Uses realistic chronology: evaluation time is after the old reset_at."""
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     sent: set[str] = set()
     first = evaluate_alerts(
         [reading(pct=100, reset=OLD_RESET)],
@@ -317,7 +322,7 @@ def test_recovery_after_new_window_deduplicated() -> None:
 def test_recovery_after_sub_100_fresh_reading_deduplicated() -> None:
     """Recovery when the reading drops below 100% in the same reset window
     remains deduplicated (per-reading identity)."""
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     sent: set[str] = set()
     first = evaluate_alerts(
         [reading(pct=100)],
@@ -343,7 +348,7 @@ def test_recovery_after_sub_100_fresh_reading_deduplicated() -> None:
 
 def test_five_hour_100_pct_does_not_fire_exhaustion() -> None:
     """A five-hour reading at 100% must not produce a weekly exhaustion alert."""
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     alerts = evaluate_alerts(
         [],
         [reading(label="Five-hour", pct=100)],
@@ -363,7 +368,7 @@ def test_real_post_reset_recovery_emits_one_event() -> None:
     reading was AVAILABLE weekly at 100% with that expired reset_at. The
     current reading is AVAILABLE weekly at 50% with a new later reset.
     Exactly one recovery event is emitted."""
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     alerts = evaluate_alerts(
         [reading(pct=100, reset=OLD_RESET)],
         [reading(pct=50, reset=NEW_RESET_POST)],
@@ -382,7 +387,7 @@ def test_real_post_reset_recovery_emits_one_event() -> None:
 
 def test_real_post_reset_recovery_deduplicated() -> None:
     """The realistic post-reset recovery event is deduplicated per window."""
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     sent: set[str] = set()
     first = evaluate_alerts(
         [reading(pct=100, reset=OLD_RESET)],
@@ -406,7 +411,7 @@ def test_real_post_reset_recovery_deduplicated() -> None:
 def test_expired_100_prior_with_new_100_current_no_recovery() -> None:
     """If the prior was exhausted and expired, but the current is still 100%
     with a new reset, no recovery fires (no sub-100 fresh reading)."""
-    settings = Settings(thresholds=[])
+    settings = Settings(thresholds=[], ntfy_enabled=True)
     alerts = evaluate_alerts(
         [reading(pct=100, reset=OLD_RESET)],
         [reading(pct=100, reset=NEW_RESET_POST)],
@@ -494,7 +499,7 @@ def test_was_weekly_exhausted_codex_service() -> None:
 
 def test_no_recovery_and_reset_for_same_transition() -> None:
     """When a recovery fires, a reset alert must not also fire for the same transition."""
-    settings = Settings(thresholds=[], reset_alerts=True)
+    settings = Settings(thresholds=[], reset_alerts=True, ntfy_enabled=True)
     alerts = evaluate_alerts(
         [reading(pct=100, reset=OLD_RESET)],
         [reading(pct=50, reset=NEW_RESET_POST)],

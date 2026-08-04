@@ -28,11 +28,18 @@ def test_mocked_ntfy_send() -> None:
     response = type(
         "Response",
         (),
-        {"status": 200, "__enter__": lambda self: self, "__exit__": lambda self, *args: None},
+        {
+            "status": 200,
+            "read": lambda self, n: b"",
+            "__enter__": lambda self: self,
+            "__exit__": lambda self, *args: None,
+        },
     )()
     with patch("urllib.request.urlopen", return_value=response) as opened:
-        send("https://notify.example", "topic", Notification("Test", "Hello"), None)
+        result = send("https://notify.example", "topic", Notification("Test", "Hello"), None)
     assert opened.call_count == 1
+    assert result.ok is True
+    assert result.status == "sent"
 
 
 def test_versioned_settings_and_no_token_on_disk(tmp_path: Path, monkeypatch: object) -> None:
@@ -40,7 +47,7 @@ def test_versioned_settings_and_no_token_on_disk(tmp_path: Path, monkeypatch: ob
     with patcher:
         save_settings(Settings(ntfy_topic="topic"))
         raw = (tmp_path / "moira/config.json").read_text()
-        assert json.loads(raw)["version"] == 2
+        assert json.loads(raw)["version"] == 3
         assert "token" not in raw.lower()
         assert load_settings().ntfy_topic == "topic"
 

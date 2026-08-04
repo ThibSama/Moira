@@ -1,3 +1,16 @@
+"""Versioned JSON configuration (v3) and a small last-known-state cache.
+
+Config v3 adds typed per-service alert rules (``ProviderRules``), separate
+Claude/Codex collection toggles, native-desktop-notification enablement,
+compact mode, persisted window geometry, and the update-check repository.
+The v1 → v2 → v3 chain is additive: every prior user setting is preserved
+exactly, and the legacy global rule fields remain the source that v2→v3
+copies into both providers' rules. Invalid configuration fails closed:
+``load_settings`` falls back to defaults on any validation error.
+
+Secrets (NTFY token) never enter JSON — they live in GNOME Keyring only.
+"""
+
 from __future__ import annotations
 
 import json
@@ -6,12 +19,20 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .models import QuotaReading
+from .models import QuotaReading, Service
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 VALID_REFRESH_MINUTES = (1, 2, 5, 10, 15, 30)
 DEFAULT_REFRESH_MINUTES = 2
+
+#: Default GitHub repository used for the manual update check.
+DEFAULT_REPO = "ThibSama/moira"
+
+DEFAULT_THRESHOLDS = [50, 75, 90]
+
+#: Valid provider rule keys (the two collection services).
+VALID_RULE_KEYS = ("claude", "codex")
 
 
 def config_dir() -> Path:
@@ -23,15 +44,41 @@ def state_dir() -> Path:
 
 
 @dataclass(slots=True)
+class ProviderRules:
+    """Typed per-service alert rules (thresholds, reset, error)."""
+
+    thresholds: list[int] = field(default_factory=lambda: list(DEFAULT_THRESHOLDS))
+    reset_alerts: bool = True
+    error_alerts: bool = True
+
+    def validate(self) -> None:
+        if any(not 1 <= value <= 100 for value in self.thresholds):
+            raise ValueError("thresholds must be between 1 and 100")
+        self.thresholds = sorted(set(self.thresholds))
+
+
+@dataclass(slots=True)
 class Settings:
     version: int = CONFIG_VERSION
     refresh_minutes: int = DEFAULT_REFRESH_MINUTES
     ntfy_server: str = "https://ntfy.sh"
     ntfy_topic: str = ""
     ntfy_enabled: bool = False
-    thresholds: list[int] = field(default_factory=lambda: [50, 75, 90])
+    native_notifications: bool = False
+    # Legacy global rule fields — kept for backward compatibility and as the
+    # migration source. Per-service rules are authoritative after v3.
+    thresholds: list[int] = field(default_factory=lambda: list(DEFAULT_THRESHOLDS))
     reset_alerts: bool = True
     error_alerts: bool = True
+    # Typed per-service alert rules (v3).
+    rules: dict[str, ProviderRules] = field(default_factory=dict)
+    collect_claude: bool = True
+    collect_codex: bool = True
+    compact_mode: bool = False
+    window_width: int | None = None
+    window_height: int | None = None
+    window_maximized: bool = False
+    repo: str = DEFAULT_REPO
     autostart: bool = False
 
     def validate(self) -> None:
@@ -44,6 +91,60 @@ class Settings:
         if any(not 1 <= value <= 100 for value in self.thresholds):
             raise ValueError("thresholds must be between 1 and 100")
         self.thresholds = sorted(set(self.thresholds))
+        if not _valid_repo(self.repo):
+            raise ValueError("update-check repository must be owner/name without separators")
+        if self.rules:
+            # Typed per-service contract: exactly the two providers, each valid.
+            for key in VALID_RULE_KEYS:
+                rules = self.rules.get(key)
+                if not isinstance(rules, ProviderRules):
+                    raise ValueError(f"missing or invalid rules for provider {key!r}")
+                rules.validate()
+            for key in self.rules:
+                if key not in VALID_RULE_KEYS:
+                    raise ValueError(f"unknown provider in rules: {key!r}")
+        else:
+            # No rules yet (fresh defaults or legacy-shaped construction):
+            # derive both providers' rules from the legacy global fields.
+            self.rules = {
+                key: ProviderRules(list(self.thresholds), self.reset_alerts, self.error_alerts)
+                for key in VALID_RULE_KEYS
+            }
+
+    def rules_for(self, service: Service | str) -> ProviderRules:
+        """Return the typed alert rules for one provider.
+
+        Falls back to the legacy global fields when the rules dict is empty
+        (e.g. directly-constructed Settings in tests). After ``validate()``
+        the rules dict is always populated for both providers.
+        """
+        key = service.value if isinstance(service, Service) else str(service)
+        rules = self.rules.get(key)
+        if rules is not None:
+            return rules
+        return ProviderRules(list(self.thresholds), self.reset_alerts, self.error_alerts)
+
+    def enabled_services(self) -> list[Service]:
+        """Return the services whose collectors should run, in fixed order."""
+        services: list[Service] = []
+        if self.collect_claude:
+            services.append(Service.CLAUDE)
+        if self.collect_codex:
+            services.append(Service.CODEX)
+        return services
+
+
+def _valid_repo(repo: str) -> bool:
+    """Validate an ``owner/name`` GitHub repository reference (fail closed)."""
+    if not isinstance(repo, str):
+        return False
+    if "/" not in repo:
+        return False
+    owner, _, name = repo.partition("/")
+    if not owner or not name or "/" in name:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+    return all(ch in allowed for ch in owner) and all(ch in allowed for ch in name)
 
 
 def _migrate_v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
@@ -61,8 +162,72 @@ def _migrate_v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
     else:
         # Absent or invalid → new default
         migrated["refresh_minutes"] = DEFAULT_REFRESH_MINUTES
+    migrated["version"] = 2
+    return migrated
+
+
+def _legacy_thresholds(data: dict[str, Any]) -> list[int]:
+    """Return the legacy thresholds value, or the default when invalid."""
+    value = data.get("thresholds")
+    if (
+        isinstance(value, list)
+        and all(isinstance(item, int) and not isinstance(item, bool) for item in value)
+        and all(1 <= item <= 100 for item in value)
+    ):
+        return sorted(set(value))
+    return list(DEFAULT_THRESHOLDS)
+
+
+def _migrate_v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
+    """Additively migrate a v2 config dict to v3.
+
+    Copies the existing global thresholds/reset/error rules into BOTH
+    providers' typed ``rules`` and preserves every prior setting. New
+    fields take their defaults only when absent. Invalid legacy rule
+    values fail closed to the defaults (the migration must never produce
+    an invalid configuration).
+    """
+    migrated = dict(data)
+    thresholds = _legacy_thresholds(migrated)
+    reset_alerts = bool(migrated.get("reset_alerts", True))
+    error_alerts = bool(migrated.get("error_alerts", True))
+    migrated["rules"] = {
+        "claude": {
+            "thresholds": list(thresholds),
+            "reset_alerts": reset_alerts,
+            "error_alerts": error_alerts,
+        },
+        "codex": {
+            "thresholds": list(thresholds),
+            "reset_alerts": reset_alerts,
+            "error_alerts": error_alerts,
+        },
+    }
+    migrated.setdefault("collect_claude", True)
+    migrated.setdefault("collect_codex", True)
+    migrated.setdefault("native_notifications", False)
+    migrated.setdefault("compact_mode", False)
+    migrated.setdefault("window_width", None)
+    migrated.setdefault("window_height", None)
+    migrated.setdefault("window_maximized", False)
+    migrated.setdefault("repo", DEFAULT_REPO)
     migrated["version"] = CONFIG_VERSION
     return migrated
+
+
+def _coerce_rules(data: dict[str, Any]) -> dict[str, ProviderRules]:
+    """Coerce raw rule dicts from JSON into typed ProviderRules (fail closed)."""
+    raw = data.get("rules")
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("rules must be an object")
+    rules: dict[str, ProviderRules] = {}
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            raise ValueError(f"rules for {key!r} must be an object")
+        rules[str(key)] = ProviderRules(**value)
+    return rules
 
 
 @dataclass(slots=True)
@@ -92,7 +257,9 @@ def load_settings() -> Settings:
         version = data.get("version", 1)
         if version == 1:
             data = _migrate_v1_to_v2(data)
-        settings = Settings(**data)
+        if version <= 2:
+            data = _migrate_v2_to_v3(data)
+        settings = Settings(**{**data, "rules": _coerce_rules(data)})
         settings.validate()
         return settings
     except (OSError, ValueError, TypeError, json.JSONDecodeError):

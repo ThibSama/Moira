@@ -8,6 +8,11 @@ NOW = datetime(2026, 8, 1, 12, tzinfo=UTC)
 RESET = NOW + timedelta(days=5)
 
 
+def base_key(key: str) -> str:
+    """Strip the per-channel suffix from a dedup key."""
+    return key.rsplit(":", 1)[0]
+
+
 def reading(
     pct: float, reset: datetime = RESET, status: QuotaStatus = QuotaStatus.AVAILABLE
 ) -> QuotaReading:
@@ -32,19 +37,24 @@ def test_failed_refresh_retains_success_as_stale() -> None:
 
 
 def test_threshold_crossing_and_deduplication() -> None:
-    settings = Settings(thresholds=[50, 75])
+    settings = Settings(thresholds=[50, 75], ntfy_enabled=True)
     alerts = evaluate_alerts([reading(49)], [reading(76)], settings, set())
-    assert [alert.key.rsplit(":", 1)[-1] for alert in alerts] == ["50", "75"]
+    assert [base_key(alert.key).rsplit(":", 1)[-1] for alert in alerts] == ["50", "75"]
     sent = {alert.key for alert in alerts}
     assert evaluate_alerts([reading(49)], [reading(76)], settings, sent) == []
 
 
 def test_no_alert_without_crossing() -> None:
-    assert evaluate_alerts([reading(80)], [reading(81)], Settings(thresholds=[75]), set()) == []
+    assert (
+        evaluate_alerts(
+            [reading(80)], [reading(81)], Settings(thresholds=[75], ntfy_enabled=True), set()
+        )
+        == []
+    )
 
 
 def test_reset_and_error_alert_deduplication() -> None:
-    settings = Settings(thresholds=[], reset_alerts=True, error_alerts=True)
+    settings = Settings(thresholds=[], reset_alerts=True, error_alerts=True, ntfy_enabled=True)
     reset_alerts = evaluate_alerts(
         [reading(10)], [reading(2, RESET + timedelta(days=7))], settings, set()
     )

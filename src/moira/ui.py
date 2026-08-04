@@ -1,3 +1,27 @@
+"""Main window for Moira.
+
+Package 5 additions:
+- Quota cards show used/remaining percentages (100 - used) plus reset
+  countdown; a compact mode keeps provider, status, exhaustion and reset
+  visible while dropping progress bars.
+- Separate Claude/Codex collection toggles: disabled providers are never
+  started, never alert, never write fresh history, and show a translated
+  "Disabled" state while old History stays readable.
+- Typed per-service alert rules (thresholds/reset/error) from the v3
+  configuration.
+- Native desktop notifications via Gio.Notification on the application;
+  NTFY and native channels are independently enabled and deduplicated per
+  channel (a key is persisted only after the channel reports success).
+- NTFY delivery returns typed sanitized outcomes (never raw exceptions,
+  server, topic, token, response body, or paths).
+- A sanitized Diagnostics tab, copy actions for quota status / History
+  summary / diagnostics (copied text contains no secrets or paths), and a
+  manual GitHub release check (no startup check, no telemetry, no token).
+- Window size and maximized state persist on close; position is not
+  restored because GTK 4 / PyGObject exposes no window-position API here
+  (and Wayland provides none) — stated truthfully, with no X11/shell hacks.
+"""
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -11,14 +35,19 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
-from .alerts import evaluate_alerts, merge_with_stale
+from .alerts import CHANNEL_NATIVE, CHANNEL_NTFY, evaluate_alerts, merge_with_stale
 from .autostart import set_enabled as set_autostart
 from .claude_integration import remove as remove_claude_integration
 from .claude_integration import setup as setup_claude_integration
 from .collectors import ClaudeCollector, CodexCollector
 from .desktop import create_shortcut, remove_shortcut
+from .diagnostics import (  # noqa: F401  (re-exported for compatibility)
+    build_diagnostics_text,
+    build_quota_status_text,
+    format_countdown,
+)
 from .exhaustion import derive_state
 from .history import HistoryStatus
 from .history_db import HistoryCoordinator
@@ -36,6 +65,7 @@ from .models import (
 from .ntfy import Notification, send
 from .persistence import (
     VALID_REFRESH_MINUTES,
+    ProviderRules,
     Settings,
     load_settings,
     load_state,
@@ -43,17 +73,17 @@ from .persistence import (
     save_state,
 )
 from .secrets import get_ntfy_token, set_ntfy_token
+from .updates import (
+    STATUS_CHECK_FAILED,
+    STATUS_INVALID_RESPONSE,
+    STATUS_UP_TO_DATE,
+    STATUS_UPDATE_AVAILABLE,
+    check_latest_release,
+)
 
 _ = tr
 
-
-def format_countdown(reset_at: datetime, now: datetime | None = None) -> str:
-    local_now = now or datetime.now().astimezone()
-    seconds = max(0, int((reset_at.astimezone() - local_now).total_seconds()))
-    days, seconds = divmod(seconds, 86400)
-    hours, seconds = divmod(seconds, 3600)
-    minutes = seconds // 60
-    return f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
+APP_VERSION = "0.2.2"
 
 
 def format_local_datetime(dt: datetime) -> str:
@@ -82,9 +112,13 @@ def format_local_datetime(dt: datetime) -> str:
 
 
 class QuotaCard(Gtk.Frame):
+    """A provider card. Compact mode keeps provider, status, exhaustion and
+    reset visible while dropping the per-reading progress bars."""
+
     def __init__(self, title: str) -> None:
         super().__init__()
         self._title = title
+        self._compact = False
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_margin_top(16)
         box.set_margin_bottom(16)
@@ -102,6 +136,17 @@ class QuotaCard(Gtk.Frame):
         box.append(self.rows)
         box.append(self.updated)
         self.set_child(box)
+
+    def set_compact(self, compact: bool) -> None:
+        """Toggle compact rendering; applied on the next show_readings call."""
+        self._compact = compact
+
+    def show_disabled(self) -> None:
+        """Show the translated Disabled state (provider not collected)."""
+        while child := self.rows.get_first_child():
+            self.rows.remove(child)
+        self.status.set_text(_("Disabled"))
+        self.updated.set_text("")
 
     def show_readings(self, readings: list[QuotaReading], snapshot=None) -> None:
         while child := self.rows.get_first_child():
@@ -127,17 +172,6 @@ class QuotaCard(Gtk.Frame):
         for reading in readings:
             if reading.percentage is None or reading.reset_at is None:
                 continue
-            # For exhausted Claude, hide the five-hour row
-            if (
-                snapshot
-                and snapshot.service is Service.CLAUDE
-                and snapshot.exhausted
-                and (
-                    "five" in reading.quota_label.lower()
-                    or "session" in reading.quota_label.lower()
-                )
-            ):
-                continue
             self._add_reading_row(reading)
         latest = max(item.retrieved_at for item in readings).astimezone()
         self.updated.set_text(
@@ -146,13 +180,29 @@ class QuotaCard(Gtk.Frame):
         )
 
     def _add_reading_row(self, reading: QuotaReading) -> None:
-        title = Gtk.Label(label=f"{reading.quota_label} — {reading.percentage:.0f}%", xalign=0)
+        used = reading.percentage
+        remaining = 100.0 - used
+        if self._compact:
+            line = f"{reading.quota_label}: {used:.0f}% {_('used')}"
+            line += f" · {remaining:.0f}% {_('remaining')}"
+            line += f" · {_('resets in ')}{format_countdown(reading.reset_at)}"
+            label = Gtk.Label(label=line, xalign=0)
+            label.set_wrap(True)
+            self.rows.append(label)
+            return
+        title = Gtk.Label(
+            label=(
+                f"{reading.quota_label} — {used:.0f}% {_('used')} · "
+                f"{remaining:.0f}% {_('remaining')}"
+            ),
+            xalign=0,
+        )
         title.add_css_class("heading")
         progress = Gtk.ProgressBar(fraction=reading.percentage / 100)
         reset = reading.reset_at.astimezone()
         reset_text = format_local_datetime(reset)
         detail = Gtk.Label(
-            label=f"{_('Resets ')}{reset_text}{_(' remaining')}",
+            label=f"{_('Resets ')}{reset_text} · {_('in ')}{format_countdown(reading.reset_at)}",
             xalign=0,
         )
         detail.set_wrap(True)
@@ -175,12 +225,19 @@ class QuotaCard(Gtk.Frame):
         # Show weekly reset time + countdown
         reset = weekly.reset_at.astimezone()
         reset_text = format_local_datetime(reset)
-        title = Gtk.Label(label=f"{weekly.quota_label} — {(weekly.percentage or 0):.0f}%", xalign=0)
+        used = weekly.percentage or 0
+        title = Gtk.Label(
+            label=(
+                f"{weekly.quota_label} — {used:.0f}% {_('used')} · "
+                f"{100.0 - used:.0f}% {_('remaining')}"
+            ),
+            xalign=0,
+        )
         title.add_css_class("heading")
         progress = Gtk.ProgressBar(fraction=1.0)
         progress.add_css_class("error")
         detail = Gtk.Label(
-            label=f"{_('Resets ')}{reset_text}{_(' remaining')}",
+            label=f"{_('Resets ')}{reset_text} · {_('in ')}{format_countdown(weekly.reset_at)}",
             xalign=0,
         )
         detail.set_wrap(True)
@@ -214,6 +271,41 @@ class QuotaCard(Gtk.Frame):
         )
 
 
+class DiagnosticsPage(Gtk.Box):
+    """Sanitized diagnostics tab with a copy action."""
+
+    def __init__(self) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.set_margin_top(18)
+        self.set_margin_bottom(18)
+        self.set_margin_start(18)
+        self.set_margin_end(18)
+        self._text = ""
+        self._label = Gtk.Label(xalign=0)
+        self._label.set_wrap(True)
+        self._label.add_css_class("monospace")
+        self.append(self._label)
+        actions = Gtk.Box(spacing=8)
+        copy = Gtk.Button(label=_("Copy"))
+        copy.connect("clicked", self._copy)
+        actions.append(copy)
+        self._status = Gtk.Label(xalign=0)
+        self._status.add_css_class("dim-label")
+        actions.append(self._status)
+        self.append(actions)
+
+    def update(self, text: str) -> None:
+        """Replace the diagnostics text (called from the main thread)."""
+        self._text = text
+        self._label.set_text(text)
+
+    def _copy(self, *_args: Any) -> None:
+        if not self._text:
+            return
+        self.get_clipboard().set_text(self._text)
+        self._status.set_text(_("Diagnostics copied."))
+
+
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, application: Adw.Application, smoke_test: bool = False) -> None:
         super().__init__(
@@ -231,6 +323,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.pending_availability: list[TokenAvailabilityRecord] = []
         self.pending_lock = threading.Lock()
         self.completed = 0
+        self._enabled_services: list[Service] = []
         self._refresh_timer_id: int | None = None
         self._last_focus_time: float = 0.0
         self._focus_debounce_seconds = 2.0
@@ -238,6 +331,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._history_coordinator = HistoryCoordinator()
         self._history_coordinator.start()
         self._history_coordinator.set_write_success_callback(self._on_history_write_success)
+        self._restore_geometry()
         self._build()
         self._render()
         if not smoke_test:
@@ -251,6 +345,30 @@ class MainWindow(Adw.ApplicationWindow):
         self._stack.connect("notify::visible-child", self._on_stack_changed)
         # Shutdown handler: stop the history worker cleanly on window close
         self.connect("close-request", self._on_close_request)
+
+    def _restore_geometry(self) -> None:
+        """Restore persisted window size and maximized state.
+
+        Position is intentionally NOT restored: GTK 4 / PyGObject exposes no
+        window-position API in this environment, and Wayland provides none.
+        No X11/shell hacks are used; the limitation is stated truthfully.
+        """
+        if self.settings.window_width and self.settings.window_height:
+            self.set_default_size(self.settings.window_width, self.settings.window_height)
+        if self.settings.window_maximized:
+            self.maximize()
+
+    def _persist_geometry(self) -> None:
+        """Save window size and maximized state on close (best-effort)."""
+        try:
+            width, height = self.get_width(), self.get_height()
+            if width > 0 and height > 0:
+                self.settings.window_width = width
+                self.settings.window_height = height
+            self.settings.window_maximized = self.is_maximized()
+            save_settings(self.settings)
+        except Exception:
+            pass
 
     def _build(self) -> None:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -273,17 +391,26 @@ class MainWindow(Adw.ApplicationWindow):
         home.set_margin_end(18)
         self.claude_card = QuotaCard(_("Claude"))
         self.codex_card = QuotaCard(_("Codex"))
+        self.claude_card.set_compact(self.settings.compact_mode)
+        self.codex_card.set_compact(self.settings.compact_mode)
         home.append(self.claude_card)
         home.append(self.codex_card)
         self.refresh_info = Gtk.Label(xalign=0)
         self.refresh_info.add_css_class("dim-label")
         home.append(self.refresh_info)
+        actions = Gtk.Box(spacing=8)
+        copy_status = Gtk.Button(label=_("Copy quota status"))
+        copy_status.connect("clicked", self._copy_quota_status)
+        actions.append(copy_status)
+        home.append(actions)
         self._stack.add_titled(home, "home", _("Quotas"))
         self._stack.add_titled(self._settings_page(), "notifications", _("Notifications"))
         self._history_page = HistoryPage(self.executor)
         history_scroll = Gtk.ScrolledWindow()
         history_scroll.set_child(self._history_page)
         self._stack.add_titled(history_scroll, "history", _("History"))
+        self._diagnostics_page = DiagnosticsPage()
+        self._stack.add_titled(self._diagnostics_page, "diagnostics", _("Diagnostics"))
         self.set_content(root)
 
     def _settings_page(self) -> Gtk.Widget:
@@ -293,6 +420,12 @@ class MainWindow(Adw.ApplicationWindow):
         box.set_margin_bottom(18)
         box.set_margin_start(18)
         box.set_margin_end(18)
+        # ── Collection toggles ──
+        self.collect_claude = Gtk.Switch(active=self.settings.collect_claude)
+        box.append(self._row(_("Collect Claude"), self.collect_claude))
+        self.collect_codex = Gtk.Switch(active=self.settings.collect_codex)
+        box.append(self._row(_("Collect Codex"), self.collect_codex))
+        # ── NTFY channel ──
         self.ntfy_enabled = Gtk.Switch(active=self.settings.ntfy_enabled)
         box.append(self._row(_("Enable NTFY alerts"), self.ntfy_enabled))
         self.server = Gtk.Entry(text=self.settings.ntfy_server)
@@ -303,9 +436,44 @@ class MainWindow(Adw.ApplicationWindow):
             placeholder_text=_("Leave blank to keep current keyring token")
         )
         box.append(self._labeled(_("Optional access token"), self.token))
-        self.thresholds = Gtk.Entry(text=", ".join(map(str, self.settings.thresholds)))
-        box.append(self._labeled(_("Thresholds (%)"), self.thresholds))
-        # Refresh interval dropdown
+        # ── Native channel ──
+        self.native_notifications = Gtk.Switch(active=self.settings.native_notifications)
+        box.append(self._row(_("Native desktop notifications"), self.native_notifications))
+        # ── Per-service alert rules ──
+        self._thresholds_entries: dict[str, Gtk.Entry] = {}
+        self._reset_switches: dict[str, Gtk.Switch] = {}
+        self._error_switches: dict[str, Gtk.Switch] = {}
+        for key in ("claude", "codex"):
+            rules = self.settings.rules_for(key)
+            title = _("Claude") if key == "claude" else _("Codex")
+            label = Gtk.Label(label=title, xalign=0)
+            label.add_css_class("heading")
+            box.append(label)
+            entry = Gtk.Entry(text=", ".join(map(str, rules.thresholds)))
+            box.append(
+                self._labeled(
+                    _("Claude thresholds (%)") if key == "claude" else _("Codex thresholds (%)"),
+                    entry,
+                )
+            )
+            self._thresholds_entries[key] = entry
+            reset_switch = Gtk.Switch(active=rules.reset_alerts)
+            box.append(
+                self._row(
+                    _("Claude reset alerts") if key == "claude" else _("Codex reset alerts"),
+                    reset_switch,
+                )
+            )
+            self._reset_switches[key] = reset_switch
+            error_switch = Gtk.Switch(active=rules.error_alerts)
+            box.append(
+                self._row(
+                    _("Claude error alerts") if key == "claude" else _("Codex error alerts"),
+                    error_switch,
+                )
+            )
+            self._error_switches[key] = error_switch
+        # ── Refresh interval ──
         self.refresh_combo = Gtk.DropDown.new_from_strings([str(m) for m in VALID_REFRESH_MINUTES])
         current_idx = VALID_REFRESH_MINUTES.index(
             self.settings.refresh_minutes
@@ -318,10 +486,9 @@ class MainWindow(Adw.ApplicationWindow):
         refresh_box.append(self.refresh_combo)
         refresh_box.append(Gtk.Label(label=_("minutes")))
         box.append(refresh_box)
-        self.reset_alerts = Gtk.Switch(active=self.settings.reset_alerts)
-        box.append(self._row(_("Alert when a quota resets"), self.reset_alerts))
-        self.error_alerts = Gtk.Switch(active=self.settings.error_alerts)
-        box.append(self._row(_("Alert on refresh errors"), self.error_alerts))
+        # ── Appearance / misc ──
+        self.compact_mode = Gtk.Switch(active=self.settings.compact_mode)
+        box.append(self._row(_("Compact mode"), self.compact_mode))
         self.autostart = Gtk.Switch(active=self.settings.autostart)
         box.append(self._row(_("Start automatically on login"), self.autostart))
         buttons = Gtk.Box(spacing=8)
@@ -330,9 +497,23 @@ class MainWindow(Adw.ApplicationWindow):
         save.connect("clicked", self._save_settings)
         test = Gtk.Button(label=_("Send test notification"))
         test.connect("clicked", self._test_notification)
+        test_native = Gtk.Button(label=_("Send native test notification"))
+        test_native.connect("clicked", self._test_native_notification)
         buttons.append(save)
         buttons.append(test)
+        buttons.append(test_native)
         box.append(buttons)
+        update_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        update_row = Gtk.Box(spacing=8)
+        check_updates = Gtk.Button(label=_("Check for updates"))
+        check_updates.connect("clicked", self._check_updates)
+        update_row.append(check_updates)
+        self.update_status = Gtk.Label(xalign=0)
+        self.update_status.set_wrap(True)
+        self.update_status.add_css_class("dim-label")
+        update_row.append(self.update_status)
+        update_box.append(update_row)
+        box.append(update_box)
         integration_buttons = Gtk.Box(spacing=8)
         setup_claude = Gtk.Button(label=_("Set up Claude integration"))
         setup_claude.connect("clicked", self._setup_claude)
@@ -375,9 +556,30 @@ class MainWindow(Adw.ApplicationWindow):
         snapshots = derive_state(self.state.readings, now=now)
         claude_readings = [r for r in self.state.readings if r.service.value == "claude"]
         codex_readings = [r for r in self.state.readings if r.service.value == "codex"]
-        self.claude_card.show_readings(claude_readings, snapshots.get(Service.CLAUDE))
-        self.codex_card.show_readings(codex_readings, snapshots.get(Service.CODEX))
+        if self.settings.collect_claude:
+            self.claude_card.show_readings(claude_readings, snapshots.get(Service.CLAUDE))
+        else:
+            self.claude_card.show_disabled()
+        if self.settings.collect_codex:
+            self.codex_card.show_readings(codex_readings, snapshots.get(Service.CODEX))
+        else:
+            self.codex_card.show_disabled()
         self._update_refresh_info()
+        self._update_diagnostics()
+
+    def _update_diagnostics(self) -> None:
+        """Refresh the sanitized diagnostics tab content."""
+        text = build_diagnostics_text(
+            version=APP_VERSION,
+            settings=self.settings,
+            readings=self.state.readings,
+            last_refresh=self.state.last_refresh,
+            next_refresh=self.state.next_refresh,
+            history_status=self._history_coordinator.status,
+            history_lifecycle=self._history_coordinator.lifecycle_state,
+            translator=tr,
+        )
+        self._diagnostics_page.update(text)
 
     def _update_refresh_info(self) -> None:
         parts: list[str] = []
@@ -399,24 +601,30 @@ class MainWindow(Adw.ApplicationWindow):
         self.pending_summary = None
         self.pending_availability = []
         self.completed = 0
-        self.claude_card.status.set_text(_("Loading…"))
-        self.codex_card.status.set_text(_("Loading…"))
+        if self.settings.collect_claude:
+            self.claude_card.status.set_text(_("Loading…"))
+        else:
+            self.claude_card.show_disabled()
+        if self.settings.collect_codex:
+            self.codex_card.status.set_text(_("Loading…"))
+        else:
+            self.codex_card.show_disabled()
         self._submit_collectors()
         return False
 
     def _submit_collectors(self) -> None:
-        """Submit one collector per provider, binding each future to its Service.
-
-        The identity travels with the future via functools.partial, so
-        ``_collector_done`` receives it independently of completion order —
-        a Claude failure can never be misclassified as Codex (or vice versa).
+        """Submit one collector per ENABLED provider, binding each future to
+        its Service via functools.partial (identity travels with the future,
+        independent of completion order). Disabled providers are never
+        started. Zero enabled providers completes the refresh immediately.
         """
-        for service, collector in (
-            (Service.CLAUDE, ClaudeCollector()),
-            (Service.CODEX, CodexCollector()),
-        ):
+        self._enabled_services = self.settings.enabled_services()
+        for service in self._enabled_services:
+            collector = ClaudeCollector() if service is Service.CLAUDE else CodexCollector()
             future = self.executor.submit(collector.collect)
             future.add_done_callback(functools.partial(self._collector_done, service=service))
+        if not self._enabled_services:
+            GLib.idle_add(self._finish_refresh)
 
     def _collector_done(
         self, future: concurrent.futures.Future[CollectorResult], service: Service
@@ -449,20 +657,27 @@ class MainWindow(Adw.ApplicationWindow):
                 self.pending_summary = result.codex_summary
             self.pending_availability.extend(result.token_availability_records)
             self.completed += 1
-            complete = self.completed == 2
+            complete = self.completed == len(self._enabled_services)
         if complete:
             GLib.idle_add(self._finish_refresh)
 
     def _finish_refresh(self) -> bool:
         previous = self.state.readings
         merged = merge_with_stale(previous, self.pending)
+        # Disabled providers keep their previous readings unchanged (never
+        # marked stale); only enabled services appear in the merge.
+        enabled = set(self._enabled_services)
+        merged = [r for r in merged if r.service in enabled]
+        merged.extend(r for r in previous if r.service not in enabled)
         now = datetime.now(UTC)
-        if self.settings.ntfy_enabled:
-            alerts = evaluate_alerts(
-                previous, self.pending, self.settings, set(self.state.alert_keys), now=now
-            )
-            for alert in alerts:
-                self.executor.submit(self._deliver_alert, alert.key, alert.notification)
+        alerts = evaluate_alerts(
+            previous, self.pending, self.settings, set(self.state.alert_keys), now=now
+        )
+        for alert in alerts:
+            if alert.channel == CHANNEL_NTFY:
+                self.executor.submit(self._deliver_ntfy, alert.key, alert.notification)
+            elif alert.channel == CHANNEL_NATIVE:
+                self._deliver_native(alert.key, alert.notification)
         self.state.readings = merged
         self.state.last_refresh = now.strftime("%H:%M:%S")
         self._next_refresh_time = time.monotonic() + self.settings.refresh_minutes * 60
@@ -483,7 +698,8 @@ class MainWindow(Adw.ApplicationWindow):
         History failure does not affect quota state, display, or alerts.
         The official Codex summary travels as one typed record — never
         duplicated onto daily buckets. Each provider's token availability
-        record is forwarded independently.
+        record is forwarded independently. Disabled providers never write
+        fresh history: only enabled collectors produced ``readings``.
         """
         combined: list[Any] = list(readings)
         combined.extend(self.pending_tokens)
@@ -492,14 +708,15 @@ class MainWindow(Adw.ApplicationWindow):
         combined.extend(self.pending_availability)
         self._history_coordinator.enqueue(combined, now)
 
-    def _on_close_request(self, *_: Any) -> bool:
-        """Stop the history worker cleanly on window close.
+    def _on_close_request(self, *_args: Any) -> bool:
+        """Persist geometry, then stop the history worker cleanly on close.
 
         The coordinator shutdown is bounded (joins with a 3-second timeout,
         strictly above the 1-second SQLite write timeout) so the worker
         terminates before the join expires. Pending work is discarded
         with a sanitized status. Never blocks GTK for more than 3 seconds.
         """
+        self._persist_geometry()
         self._history_coordinator.clear_write_success_callback()
         self._history_page.shutdown()
         self._history_coordinator.shutdown()
@@ -514,7 +731,7 @@ class MainWindow(Adw.ApplicationWindow):
         """
         GLib.idle_add(self._history_page.on_refresh_complete)
 
-    def _on_stack_changed(self, *_: Any) -> None:
+    def _on_stack_changed(self, *_args: Any) -> None:
         """Refresh History tab when it becomes visible; hide when not."""
         visible_child = self._stack.get_visible_child()
         if visible_child is not None:
@@ -536,9 +753,15 @@ class MainWindow(Adw.ApplicationWindow):
         seconds = remaining % 60
         return f"{minutes}m {seconds}s"
 
-    def _deliver_alert(self, key: str, notification: Notification) -> None:
+    # ── Alert delivery (per-channel dedup) ──
+
+    def _deliver_ntfy(self, key: str, notification: Notification) -> None:
+        """Deliver via NTFY on the worker thread. The channel key is recorded
+        (via the main thread) ONLY after the typed outcome reports success —
+        a failed delivery keeps its pending key so it is retried next refresh
+        without repeating channels that already succeeded."""
         try:
-            send(
+            result = send(
                 self.settings.ntfy_server,
                 self.settings.ntfy_topic,
                 notification,
@@ -546,7 +769,36 @@ class MainWindow(Adw.ApplicationWindow):
             )
         except Exception:
             return
-        GLib.idle_add(self._record_alert, key)
+        if result.ok:
+            GLib.idle_add(self._record_alert, key)
+
+    def _deliver_native(self, key: str, notification: Notification) -> None:
+        """Deliver a native desktop notification on the main thread via
+        Gio.Notification on the application. Never calls notify-send.
+        The channel key is recorded only after send_notification succeeds."""
+        try:
+            app = self.get_application()
+            if app is None:
+                return
+            gio_notification = Gio.Notification.new(notification.title)
+            gio_notification.set_body(notification.message)
+            self._apply_native_priority(gio_notification, notification.priority)
+            app.send_notification(key, gio_notification)
+        except Exception:
+            return
+        self._record_alert(key)
+
+    @staticmethod
+    def _apply_native_priority(gio_notification: Any, priority: int) -> None:
+        """Map Moira priority levels to Gio.NotificationPriority (best-effort)."""
+        if not hasattr(gio_notification, "set_priority"):
+            return
+        mapping = {
+            5: Gio.NotificationPriority.URGENT,
+            4: Gio.NotificationPriority.HIGH,
+            3: Gio.NotificationPriority.NORMAL,
+        }
+        gio_notification.set_priority(mapping.get(priority, Gio.NotificationPriority.LOW))
 
     def _record_alert(self, key: str) -> bool:
         if key not in self.state.alert_keys:
@@ -576,7 +828,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._render()
         return True
 
-    def _on_focus_change(self, *_: Any) -> None:
+    def _on_focus_change(self, *_args: Any) -> None:
         """Refresh on focus regain with monotonic debounce and overlap guard."""
         if not self.is_active():
             return
@@ -588,45 +840,70 @@ class MainWindow(Adw.ApplicationWindow):
             self.refresh()
 
     def _read_form(self) -> Settings:
-        values = [
-            int(part.strip()) for part in self.thresholds.get_text().split(",") if part.strip()
-        ]
+        def parse_thresholds(text: str) -> list[int]:
+            return [int(part.strip()) for part in text.split(",") if part.strip()]
+
+        claude_rules = ProviderRules(
+            parse_thresholds(self._thresholds_entries["claude"].get_text()),
+            self._reset_switches["claude"].get_active(),
+            self._error_switches["claude"].get_active(),
+        )
+        codex_rules = ProviderRules(
+            parse_thresholds(self._thresholds_entries["codex"].get_text()),
+            self._reset_switches["codex"].get_active(),
+            self._error_switches["codex"].get_active(),
+        )
         selected_idx = self.refresh_combo.get_selected()
         refresh_val = VALID_REFRESH_MINUTES[selected_idx]
         settings = Settings(
             ntfy_server=self.server.get_text().strip(),
             ntfy_topic=self.topic.get_text().strip(),
             ntfy_enabled=self.ntfy_enabled.get_active(),
-            thresholds=values,
-            reset_alerts=self.reset_alerts.get_active(),
-            error_alerts=self.error_alerts.get_active(),
+            native_notifications=self.native_notifications.get_active(),
+            thresholds=list(claude_rules.thresholds),
+            reset_alerts=claude_rules.reset_alerts,
+            error_alerts=claude_rules.error_alerts,
+            rules={"claude": claude_rules, "codex": codex_rules},
+            collect_claude=self.collect_claude.get_active(),
+            collect_codex=self.collect_codex.get_active(),
+            compact_mode=self.compact_mode.get_active(),
             autostart=self.autostart.get_active(),
             refresh_minutes=refresh_val,
         )
         settings.validate()
         return settings
 
-    def _save_settings(self, *_: Any) -> None:
+    def _save_settings(self, *_args: Any) -> None:
         try:
             settings = self._read_form()
             token = self.token.get_text()
             if token:
                 set_ntfy_token(token)
                 self.token.set_text("")
+            old_interval = self.settings.refresh_minutes
+            old_collect = (self.settings.collect_claude, self.settings.collect_codex)
+            old_compact = self.settings.compact_mode
             save_settings(settings)
             set_autostart(settings.autostart)
-            old_interval = self.settings.refresh_minutes
             self.settings = settings
             # Replace the GLib provider timer immediately if interval changed
             if old_interval != settings.refresh_minutes:
                 self._arm_refresh_timer()
+            # Apply compact mode and collection toggles immediately
+            if old_compact != settings.compact_mode:
+                self.claude_card.set_compact(settings.compact_mode)
+                self.codex_card.set_compact(settings.compact_mode)
+            self._render()
             self.settings_status.set_text(
                 _("Settings saved. Token is stored only in GNOME Keyring.")
             )
+            if old_collect != (settings.collect_claude, settings.collect_codex):
+                GLib.idle_add(self.refresh)
         except Exception as exc:
             self.settings_status.set_text(f"{_('Could not save settings: ')}{exc}")
 
-    def _test_notification(self, *_: Any) -> None:
+    def _test_notification(self, *_args: Any) -> None:
+        """Send a test NTFY notification. Never changes dedup state."""
         try:
             settings = self._read_form()
         except Exception as exc:
@@ -644,15 +921,67 @@ class MainWindow(Adw.ApplicationWindow):
             ),
             self.token.get_text() or get_ntfy_token(),
         )
-        future.add_done_callback(lambda done: GLib.idle_add(self._test_done, done.exception()))
+        future.add_done_callback(lambda done: GLib.idle_add(self._test_done, done.result()))
 
-    def _test_done(self, error: BaseException | None) -> bool:
-        self.settings_status.set_text(
-            _("Test notification sent.") if error is None else f"{_('Test failed: ')}{error}"
-        )
+    def _test_done(self, result: Any) -> bool:
+        """Show the sanitized typed outcome. Never exposes server, topic,
+        token, response body, or raw exceptions; never changes dedup state."""
+        if result.ok:
+            self.settings_status.set_text(_("Test notification sent."))
+        else:
+            self.settings_status.set_text(f"{_('Test failed: ')}{tr(result.status)}")
         return False
 
-    def _setup_claude(self, *_: Any) -> None:
+    def _test_native_notification(self, *_args: Any) -> None:
+        """Send a test native notification. Never changes dedup state."""
+        app = self.get_application()
+        if app is None:
+            self.settings_status.set_text(_("Native notifications are unavailable."))
+            return
+        gio_notification = Gio.Notification.new(_("Moira test"))
+        gio_notification.set_body(_("Notifications are configured correctly."))
+        app.send_notification("moira-native-test", gio_notification)
+        self.settings_status.set_text(_("Test notification sent."))
+
+    # ── Update check (manual only) ──
+
+    def _check_updates(self, *_args: Any) -> None:
+        """Manually check the repository's latest release. No startup check,
+        no telemetry, no token, no auto-download or install."""
+        self.update_status.set_text(_("Checking for updates…"))
+        repo = self.settings.repo
+        future = self.executor.submit(check_latest_release, repo, current=APP_VERSION)
+        future.add_done_callback(lambda done: GLib.idle_add(self._update_done, done))
+
+    def _update_done(self, future: Any) -> bool:
+        try:
+            result = future.result()
+        except Exception:
+            self.update_status.set_text(_("Update check failed."))
+            return False
+        if result.status == STATUS_UPDATE_AVAILABLE:
+            self.update_status.set_text(f"{_('A new version is available: ')}{result.latest}")
+        elif result.status == STATUS_UP_TO_DATE:
+            self.update_status.set_text(_("Moira is up to date."))
+        elif result.status == STATUS_INVALID_RESPONSE:
+            self.update_status.set_text(_("The update server returned an invalid response."))
+        elif result.status == STATUS_CHECK_FAILED:
+            self.update_status.set_text(_("Update check failed."))
+        return False
+
+    # ── Copy actions (sanitized; no secrets, raw errors, or paths) ──
+
+    def _copy_quota_status(self, *_args: Any) -> None:
+        text = build_quota_status_text(
+            self.state.readings,
+            self.settings,
+            format_local=format_local_datetime,
+            translator=tr,
+        )
+        self.get_clipboard().set_text(text)
+        self.refresh_info.set_text(_("Quota status copied."))
+
+    def _setup_claude(self, *_args: Any) -> None:
         try:
             changed = setup_claude_integration()
             self.settings_status.set_text(
@@ -663,7 +992,7 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception as exc:
             self.settings_status.set_text(f"{_('Claude integration was not changed: ')}{exc}")
 
-    def _remove_claude(self, *_: Any) -> None:
+    def _remove_claude(self, *_args: Any) -> None:
         try:
             changed = remove_claude_integration()
             self.settings_status.set_text(
@@ -674,7 +1003,7 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception as exc:
             self.settings_status.set_text(f"{_('Claude integration was not changed: ')}{exc}")
 
-    def _create_desktop_shortcut(self, *_: Any) -> None:
+    def _create_desktop_shortcut(self, *_args: Any) -> None:
         try:
             target, changed = create_shortcut()
             action = _("created") if changed else _("already exists")
@@ -682,7 +1011,7 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception as exc:
             self.settings_status.set_text(f"{_('Desktop shortcut is unavailable: ')}{exc}")
 
-    def _remove_desktop_shortcut(self, *_: Any) -> None:
+    def _remove_desktop_shortcut(self, *_args: Any) -> None:
         try:
             changed = remove_shortcut()
             removed = (
@@ -694,11 +1023,11 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception as exc:
             self.settings_status.set_text(f"{_('Desktop shortcut is unavailable: ')}{exc}")
 
-    def _about(self, *_: Any) -> None:
+    def _about(self, *_args: Any) -> None:
         dialog = Adw.AboutDialog(
             application_name=_("Moira"),
             application_icon="io.github.moira.QuotaMonitor",
-            version="0.2.2",
+            version=APP_VERSION,
             developer_name="Moira contributors",
             license_type=Gtk.License.MIT_X11,
             comments=_("Claude and Codex quota monitor for Ubuntu"),

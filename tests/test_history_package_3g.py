@@ -692,15 +692,19 @@ class RecordingExecutor:
 
 def _window_harness() -> tuple[Any, RecordingExecutor]:
     """Build an uninitialized MainWindow exposing only the refresh-accumulator state."""
+    from moira.persistence import Settings
     from moira.ui import MainWindow
 
     window = MainWindow.__new__(MainWindow)
+    window.settings = Settings()
+    window.settings.validate()
     window.pending = []
     window.pending_tokens = []
     window.pending_summary = None
     window.pending_availability = []
     window.pending_lock = threading.Lock()
     window.completed = 0
+    window._enabled_services = []
     executor = RecordingExecutor()
     window.executor = executor  # type: ignore[assignment]
     return window, executor

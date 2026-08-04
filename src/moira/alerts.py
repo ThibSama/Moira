@@ -1,3 +1,20 @@
+"""Alert rule evaluation with typed per-service rules and per-channel dedup.
+
+Each event (exhaustion, recovery, reset, threshold crossing, error) yields
+one ``PendingAlert`` per ENABLED delivery channel (NTFY, native desktop).
+The dedup key is the base event key suffixed with the channel
+(``<base>:ntfy`` / ``<base>:native``), and a key is persisted only after
+the channel actually reports success — one successful channel never
+repeats because the other failed.
+
+Legacy unprefixed alert keys (from configurations predating per-channel
+dedup) are treated as delivered on BOTH channels: a base key present in
+``sent_keys`` suppresses the event entirely.
+
+Threshold/reset/error rules are read per service from ``Settings.rules``
+(typed ``ProviderRules``), falling back to the legacy global fields.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -10,10 +27,19 @@ from .models import QuotaReading, QuotaStatus, Service
 from .ntfy import Notification
 from .persistence import Settings
 
+#: Delivery channel identifiers (also used as dedup-key suffixes).
+CHANNEL_NTFY = "ntfy"
+CHANNEL_NATIVE = "native"
+
+_CHANNELS = (CHANNEL_NTFY, CHANNEL_NATIVE)
+
 
 @dataclass(frozen=True, slots=True)
 class PendingAlert:
+    """One alert for one enabled channel, keyed for per-channel dedup."""
+
     key: str
+    channel: str
     notification: Notification
 
 
@@ -38,6 +64,16 @@ def _currently_exhausted(reading: QuotaReading | None, *, now: datetime | None) 
     return is_weekly_exhausted(reading, now=now)
 
 
+def _enabled_channels(settings: Settings) -> list[str]:
+    """Return the enabled delivery channels in fixed order."""
+    channels: list[str] = []
+    if settings.ntfy_enabled:
+        channels.append(CHANNEL_NTFY)
+    if settings.native_notifications:
+        channels.append(CHANNEL_NATIVE)
+    return channels
+
+
 def evaluate_alerts(
     previous: list[QuotaReading],
     current: list[QuotaReading],
@@ -47,10 +83,30 @@ def evaluate_alerts(
     now: datetime | None = None,
 ) -> list[PendingAlert]:
     old = {_identity(item): item for item in previous}
+    channels = _enabled_channels(settings)
+    if not channels:
+        return []
     alerts: list[PendingAlert] = []
+
+    def emit(base_key: str, notification: Notification) -> None:
+        """Emit the alert on every enabled channel that has not delivered it.
+
+        A legacy unprefixed base key in ``sent_keys`` counts as delivered on
+        both channels and suppresses the event entirely. Per-channel keys
+        are independent: a channel that already succeeded never repeats,
+        while a channel that failed keeps its own pending key.
+        """
+        if base_key in sent_keys:
+            return
+        for channel in channels:
+            channel_key = f"{base_key}:{channel}"
+            if channel_key not in sent_keys:
+                alerts.append(PendingAlert(channel_key, channel, notification))
+
     for reading in current:
         identity = _identity(reading)
         prior = old.get(identity)
+        rules = settings.rules_for(reading.service)
         if (
             reading.status is QuotaStatus.AVAILABLE
             and reading.percentage is not None
@@ -62,21 +118,18 @@ def evaluate_alerts(
             # Exhaustion/recovery events: dedup per service/window, independent from thresholds
             if exhausted:
                 exh_key = f"exhausted:{identity}:{reset_key}"
-                if exh_key not in sent_keys:
-                    alerts.append(
-                        PendingAlert(
-                            exh_key,
-                            Notification(
-                                f"{_service_name(reading.service)} {tr('quota exhausted')}",
-                                tr(
-                                    "Weekly usage has reached 100%. "
-                                    "Usage is blocked until the weekly reset."
-                                ),
-                                "no_entry",
-                                5,
-                            ),
-                        )
-                    )
+                emit(
+                    exh_key,
+                    Notification(
+                        f"{_service_name(reading.service)} {tr('quota exhausted')}",
+                        tr(
+                            "Weekly usage has reached 100%. "
+                            "Usage is blocked until the weekly reset."
+                        ),
+                        "no_entry",
+                        5,
+                    ),
+                )
                 # Fall through to threshold checks: lower thresholds still fire,
                 # only the generic 100% threshold is suppressed below.
             elif (
@@ -87,77 +140,66 @@ def evaluate_alerts(
             ):
                 # Recovery: previously exhausted, now below 100% or reset
                 rec_key = f"recovered:{identity}:{reset_key}"
-                if rec_key not in sent_keys:
-                    alerts.append(
-                        PendingAlert(
-                            rec_key,
-                            Notification(
-                                f"{_service_name(reading.service)} {tr('quota recovered')}",
-                                tr("Weekly quota has reset and usage is available again."),
-                                "white_check_mark",
-                                3,
-                            ),
-                        )
-                    )
+                emit(
+                    rec_key,
+                    Notification(
+                        f"{_service_name(reading.service)} {tr('quota recovered')}",
+                        tr("Weekly quota has reset and usage is available again."),
+                        "white_check_mark",
+                        3,
+                    ),
+                )
                 continue
-            # ── Reset alerts ──
+            # ── Reset alerts (per-service rule) ──
             if (
-                settings.reset_alerts
+                rules.reset_alerts
                 and prior
                 and prior.reset_at
                 and prior.reset_at != reading.reset_at
                 and not prior_exhausted
             ):
                 key = f"reset:{identity}:{reset_key}"
-                if key not in sent_keys:
-                    alerts.append(
-                        PendingAlert(
-                            key,
-                            Notification(
-                                f"{_service_name(reading.service)} {tr('quota reset')}",
-                                f"{reading.quota_label}{tr(' quota entered a new window.')}",
-                                "arrows_counterclockwise",
-                            ),
-                        )
-                    )
-            # ── Threshold alerts (the generic 100% threshold is suppressed
-            #    when an exhaustion event fires for this reading) ──
+                emit(
+                    key,
+                    Notification(
+                        f"{_service_name(reading.service)} {tr('quota reset')}",
+                        f"{reading.quota_label}{tr(' quota entered a new window.')}",
+                        "arrows_counterclockwise",
+                    ),
+                )
+            # ── Threshold alerts (per-service rule; the generic 100% threshold
+            #    is suppressed when an exhaustion event fires for this reading) ──
             if prior and prior.percentage is not None:
-                for threshold in settings.thresholds:
+                for threshold in rules.thresholds:
                     # Suppress the generic 100% threshold when exhaustion fires
                     if exhausted and threshold == 100:
                         continue
                     key = f"threshold:{identity}:{reset_key}:{threshold}"
-                    if prior.percentage < threshold <= reading.percentage and key not in sent_keys:
-                        alerts.append(
-                            PendingAlert(
-                                key,
-                                Notification(
-                                    f"{_service_name(reading.service)} "
-                                    f"{reading.quota_label}: {threshold}%",
-                                    f"{tr('Usage reached ')}{reading.percentage:.0f}{tr('%.')}",
-                                    "warning",
-                                    4 if threshold >= 90 else 3,
-                                ),
-                            )
+                    if prior.percentage < threshold <= reading.percentage:
+                        emit(
+                            key,
+                            Notification(
+                                f"{_service_name(reading.service)} "
+                                f"{reading.quota_label}: {threshold}%",
+                                f"{tr('Usage reached ')}{reading.percentage:.0f}{tr('%.')}",
+                                "warning",
+                                4 if threshold >= 90 else 3,
+                            ),
                         )
-        elif settings.error_alerts and reading.status in {
+        elif rules.error_alerts and reading.status in {
             QuotaStatus.ERROR,
             QuotaStatus.PARSE_ERROR,
         }:
             digest = hashlib.sha256(reading.detail.encode()).hexdigest()[:12]
             key = f"error:{identity}:{reading.status.value}:{digest}"
-            if key not in sent_keys:
-                alerts.append(
-                    PendingAlert(
-                        key,
-                        Notification(
-                            f"{_service_name(reading.service)} {tr('quota error')}",
-                            tr("Moira could not refresh quota data."),
-                            "warning",
-                        ),
-                    )
-                )
+            emit(
+                key,
+                Notification(
+                    f"{_service_name(reading.service)} {tr('quota error')}",
+                    tr("Moira could not refresh quota data."),
+                    "warning",
+                ),
+            )
     return alerts
 
 

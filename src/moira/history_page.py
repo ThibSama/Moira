@@ -13,34 +13,47 @@ ways so hidden pages never receive write-triggered reads.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from datetime import UTC, datetime, timedelta, tzinfo
+from datetime import timedelta
 from typing import Any
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
+from .export import export_history  # noqa: E402
 from .history_chart import QuotaChart  # noqa: E402
 from .history_view import (  # noqa: E402
     DailyTokenStats,
     HistoryReader,
     HistoryViewResult,
-    SeriesStats,
     SeriesView,
     TokenSummary,
+    _format_local,  # noqa: F401  (re-exported for tests)
+    _system_local_converter,
     build_codex_summary_text,
     build_daily_token_stats_text,
+    build_history_summary_text,
+    build_series_stats_text,
     build_token_availability_note,
     build_token_summary_text,
     derive_content_state,
+    format_observation_time,  # noqa: F401  (re-exported for tests)
 )
 from .i18n import tr  # noqa: E402
 from .models import HistoryStatus, Service  # noqa: E402
 
 _ = tr
+
+# Explicit re-exports (pure helpers relocated to history_view for testability).
+__all__ = [
+    "HistoryPage",
+    "build_series_stats_text",
+    "format_observation_time",
+    "_format_local",
+    "_system_local_converter",
+]
 
 RANGES = [
     ("24h", "24h", timedelta(hours=24)),
@@ -74,6 +87,10 @@ class HistoryPage(Gtk.Box):
             db_path=db_path,
         )
         self._reader.set_callback(self._on_result)
+        self._executor = executor
+        self._db_path = db_path
+        self._exporting = False
+        self._deleting = False
         self._current_result: HistoryViewResult | None = None
         self._visible = False
         self._range_idx = 0
@@ -128,6 +145,26 @@ class HistoryPage(Gtk.Box):
         self._stats_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.append(self._stats_box)
 
+        # Export / copy / delete actions
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        csv_button = Gtk.Button(label=_("Export CSV"))
+        csv_button.connect("clicked", lambda *_: self._on_export("csv"))
+        json_button = Gtk.Button(label=_("Export JSON"))
+        json_button.connect("clicked", lambda *_: self._on_export("json"))
+        copy_button = Gtk.Button(label=_("Copy history summary"))
+        copy_button.connect("clicked", self._copy_summary)
+        delete_button = Gtk.Button(label=_("Delete all history…"))
+        delete_button.connect("clicked", self._on_delete_clicked)
+        actions.append(csv_button)
+        actions.append(json_button)
+        actions.append(copy_button)
+        actions.append(delete_button)
+        self.append(actions)
+        self._export_status = Gtk.Label(xalign=0)
+        self._export_status.set_wrap(True)
+        self._export_status.add_css_class("dim-label")
+        self.append(self._export_status)
+
         # Theme detection via Adw.StyleManager
         self._setup_theme()
 
@@ -143,7 +180,7 @@ class HistoryPage(Gtk.Box):
         except Exception:
             pass
 
-    def _on_theme_changed(self, *_: Any) -> None:
+    def _on_theme_changed(self, *_args: Any) -> None:
         """React to live dark-state changes."""
         self._apply_theme()
 
@@ -165,11 +202,11 @@ class HistoryPage(Gtk.Box):
                 pass
             self._theme_handler_id = 0
 
-    def _on_range_changed(self, *_: Any) -> None:
+    def _on_range_changed(self, *_args: Any) -> None:
         self._range_idx = self._range_combo.get_selected()
         self.refresh()
 
-    def _on_filter_changed(self, *_: Any) -> None:
+    def _on_filter_changed(self, *_args: Any) -> None:
         self._filter_idx = self._filter_combo.get_selected()
         self.refresh()
 
@@ -195,26 +232,181 @@ class HistoryPage(Gtk.Box):
         """Request a history read from the worker thread."""
         if self._destroyed:
             return
-        from .history_db import query_7d, query_24h, query_30d, query_90d
-
-        range_funcs = [query_24h, query_7d, query_30d, query_90d]
-        range_func = range_funcs[self._range_idx]
-        range_label = RANGES[self._range_idx][1]
-        filter_label = _FILTER_KEYS[self._filter_idx][1]
-
-        service: Service | None = None
-        if self._filter_idx == 1:
-            service = Service.CLAUDE
-        elif self._filter_idx == 2:
-            service = Service.CODEX
-
         self._status_label.set_text(_("Loading…"))
         self._reader.request(
-            range_func=range_func,
-            range_label=range_label,
-            filter_label=filter_label,
-            service=service,
+            range_func=self._range_func(),
+            range_label=RANGES[self._range_idx][1],
+            filter_label=_FILTER_KEYS[self._filter_idx][1],
+            service=self._current_service(),
         )
+
+    def _range_func(self) -> Any:
+        """Return the query function for the selected range."""
+        from .history_db import query_7d, query_24h, query_30d, query_90d
+
+        return [query_24h, query_7d, query_30d, query_90d][self._range_idx]
+
+    def _current_service(self) -> Service | None:
+        """Return the selected filter service (None = All)."""
+        if self._filter_idx == 1:
+            return Service.CLAUDE
+        if self._filter_idx == 2:
+            return Service.CODEX
+        return None
+
+    # ── Export (explicit destination, off-GTK read/write) ──
+
+    def _on_export(self, fmt: str) -> None:
+        """Open a save dialog for the explicit destination; runs the export
+        on the worker thread. Cancelling the dialog writes nothing."""
+        if self._destroyed or self._exporting or self._deleting:
+            return
+        self._exporting = True
+        dialog = Gtk.FileDialog()
+        dialog.set_title(_("Export history"))
+        dialog.set_initial_name(f"moira-history.{fmt}")
+
+        def done(dialog: Gtk.FileDialog, result: Gio.AsyncResult, _user_data: Any = None) -> None:
+            self._on_export_dialog_done(dialog, result, fmt)
+
+        try:
+            dialog.save(self._parent_window(), None, done)
+        except Exception:
+            self._exporting = False
+            self._export_status.set_text(_("Export failed."))
+
+    def _parent_window(self) -> Gtk.Window | None:
+        root = self.get_root()
+        return root if isinstance(root, Gtk.Window) else None
+
+    def _on_export_dialog_done(
+        self, dialog: Gtk.FileDialog, result: Gio.AsyncResult, fmt: str = "csv"
+    ) -> None:
+        self._exporting = False
+        try:
+            file = dialog.save_finish(result)
+        except GLib.Error as exc:
+            if getattr(exc, "code", None) == Gio.IOErrorEnum.CANCELLED:
+                self._export_status.set_text(_("Export cancelled."))
+            else:
+                self._export_status.set_text(_("Export failed."))
+            return
+        except Exception:
+            self._export_status.set_text(_("Export failed."))
+            return
+        path = file.get_path()
+        if not path:
+            self._export_status.set_text(_("Export failed."))
+            return
+        self._export_status.set_text(_("Exporting…"))
+        from pathlib import Path
+
+        from .history_db import history_path
+
+        future = self._executor.submit(
+            export_history,
+            self._db_path if self._db_path is not None else history_path(),
+            range_func=self._range_func(),
+            service=self._current_service(),
+            fmt=fmt,
+            dest=Path(path),
+        )
+        future.add_done_callback(lambda done: GLib.idle_add(self._export_done, done))
+
+    def _export_done(self, future: Any) -> bool:
+        """Show the sanitized export outcome (never raw exceptions)."""
+        try:
+            result = future.result()
+        except Exception:
+            self._export_status.set_text(_("Export failed."))
+            return False
+        if result.ok and result.status == "exported":
+            self._export_status.set_text(f"{_('Exported')} {result.rows} {_('rows')}.")
+        elif result.status == "no data":
+            self._export_status.set_text(_("Nothing to export."))
+        elif result.status == "no database":
+            self._export_status.set_text(_("No history database"))
+        elif result.status == "schema mismatch":
+            self._export_status.set_text(_("Schema mismatch"))
+        elif result.status == "database unavailable":
+            self._export_status.set_text(_("Database unavailable"))
+        else:
+            self._export_status.set_text(_("Export failed."))
+        return False
+
+    # ── Delete all history (confirmed) ──
+
+    def _on_delete_clicked(self, *_args: Any) -> None:
+        """Ask for confirmation before deleting every stored observation.
+        Settings, keyring and current quota state are kept."""
+        if self._destroyed or self._deleting or self._exporting:
+            return
+        dialog = Adw.MessageDialog.new(
+            self._parent_window(),
+            _("Delete all history?"),
+            _(
+                "This removes every stored observation. Settings, keyring and "
+                "current quota state are kept."
+            ),
+        )
+        dialog.add_response("cancel", _("Cancel"))
+        dialog.add_response("delete", _("Delete"))
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.connect("response", self._on_delete_response)
+        dialog.present()
+
+    def _on_delete_response(self, dialog: Any, response: str) -> None:
+        try:
+            dialog.close()
+        except Exception:
+            pass
+        if response != "delete":
+            return
+        self._deleting = True
+        self._export_status.set_text(_("Deleting…"))
+        future = self._executor.submit(self._delete_worker)
+        future.add_done_callback(lambda done: GLib.idle_add(self._delete_done, done))
+
+    def _delete_worker(self) -> int:
+        """Delete all history rows off-GTK. Returns the row count deleted."""
+        from pathlib import Path
+
+        from .history_db import _connect, delete_all, history_path, init_schema
+
+        db_path = self._db_path if self._db_path is not None else history_path()
+        path = Path(db_path) if not isinstance(db_path, Path) else db_path
+        if not path.exists():
+            return 0
+        conn = _connect(path, timeout=5.0)
+        try:
+            init_schema(conn)
+            return delete_all(conn)
+        finally:
+            conn.close()
+
+    def _delete_done(self, future: Any) -> bool:
+        self._deleting = False
+        try:
+            count = future.result()
+        except Exception:
+            self._export_status.set_text(_("Deletion failed."))
+            return False
+        if count > 0:
+            self._export_status.set_text(_("History deleted."))
+        else:
+            self._export_status.set_text(_("History is already empty."))
+        self.refresh()
+        return False
+
+    # ── Copy history summary (sanitized) ──
+
+    def _copy_summary(self, *_args: Any) -> None:
+        if self._current_result is None or self._destroyed:
+            return
+        text = build_history_summary_text(self._current_result, tr)
+        self.get_clipboard().set_text(text)
+        self._export_status.set_text(_("History summary copied."))
 
     def _on_result(self, view: HistoryViewResult, req_id: int = 0) -> None:
         """Called via GLib.idle_add with the newest result.
@@ -340,102 +532,3 @@ class HistoryPage(Gtk.Box):
         """Build a label showing the official Codex summary, apart from daily totals."""
         text = build_codex_summary_text(cs, tr)
         return Gtk.Label(label=text, xalign=0, wrap=True)
-
-
-def build_series_stats_text(
-    stats: SeriesStats,
-    translator: Callable[[str], str],
-    *,
-    target_tz: tzinfo | None = None,
-    converter: Callable[[datetime], datetime] | None = None,
-    tz_provider: Callable[[], tzinfo] | None = None,
-) -> str:
-    """Build the complete per-series statistics text as a pure function.
-
-    GTK only wraps this text in a label. The translator is injected
-    so tests don't depend on the locale. Timezone resolution is
-    injectable via target_tz/converter/tz_provider.
-    """
-    _ = translator
-    parts: list[str] = [f"{stats.service.value.title()} {stats.label}"]
-    if stats.count == 0:
-        parts.append(_("No observations"))
-    else:
-        if stats.latest is not None:
-            parts.append(f"{_('Latest')}: {stats.latest:.1f}%")
-        if stats.minimum is not None:
-            parts.append(f"{_('Min')}: {stats.minimum:.1f}%")
-        if stats.maximum is not None:
-            parts.append(f"{_('Max')}: {stats.maximum:.1f}%")
-        parts.append(f"{_('Count')}: {stats.count}")
-        if stats.reset_count > 0:
-            parts.append(f"{_('Resets')}: {stats.reset_count}")
-        if stats.first_observed is not None:
-            ft = format_observation_time(
-                stats.first_observed,
-                target_tz=target_tz,
-                converter=converter,
-                tz_provider=tz_provider,
-            )
-            parts.append(f"{_('First')}: {ft}")
-        if stats.last_observed is not None:
-            lt = format_observation_time(
-                stats.last_observed,
-                target_tz=target_tz,
-                converter=converter,
-                tz_provider=tz_provider,
-            )
-            parts.append(f"{_('Last')}: {lt}")
-    return _(" · ").join(parts)
-
-
-def _system_local_converter(utc_dt: datetime) -> datetime:
-    """Convert a UTC datetime to the OS local timezone using system rules.
-
-    Uses datetime.astimezone() with no arguments, which resolves the
-    correct offset for each observation instant, including DST
-    transitions. This is not a fixed offset — the OS timezone database
-    is authoritative.
-    """
-    if utc_dt.tzinfo is None:
-        raise ValueError("naive timestamps are not allowed; use timezone-aware datetimes")
-    return utc_dt.astimezone()
-
-
-def format_observation_time(
-    utc_dt: datetime,
-    target_tz: tzinfo | None = None,
-    *,
-    tz_provider: Callable[[], tzinfo] | None = None,
-    converter: Callable[[datetime], datetime] | None = None,
-) -> str:
-    """Format a UTC datetime in the target timezone for display only.
-
-    Resolution order:
-      1. ``target_tz`` explicit → deterministic pure function.
-      2. ``converter`` given → called per observation (supports DST).
-      3. ``tz_provider`` given → called once, fixed offset for all.
-      4. Both None → UTC fallback.
-
-    Naive timestamps (no tzinfo) raise ValueError (fail-closed).
-    """
-    if utc_dt.tzinfo is None:
-        raise ValueError("naive timestamps are not allowed; use timezone-aware datetimes")
-    if target_tz is not None:
-        local_dt = utc_dt.astimezone(target_tz)
-    elif converter is not None:
-        local_dt = converter(utc_dt)
-    elif tz_provider is not None:
-        tz = tz_provider()
-        local_dt = utc_dt.astimezone(tz)
-    else:
-        local_dt = utc_dt.astimezone(UTC)
-    return local_dt.strftime("%Y-%m-%d %H:%M")
-
-
-def _format_local(utc_dt: datetime) -> str:
-    """Format a UTC datetime in the system local timezone for display only.
-
-    Uses _system_local_converter for DST-correct per-observation offsets.
-    """
-    return format_observation_time(utc_dt, converter=_system_local_converter)
