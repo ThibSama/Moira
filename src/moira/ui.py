@@ -926,17 +926,23 @@ class MainWindow(Adw.ApplicationWindow):
             self.settings_status.set_text(_("Test failed: keyring unavailable."))
             return
         self.settings_status.set_text(_("Sending test…"))
-        future = self.executor.submit(
-            send,
-            settings.ntfy_server,
-            settings.ntfy_topic,
-            Notification(
-                _("Moira test"),
-                _("Notifications are configured correctly."),
-                "white_check_mark",
-            ),
-            token,
-        )
+        try:
+            future = self.executor.submit(
+                send,
+                settings.ntfy_server,
+                settings.ntfy_topic,
+                Notification(
+                    _("Moira test"),
+                    _("Notifications are configured correctly."),
+                    "white_check_mark",
+                ),
+                token,
+            )
+        except Exception:
+            # A stopped or rejecting executor raises synchronously at
+            # submit(); never let that escape the GTK handler.
+            self.settings_status.set_text(_("Test failed: notification unavailable."))
+            return
         future.add_done_callback(lambda done: GLib.idle_add(self._test_done, done))
 
     def _test_done(self, future: Any) -> bool:
@@ -977,7 +983,13 @@ class MainWindow(Adw.ApplicationWindow):
         no telemetry, no token, no auto-download or install."""
         self.update_status.set_text(_("Checking for updates…"))
         repo = self.settings.repo
-        future = self.executor.submit(check_latest_release, repo, current=APP_VERSION)
+        try:
+            future = self.executor.submit(check_latest_release, repo, current=APP_VERSION)
+        except Exception:
+            # A stopped or rejecting executor raises synchronously at
+            # submit(); never let that escape the GTK handler.
+            self.update_status.set_text(_("Update check failed."))
+            return
         future.add_done_callback(lambda done: GLib.idle_add(self._update_done, done))
 
     def _update_done(self, future: Any) -> bool:

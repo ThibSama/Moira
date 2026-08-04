@@ -16,6 +16,7 @@ from moira.persistence import (
     VALID_REFRESH_MINUTES,
     ProviderRules,
     Settings,
+    _coerce_rules,
     _migrate_v1_to_v2,
     _migrate_v2_to_v3,
     load_settings,
@@ -214,7 +215,7 @@ def test_refresh_minutes_in_valid_set() -> None:
 def test_defaults_normalize_rules_for_both_providers() -> None:
     settings = Settings()
     settings.validate()
-    assert set(settings.rules) == {"claude", "codex"}
+    assert set(settings.rules) == {"claude", "codex"}  # type: ignore[arg-type]
     assert settings.rules_for(Service.CLAUDE).thresholds == [50, 75, 90]
     assert settings.rules_for(Service.CODEX).thresholds == [50, 75, 90]
 
@@ -331,7 +332,7 @@ def test_rule_switch_types_rejected() -> None:
         rules2.validate()
     # JSON-shaped rules with a string switch fail closed through Settings too.
     settings = Settings(rules={"claude": ProviderRules(), "codex": ProviderRules()})
-    settings.rules["claude"].reset_alerts = bad_reset
+    settings.rules["claude"].reset_alerts = bad_reset  # type: ignore[index]
     with pytest.raises(ValueError):
         settings.validate()
 
@@ -458,3 +459,112 @@ def test_load_settings_v2_string_false_fails_closed(tmp_path: Path) -> None:
         settings = load_settings()
     assert settings.rules_for(Service.CLAUDE).reset_alerts is True
     assert settings.rules_for(Service.CODEX).reset_alerts is True
+
+
+# ── Package 5c: persisted v3 `rules` is a strict exact-shape contract ──
+
+
+def _valid_rules() -> dict[str, Any]:
+    return {
+        "claude": {"thresholds": [50, 75], "reset_alerts": True, "error_alerts": True},
+        "codex": {"thresholds": [90], "reset_alerts": True, "error_alerts": True},
+    }
+
+
+def test_coerce_rules_strict_shapes() -> None:
+    """Persisted v3 `rules` must be an object with exactly claude+codex."""
+    with pytest.raises(ValueError):
+        _coerce_rules({})  # missing key
+    bad_values: list[Any] = [[], False, 0, "", None, "rules"]
+    for bad in bad_values:
+        with pytest.raises(ValueError):
+            _coerce_rules({"rules": bad})
+    with pytest.raises(ValueError):
+        _coerce_rules({"rules": {}})  # explicit empty object
+    with pytest.raises(ValueError):
+        _coerce_rules({"rules": {"claude": {"thresholds": [50]}}})  # one provider
+    with pytest.raises(ValueError):
+        _coerce_rules(  # extra provider
+            {"rules": {**_valid_rules(), "extra": {"thresholds": [50]}}}
+        )
+    with pytest.raises(ValueError):
+        _coerce_rules({"rules": {"claude": [50], "codex": {"thresholds": [50]}}})
+    coerced = _coerce_rules({"rules": _valid_rules()})
+    assert set(coerced) == {"claude", "codex"}
+    assert coerced["claude"].thresholds == [50, 75]
+
+
+def test_persisted_rules_matrix_fails_closed_to_complete_defaults(tmp_path: Path) -> None:
+    """Every malformed persisted `rules` shape falls back to a COMPLETE
+    default Settings instance — never partial preservation with rules
+    silently derived from the legacy globals."""
+    cases = (
+        {"version": 3, "ntfy_topic": "keep", "rules": {}},
+        {"version": 3, "ntfy_topic": "keep", "rules": []},
+        {"version": 3, "ntfy_topic": "keep", "rules": False},
+        {"version": 3, "ntfy_topic": "keep", "rules": 0},
+        {"version": 3, "ntfy_topic": "keep", "rules": ""},
+        {"version": 3, "ntfy_topic": "keep"},  # missing rules key
+        {"version": 3, "ntfy_topic": "keep", "rules": {"claude": {"thresholds": [50]}}},
+        {
+            "version": 3,
+            "ntfy_topic": "keep",
+            "rules": {**_valid_rules(), "extra": {"thresholds": [50]}},
+        },
+        {
+            "version": 3,
+            "ntfy_topic": "keep",
+            "rules": {"claude": {"thresholds": [True, 50]}, "codex": {"thresholds": [90]}},
+        },
+    )
+    for payload in cases:
+        config = tmp_path / "moira" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps(payload))
+        with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
+            settings = load_settings()
+        # COMPLETE default instance: not even ntfy_topic is preserved.
+        assert settings.version == 3
+        assert settings.ntfy_topic == "", payload["rules"] if "rules" in payload else "missing"
+        assert settings.thresholds == [50, 75, 90]
+        assert settings.collect_claude is True
+        assert settings.rules_for(Service.CLAUDE).thresholds == [50, 75, 90]
+        assert settings.rules_for(Service.CODEX).thresholds == [50, 75, 90]
+        config.unlink()
+
+
+def test_valid_persisted_rules_still_load(tmp_path: Path) -> None:
+    config = tmp_path / "moira" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"version": 3, "ntfy_topic": "keep", "rules": _valid_rules()}))
+    with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
+        settings = load_settings()
+    assert settings.ntfy_topic == "keep"
+    assert settings.rules_for(Service.CLAUDE).thresholds == [50, 75]
+    assert settings.rules_for(Service.CODEX).thresholds == [90]
+
+
+def test_direct_settings_construction_stays_ergonomic() -> None:
+    """Settings() without rules derives both providers from legacy globals
+    (in-memory path); the sentinel never reaches persisted validation."""
+    settings = Settings()
+    settings.validate()
+    assert set(settings.rules) == {"claude", "codex"}  # type: ignore[arg-type]
+    assert settings.rules_for(Service.CLAUDE).thresholds == [50, 75, 90]
+    assert settings.rules_for(Service.CODEX).reset_alerts is True
+    # Explicit empty dict is NOT the sentinel: it fails closed.
+    explicit = Settings(rules={})
+    with pytest.raises(ValueError):
+        explicit.validate()
+
+
+def test_saved_default_settings_round_trip(tmp_path: Path) -> None:
+    """A fresh default Settings, once saved, carries the full rules object
+    and reloads cleanly (no sentinel ever written to disk)."""
+    with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
+        save_settings(Settings())
+        raw = (tmp_path / "moira" / "config.json").read_text()
+        assert "rules" in raw
+        loaded = load_settings()
+    assert loaded.rules_for(Service.CLAUDE).thresholds == [50, 75, 90]
+    assert loaded.rules_for(Service.CODEX).thresholds == [50, 75, 90]

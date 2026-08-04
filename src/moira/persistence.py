@@ -106,6 +106,27 @@ class ProviderRules:
         self.thresholds = sorted(set(self.thresholds))
 
 
+class _UnsetRules:
+    """Sentinel type for ``rules`` omitted on direct in-memory ``Settings()``
+    construction.
+
+    Persisted v3 JSON never carries the sentinel: the strict decode layer
+    (``_coerce_rules``) either produces the exact ``{claude, codex}`` shape
+    or raises, so an invalid persisted file fails closed to a complete
+    default ``Settings`` instance. The sentinel exists only so that
+    ``Settings()`` (no rules argument) stays ergonomic: ``validate()`` then
+    derives both providers' rules from the legacy global fields.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<unset-rules>"
+
+
+_RULES_UNSET = _UnsetRules()
+
+
 @dataclass(slots=True)
 class Settings:
     version: int = CONFIG_VERSION
@@ -119,8 +140,12 @@ class Settings:
     thresholds: list[int] = field(default_factory=lambda: list(DEFAULT_THRESHOLDS))
     reset_alerts: bool = True
     error_alerts: bool = True
-    # Typed per-service alert rules (v3).
-    rules: dict[str, ProviderRules] = field(default_factory=dict)
+    # Typed per-service alert rules (v3). The sentinel default keeps direct
+    # ``Settings()`` construction ergonomic: ``validate()`` derives both
+    # providers' rules from the legacy global fields. Persisted v3 JSON
+    # always carries an explicit exact ``{claude, codex}`` object, enforced
+    # by ``_coerce_rules`` (any other shape fails closed to defaults).
+    rules: dict[str, ProviderRules] | _UnsetRules = _RULES_UNSET
     collect_claude: bool = True
     collect_codex: bool = True
     compact_mode: bool = False
@@ -154,35 +179,40 @@ class Settings:
             raise ValueError("window geometry must be two positive integers or both null")
         if not _valid_repo(self.repo):
             raise ValueError("update-check repository must be owner/name without separators")
-        if self.rules:
-            # Typed per-service contract: exactly the two providers, each valid.
-            for key in VALID_RULE_KEYS:
-                rules = self.rules.get(key)
-                if not isinstance(rules, ProviderRules):
-                    raise ValueError(f"missing or invalid rules for provider {key!r}")
-                rules.validate()
-            for key in self.rules:
-                if key not in VALID_RULE_KEYS:
-                    raise ValueError(f"unknown provider in rules: {key!r}")
-        else:
-            # No rules yet (fresh defaults or legacy-shaped construction):
-            # derive both providers' rules from the legacy global fields.
+        if isinstance(self.rules, _UnsetRules):
+            # In-memory default construction without explicit rules: derive
+            # both providers' rules from the legacy global fields. Valid by
+            # construction (thresholds and switches were checked above).
             self.rules = {
                 key: ProviderRules(list(self.thresholds), self.reset_alerts, self.error_alerts)
                 for key in VALID_RULE_KEYS
             }
+            return
+        if not isinstance(self.rules, dict):
+            raise ValueError("rules must be an object mapping providers to ProviderRules")
+        # Typed per-service contract: exactly the two providers, each valid.
+        for key in VALID_RULE_KEYS:
+            rules = self.rules.get(key)
+            if not isinstance(rules, ProviderRules):
+                raise ValueError(f"missing or invalid rules for provider {key!r}")
+            rules.validate()
+        for key in self.rules:
+            if key not in VALID_RULE_KEYS:
+                raise ValueError(f"unknown provider in rules: {key!r}")
 
     def rules_for(self, service: Service | str) -> ProviderRules:
         """Return the typed alert rules for one provider.
 
-        Falls back to the legacy global fields when the rules dict is empty
-        (e.g. directly-constructed Settings in tests). After ``validate()``
-        the rules dict is always populated for both providers.
+        Falls back to the legacy global fields when the rules dict is unset
+        (direct ``Settings()`` construction before ``validate()``) or when
+        the provider is absent. After ``validate()`` the rules dict is
+        always populated for both providers.
         """
         key = service.value if isinstance(service, Service) else str(service)
-        rules = self.rules.get(key)
-        if rules is not None:
-            return rules
+        if isinstance(self.rules, dict):
+            rules = self.rules.get(key)
+            if rules is not None:
+                return rules
         return ProviderRules(list(self.thresholds), self.reset_alerts, self.error_alerts)
 
     def enabled_services(self) -> list[Service]:
@@ -288,17 +318,28 @@ def _migrate_v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _coerce_rules(data: dict[str, Any]) -> dict[str, ProviderRules]:
-    """Coerce raw rule dicts from JSON into typed ProviderRules (fail closed)."""
-    raw = data.get("rules")
-    if not raw:
-        return {}
+    """Strictly decode persisted v3 ``rules`` (fail closed).
+
+    A persisted v3 file MUST carry ``rules`` as an object containing exactly
+    ``claude`` and ``codex`` with valid typed values. Missing, falsy
+    non-object shapes (``[]``, ``false``, ``0``, ``""``), empty, incomplete
+    or extra shapes all raise ValueError, so ``load_settings`` falls back to
+    a COMPLETE default ``Settings`` instance — never to partial preservation
+    with rules silently derived from the legacy globals.
+    """
+    if "rules" not in data:
+        raise ValueError("persisted v3 configuration must contain rules")
+    raw = data["rules"]
     if not isinstance(raw, dict):
         raise ValueError("rules must be an object")
+    if set(raw) != set(VALID_RULE_KEYS):
+        raise ValueError("rules must contain exactly the claude and codex providers")
     rules: dict[str, ProviderRules] = {}
-    for key, value in raw.items():
+    for key in VALID_RULE_KEYS:
+        value = raw[key]
         if not isinstance(value, dict):
             raise ValueError(f"rules for {key!r} must be an object")
-        rules[str(key)] = ProviderRules(**value)
+        rules[key] = ProviderRules(**value)
     return rules
 
 

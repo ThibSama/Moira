@@ -61,6 +61,14 @@ class DirectExecutor:
         return future
 
 
+class RejectingExecutor:
+    """An executor whose ``submit()`` raises synchronously — exactly what a
+    stopped or rejecting ThreadPoolExecutor does."""
+
+    def submit(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("executor has been shut down")
+
+
 class FakeApp:
     def __init__(self) -> None:
         self.sent: list[tuple[str, Any]] = []
@@ -86,6 +94,7 @@ def _window() -> Any:
     window.state = None  # type: ignore[assignment]  # unused by these paths
     window.executor = DirectExecutor()  # type: ignore[assignment]
     window.settings_status = FakeLabel()
+    window.update_status = FakeLabel()
     window.token = FakeEntry()
     return window
 
@@ -229,3 +238,34 @@ def test_test_failures_never_persist_alert_keys(tmp_path: Any) -> None:
         save_state(window.state)
         loaded = load_state()
     assert loaded.alert_keys == ["old:key"]
+
+
+# ── Package 5c: synchronous executor submit failures are sanitized ──
+
+
+def test_ntfy_test_synchronous_submit_failure_is_sanitized() -> None:
+    """A stopped/rejecting executor raises at submit() on the GTK thread;
+    the handler must catch it, show a fixed translated outcome, and never
+    leave 'Sending test…' visible or touch dedup state."""
+    from moira.persistence import AppState
+
+    window = _form_window()
+    window.executor = RejectingExecutor()
+    window.state = AppState(readings=[], alert_keys=["old:key"], last_refresh=None)
+    window._read_form = lambda: Settings(ntfy_enabled=True)
+    with patch("moira.ui.get_ntfy_token", return_value=None):
+        window._test_notification()
+    assert window.settings_status.text == tr("Test failed: notification unavailable.")
+    assert window.settings_status.text != tr("Sending test…")
+    assert "shut down" not in window.settings_status.text
+    assert window.state.alert_keys == ["old:key"]
+
+
+def test_update_check_synchronous_submit_failure_is_sanitized() -> None:
+    """The manual update check has the same synchronous submit() boundary."""
+    window = _window()
+    window.executor = RejectingExecutor()
+    window._check_updates()
+    assert window.update_status.text == tr("Update check failed.")
+    assert window.update_status.text != tr("Checking for updates…")
+    assert "shut down" not in window.update_status.text

@@ -160,6 +160,68 @@ def test_longer_prerelease_wins_when_prefix_equal() -> None:
     assert compare_versions(alpha1, alpha) == 1
 
 
+# ── Package 5c: total, bounded parsing (no int() overflow, never raises) ──
+
+
+def test_oversized_numeric_core_is_invalid_not_raised() -> None:
+    """5000-digit numeric identifiers exceed Python's int-string conversion
+    limit; the documented bound (MAX_NUMERIC_IDENTIFIER_DIGITS) maps them
+    to None without ever raising."""
+    huge = "9" * 5000
+    assert parse_version(f"{huge}.2.3") is None
+    assert parse_version(f"1.{huge}.3") is None
+    assert parse_version(f"1.2.{huge}") is None
+
+
+def test_oversized_numeric_prerelease_is_invalid_not_raised() -> None:
+    huge = "9" * 5000
+    assert parse_version(f"1.2.3-{huge}") is None
+    assert parse_version(f"1.2.3-rc.1.{huge}") is None
+
+
+def test_boundary_numeric_identifiers_parse_and_compare() -> None:
+    """Identifiers exactly at the documented bound (64 digits) parse and
+    compare numerically without any decimal conversion problem."""
+    biggest_64 = "9" * 64  # 10^64 - 1
+    one_with_63_zeros = "1" + "0" * 63  # 10^63, also 64 digits
+    a = parse_version(f"1.0.0-{one_with_63_zeros}")
+    b = parse_version(f"1.0.0-{biggest_64}")
+    assert a is not None and b is not None
+    assert compare_versions(a, b) == -1
+    assert compare_versions(b, a) == 1
+    assert parse_version(f"1.{biggest_64}.0") is not None
+    # One digit beyond the bound is invalid.
+    assert parse_version(f"1.{biggest_64}0.0") is None
+
+
+def test_parse_version_never_raises_on_pathological_input() -> None:
+    pathological = (
+        "9" * 10_000,
+        "v" + "9" * 5000 + ".1.1",
+        "1.2.3-" + "a" * 5000,  # long alphanumeric prerelease stays valid
+        "1.2.3+" + "b" * 5000,  # long build metadata stays valid
+        "1.2.3-" + "9" * 5000 + ".0",
+        "1.2.3-rc." + "9" * 5000,
+        "1.2.3-rc." + "9" * 5000 + "+build." + "x" * 5000,
+    )
+    for tag in pathological:
+        result = parse_version(tag)
+        assert result is None or isinstance(result, SemVer), tag[:40]
+
+
+def test_check_latest_release_oversized_inputs_sanitized() -> None:
+    huge = "9" * 5000
+    body = json.dumps({"tag_name": f"1.2.{huge}"}).encode()
+    result = check_latest_release("ThibSama/moira", current="0.2.2", opener=_opener(body))
+    assert result.ok is False
+    assert result.status == STATUS_INVALID_RESPONSE
+    # Oversized current version fails closed too.
+    body = json.dumps({"tag_name": "0.3.0"}).encode()
+    result = check_latest_release("ThibSama/moira", current=f"1.2.{huge}", opener=_opener(body))
+    assert result.ok is False
+    assert result.status == STATUS_CHECK_FAILED
+
+
 # ── Release check outcomes ──
 
 

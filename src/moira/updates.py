@@ -11,7 +11,10 @@ three-part core (``0.10.0`` > ``0.2.2``), prerelease ordering
 (``1.0.0-alpha`` < ``1.0.0-alpha.1`` < ``1.0.0-beta`` < ``1.0.0``),
 build metadata ignored for ordering, leading zeros rejected, empty or
 invalid identifiers rejected, and an invalid ``current`` version fails
-the check (never reported as "up to date").
+the check (never reported as "up to date"). Parsing is total and bounded:
+numeric identifiers longer than ``MAX_NUMERIC_IDENTIFIER_DIGITS`` are
+rejected, so no input can ever make ``int()`` raise during parsing or
+comparison — every string returns ``SemVer | None``.
 """
 
 from __future__ import annotations
@@ -39,6 +42,14 @@ DEFAULT_MAX_BYTES = 65536
 _VERSION_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$")
 _IDENTIFIER_RE = re.compile(r"^[0-9A-Za-z-]+$")
 
+#: Deterministic safe bound for numeric SemVer identifiers. Any core or
+#: prerelease numeric identifier longer than this is rejected as invalid.
+#: The bound is far above any real release tag and far below Python's
+#: int-string conversion limit (4300 digits by default), so ``int()`` can
+#: never raise during parsing or comparison: ``parse_version`` is total —
+#: every string returns ``SemVer | None``.
+MAX_NUMERIC_IDENTIFIER_DIGITS = 64
+
 
 @dataclass(frozen=True, slots=True)
 class SemVer:
@@ -65,20 +76,26 @@ def _valid_identifier(identifier: str) -> bool:
     """Validate one dot-separated SemVer identifier.
 
     Numeric identifiers (all digits) MUST NOT carry leading zeros (``01``
-    is invalid, ``0`` is valid). Alphanumeric/hyphen identifiers are valid
-    as-is. Empty identifiers are always invalid.
+    is invalid, ``0`` is valid) and MUST stay within the documented digit
+    bound (``MAX_NUMERIC_IDENTIFIER_DIGITS``) so conversion can never
+    raise. Alphanumeric/hyphen identifiers are valid as-is. Empty
+    identifiers are always invalid.
     """
     if not identifier or not _IDENTIFIER_RE.match(identifier):
         return False
     if identifier.isdigit():
+        if len(identifier) > MAX_NUMERIC_IDENTIFIER_DIGITS:
+            return False
         return len(identifier) == 1 or identifier[0] != "0"
     return True
 
 
 def parse_version(tag: str) -> SemVer | None:
     """Parse a SemVer 2.0 tag like ``0.2.2``, ``v1.2.3-rc1`` or
-    ``1.2.3+build.5``. Returns None for anything non-conforming
-    (leading zeros, empty/invalid identifiers, malformed shapes)."""
+    ``1.2.3+build.5``. Total and bounded: NEVER raises, every input returns
+    ``SemVer | None``. Returns None for anything non-conforming (leading
+    zeros, empty/invalid identifiers, oversized numeric identifiers,
+    malformed shapes)."""
     if not isinstance(tag, str):
         return None
     match = _VERSION_RE.match(tag.strip())
@@ -86,6 +103,8 @@ def parse_version(tag: str) -> SemVer | None:
         return None
     for group in (match.group(1), match.group(2), match.group(3)):
         if len(group) > 1 and group.startswith("0"):
+            return None
+        if len(group) > MAX_NUMERIC_IDENTIFIER_DIGITS:
             return None
     prerelease: tuple[str, ...] = ()
     if match.group(4) is not None:
