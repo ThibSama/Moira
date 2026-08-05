@@ -1,0 +1,59 @@
+.TH MOIRA 1 "August 2026" "moira 0.3.0" "User Commands"
+.SH NAME
+moira \- Claude and Codex quota monitor
+.SH SYNOPSIS
+.B moira
+[\fI\-\-smoke\-test\fR]
+.SH DESCRIPTION
+.B moira
+is a compact GTK4/Libadwaita application that displays Claude and Codex
+quota usage, local reset times, countdowns, refresh state and weekly
+exhaustion semantics.
+.PP
+Data is collected only from structured provider surfaces: the chained
+Claude Code status\-line command and the documented Codex app\-server
+read\-only rate\-limit method. Missing or invalid data is displayed as
+Unavailable, Parse error or Stale \-\- never invented.
+.PP
+The History tab shows quota series with reset transitions and
+availability states over selectable 24h/7d/30d/90d ranges and
+per\-service filters, plus exact daily token statistics computed only
+from official Codex account usage (Claude remains percentage\-only).
+.PP
+Per\-provider collection toggles and typed alert rules feed native
+desktop and NTFY notification channels with deduplicated exhaustion,
+recovery, reset and error events. Diagnostics are sanitized and can be
+copied; history can be exported as CSV/JSON; manual update checks use
+strict SemVer parsing.
+.PP
+The Settings view can install and remove Moira\-owned Claude Code hooks
+and Hermes shell hooks for privacy\-minimal agent activity display, and
+probe Moira\-owned Codex app\-server sessions. Independent Codex CLI
+sessions are never observed.
+.SH OPTIONS
+.TP
+.B \-\-smoke\-test
+Start the application, construct the main window, and quit after about
+half a second. Intended for packaged validation; no data is written.
+.SH FILES
+.TP
+.I $XDG_CONFIG_HOME/moira/config.json
+Versioned configuration (schema v3; normally
+.IR ~/.config/moira/config.json ).
+.TP
+.I $XDG_STATE_HOME/moira/state.json
+Last readings and alert deduplication keys (normally
+.IR ~/.local/state/moira/state.json ).
+.TP
+.I $XDG_STATE_HOME/moira/history.sqlite3
+Versioned SQLite History database (schema v4).
+.TP
+.I $XDG_STATE_HOME/moira/activity.json
+Privacy\-minimal agent activity store (schema v2).
+.SH EXIT STATUS
+Returns 0 after a normal run or a successful
+.B \-\-smoke\-test
+run.
+.SH SEE ALSO
+.BR moira\-claude\-statusline (1),
+.BR moira\-agent\-hook (1)

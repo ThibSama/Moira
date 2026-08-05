@@ -1,0 +1,39 @@
+.TH MOIRA-CLAUDE-STATUSLINE 1 "August 2026" "moira 0.3.0" "User Commands"
+.SH NAME
+moira\-claude\-statusline \- Claude Code status-line command for Moira
+.SH SYNOPSIS
+.B moira\-claude\-statusline
+.SH DESCRIPTION
+.B moira\-claude\-statusline
+is the status\-line command Claude Code invokes after a response. It
+reads the structured JSON payload from standard input, updates Moira's
+minimal local quota cache (never the rendered /usage screen), and chains
+the previously configured status\-line command when one exists, so the
+original output is preserved.
+.PP
+The command is installed and removed only by Moira itself: the Settings
+view records the original status line and restores it on removal.
+.SH INPUT
+A single JSON object on standard input as documented by Claude Code for
+status\-line commands. Malformed or non\-object input is ignored without
+error.
+.SH OUTPUT
+Nothing is printed by
+.B moira\-claude\-statusline
+itself; when a delegate status line is configured, its standard output
+and standard error pass through unchanged.
+.SH FILES
+.TP
+.I $XDG_STATE_HOME/moira/claude-rate-limits.json
+Minimal sanitized cache of the structured rate-limit data (normally
+.IR ~/.local/state/moira/claude-rate-limits.json ).
+.TP
+.I $XDG_STATE_HOME/moira/claude-integration.json
+Moira-owned integration metadata, including the preserved original
+status-line command.
+.SH EXIT STATUS
+Returns the delegate command's exit status when one is configured, and
+0 otherwise.
+.SH SEE ALSO
+.BR moira (1),
+.BR moira\-agent\-hook (1)

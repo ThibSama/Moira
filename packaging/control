@@ -3,8 +3,34 @@ Version: 0.3.0
 Section: utils
 Priority: optional
 Architecture: all
-Maintainer: Moira contributors
+Maintainer: Thibault Paul <xpaul.thibault@gmail.com>
 Depends: python3 (>= 3.11), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-secret-1
 Description: Claude and Codex quota monitor
- A compact Ubuntu GTK4 application showing Claude and Codex quota usage,
- reset times, and optional NTFY notifications.
+ Moira is a compact Ubuntu GTK4/Libadwaita utility showing Claude and Codex
+ quota usage, local reset times, countdowns, refresh state and weekly
+ exhaustion semantics. Data comes only from structured provider surfaces:
+ the chained Claude Code status-line command and the documented Codex
+ app-server read-only rate-limit method. Missing or invalid data is shown
+ as Unavailable, Parse error or Stale — never invented.
+ .
+ It adds a History tab with selectable 24h/7d/30d/90d ranges and per-service
+ filters, quota series with reset transitions, availability states, exact
+ daily token statistics computed only from official Codex account usage
+ (Claude remains percentage-only), sanitized diagnostics with copy actions,
+ and deterministic CSV/JSON export.
+ .
+ Per-provider collection toggles, typed alert rules, and native desktop and
+ NTFY notification channels provide deduplicated exhaustion, recovery,
+ reset and error events. Manual update checks use strict SemVer parsing.
+ .
+ Privacy-minimal agent activity is shown for Claude Code, Hermes and
+ Moira-owned Codex app-server sessions through owned hooks and the
+ documented Codex app-server protocol: only hashed session and turn
+ identities, sanitized model labels and UTC timestamps are stored, and the
+ activity is watched live with no polling or terminal scraping. Independent
+ Codex CLI sessions are never observed.
+ .
+ Configuration is versioned JSON (config v3), History is stored in a
+ versioned SQLite database (schema v4), and all user files are preserved
+ across upgrades. The interface is localized in French with English
+ fallback.

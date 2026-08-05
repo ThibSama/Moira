@@ -1,4 +1,4 @@
-"""Package 6b — deterministic artifact-content hygiene tests.
+"""Package 6b/6e — deterministic artifact-content hygiene tests.
 
 Builds fresh wheel, sdist and .deb from the current tree into an isolated
 output directory (once per module) and enumerates every archive member.
@@ -11,6 +11,13 @@ secrets, absolute private paths — and validates the positive contract:
   sources, packaging metadata) and no tests;
 - .deb: Debian control metadata, launcher modes, Python package modes,
   desktop file, icon and AppStream metainfo.
+
+Package 6e extends the .deb contract with Debian policy compliance:
+a valid Maintainer contact, policy-accurate descriptions (no generic
+balances, no independent Codex CLI monitoring), the machine-readable
+copyright, a timestamp-free gzip changelog and the three man pages, plus
+a reproducibility proof: two isolated .deb builds with an identical
+SOURCE_DATE_EPOCH are byte-identical.
 
 The sdist is additionally proven to rebuild a working 0.3.0 wheel in a
 fresh isolated extraction, without reading the original repository or
@@ -236,6 +243,148 @@ def test_deb_hygiene_metadata_and_modes(artifacts: dict[str, Path]) -> None:
     assert (
         entries["./usr/share/metainfo/io.github.moira.QuotaMonitor.metainfo.xml"][0] == "-rw-r--r--"
     )
+
+
+# ── Package 6e — Debian policy compliance ──
+
+
+def _deb_entries(path: Path) -> dict[str, tuple[str, int]]:
+    listing = subprocess.run(
+        ["dpkg-deb", "--contents", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    entries: dict[str, tuple[str, int]] = {}
+    for line in listing.splitlines():
+        match = re.match(r"^(\S+)\s+\S+\s+(\d+)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+(.+)$", line)
+        assert match is not None, f"unparseable dpkg-deb line: {line}"
+        entries[match.group(3)] = (match.group(1), int(match.group(2)))
+    return entries
+
+
+def test_deb_policy_maintainer_contact(artifacts: dict[str, Path]) -> None:
+    """The Maintainer field is a real contact: a name plus a non-placeholder
+    email — never a bare team name."""
+    control = subprocess.run(
+        ["dpkg-deb", "--field", str(artifacts["deb"]), "Maintainer"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert re.fullmatch(r".+ <[^<>@]+@[^<>@]+\.[^<>@]+>", control), control
+    assert "Moira contributors" not in control  # the malformed legacy value
+
+
+def test_deb_policy_description_covers_features_without_overclaiming(
+    artifacts: dict[str, Path],
+) -> None:
+    """The description covers quotas, History, exact Codex account usage,
+    notifications, export/update and privacy-minimal agent activity — and
+    never claims generic balances or independent Codex CLI monitoring."""
+    control = subprocess.run(
+        ["dpkg-deb", "--field", str(artifacts["deb"]), "Description"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    # dpkg-deb folds the description; normalize whitespace before matching.
+    control = " ".join(control.split())
+    for keyword in (
+        "quota usage",
+        "History",
+        "Codex account usage",
+        "Claude remains percentage-only",
+        "notification",
+        "CSV/JSON export",
+        "update checks",
+        "agent activity",
+        "hashed session and turn identities",
+    ):
+        assert keyword in control, keyword
+    for stale in (
+        "generic balance",
+        "independent Codex CLI monitoring",
+        "optional NTFY notifications",  # the legacy quota-only wording
+    ):
+        assert stale not in control, stale
+    # The honest negative claim about independent sessions is present.
+    assert "Independent Codex CLI sessions are never observed" in control
+
+
+def test_deb_policy_docs_and_manpages(artifacts: dict[str, Path]) -> None:
+    """Policy docs and man pages are installed with 0644 modes; the
+    changelog is a readable, timestamp-free gzip (MTIME 0 in the header)."""
+    entries = _deb_entries(artifacts["deb"])
+    for path in (
+        "./usr/share/doc/moira/copyright",
+        "./usr/share/doc/moira/changelog.gz",
+        "./usr/share/man/man1/moira.1.gz",
+        "./usr/share/man/man1/moira-claude-statusline.1.gz",
+        "./usr/share/man/man1/moira-agent-hook.1.gz",
+    ):
+        assert path in entries, path
+        assert entries[path][0] == "-rw-r--r--", (path, entries[path])
+
+    extracted = Path(
+        subprocess.run(["mktemp", "-d"], check=True, capture_output=True, text=True).stdout.strip()
+    )
+    try:
+        subprocess.run(
+            ["dpkg-deb", "-x", str(artifacts["deb"]), str(extracted)],
+            check=True,
+            capture_output=True,
+        )
+        changelog = extracted / "usr/share/doc/moira/changelog.gz"
+        header = changelog.read_bytes()[:8]
+        assert header == b"\x1f\x8b\x08\x00\x00\x00\x00\x00", header.hex()
+        text = subprocess.run(
+            ["zcat", str(changelog)], check=True, capture_output=True, text=True
+        ).stdout
+        assert "moira (0.3.0) unstable; urgency=medium" in text
+        for man in (
+            "moira.1.gz",
+            "moira-claude-statusline.1.gz",
+            "moira-agent-hook.1.gz",
+        ):
+            man_text = subprocess.run(
+                ["zcat", str(extracted / "usr/share/man/man1" / man)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            assert ".TH " in man_text and ".SH NAME" in man_text
+    finally:
+        subprocess.run(["rm", "-rf", str(extracted)], check=False)
+
+
+def test_deb_build_is_reproducible(tmp_path: Path) -> None:
+    """Two isolated .deb builds with an identical SOURCE_DATE_EPOCH are
+    byte-identical (normalized mtimes, deterministic compression)."""
+    import hashlib
+
+    env = {
+        **os.environ,
+        "SOURCE_DATE_EPOCH": "1754380800",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    outputs: list[Path] = []
+    for index in (1, 2):
+        output = tmp_path / f"out-{index}"
+        output.mkdir()
+        subprocess.run(
+            [str(REPO_ROOT / "scripts" / "build-deb.sh")],
+            cwd=REPO_ROOT,
+            env={**env, "MOIRA_OUTPUT_DIR": str(output)},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        outputs.append(output / DEB_NAME)
+        assert outputs[-1].is_file()
+    first = hashlib.sha256(outputs[0].read_bytes()).hexdigest()
+    second = hashlib.sha256(outputs[1].read_bytes()).hexdigest()
+    assert first == second, "reproducible .deb builds differ"
 
 
 # ── Offline rebuild from the sdist ──

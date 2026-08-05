@@ -1,0 +1,27 @@
+moira (0.3.0) unstable; urgency=medium
+
+  * Package 1: Claude quota collection through the chained status-line
+    command with a minimal privacy-safe cache, fail-closed validation and
+    stale-data handling.
+  * Package 2: Codex quota collection through the documented app-server
+    read-only rate-limit method, weekly exhaustion semantics, unavailable
+    and parse-error states, compact mode.
+  * Package 3: local History tab with schema v4 SQLite storage, selectable
+    24h/7d/30d/90d ranges and per-service filters, quota series with reset
+    transitions, exact daily token statistics from official Codex account
+    usage (Claude remains percentage-only), and history deletion.
+  * Package 4: per-provider collection toggles, typed alert rules, native
+    desktop and NTFY notification channels with deduplicated exhaustion,
+    recovery, reset and error events, and sanitized diagnostics with copy
+    actions.
+  * Package 5: deterministic CSV/JSON export, persisted configuration v3,
+    update checks with strict SemVer parsing, French localization with
+    English fallback, and correction passes closing persisted-version and
+    artifact-hygiene gaps.
+  * Package 6: privacy-minimal agent activity visibility — a spinner and
+    terminal state for Claude Code, Hermes and Moira-owned Codex app-server
+    sessions, recorded through owned hooks and the documented Codex
+    app-server protocol with hashed identities and an independent turn
+    lifecycle; plus Debian policy compliance and reproducible packaging.
+
+ -- Thibault Paul <xpaul.thibault@gmail.com>  Wed, 05 Aug 2026 11:00:00 +0200

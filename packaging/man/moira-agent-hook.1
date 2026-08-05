@@ -1,0 +1,44 @@
+.TH MOIRA-AGENT-HOOK 1 "August 2026" "moira 0.3.0" "User Commands"
+.SH NAME
+moira\-agent\-hook \- agent activity hook for Claude Code and Hermes
+.SH SYNOPSIS
+.B moira\-agent\-hook
+.I runtime
+.SH DESCRIPTION
+.B moira\-agent\-hook
+is the packaged hook command that Claude Code and Hermes invoke to
+record privacy\-minimal agent activity events. The
+.I runtime
+argument must be
+.B claude
+or
+.BR hermes .
+.PP
+It reads a bounded JSON payload from standard input (at most 256 KiB;
+larger payloads are drained and skipped), extracts only the identity and
+model fields, and records the typed activity event into Moira's activity
+store.
+.SH EVENTS
+Claude Code: UserPromptSubmit starts a turn, Stop completes it,
+StopFailure fails it and SessionEnd interrupts it. Hermes: pre_llm_call
+starts a turn, post_llm_call completes it and on_session_end interrupts
+or completes it. Turn events are correlated per prompt through Claude's
+prompt_id and Hermes' extra.turn_id.
+.SH OUTPUT AND EXIT STATUS
+The hook always exits 0 and writes nothing to standard output or
+standard error. Any failure (bad JSON, oversized input, store error,
+unknown event) is silent, so the agent is never affected.
+.SH PRIVACY
+Prompts, responses, transcripts, paths, raw payloads, error details,
+accounts and secrets are never stored. Only SHA\-256 hashed session and
+turn identities, sanitized bounded model labels and UTC timestamps are
+persisted.
+.SH FILES
+.TP
+.I $XDG_STATE_HOME/moira/activity.json
+Privacy\-minimal activity store (schema v2; mode 0600, atomic writes
+with process\-safe locking; normally
+.IR ~/.local/state/moira/activity.json ).
+.SH SEE ALSO
+.BR moira (1),
+.BR moira\-claude\-statusline (1)
