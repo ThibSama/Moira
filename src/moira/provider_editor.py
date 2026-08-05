@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Any
 
 import gi
@@ -432,6 +433,27 @@ def _form_error_key(exc: ValueError) -> str:
     return "Invalid profile."
 
 
+class _Disposition(StrEnum):
+    """Immutable decision returned by the under-lock reservation.
+
+    DISPATCH — this reservation owns the slot: the caller MUST commit
+        the submit through ``_attempt`` (the single dispatcher).
+    PARKED — the request is parked behind the in-flight run; a worker
+        completion or a rejection recovery dispatches it exactly once.
+    REPLACED — a superseded parked request: its single terminal
+        disposition (CANCELLED) is delivered by the iterative drain. A
+        fresh reservation never returns REPLACED for its own request —
+        the superseded request's original ``request()`` call already
+        returned PARKED.
+    CLOSED — shutdown won: the reservation was discarded, zero submit.
+    """
+
+    DISPATCH = "dispatch"
+    PARKED = "parked"
+    REPLACED = "replaced"
+    CLOSED = "closed"
+
+
 class _ConnectionCoordinator:
     """One in-flight connection test plus one NEWEST pending request.
 
@@ -441,6 +463,17 @@ class _ConnectionCoordinator:
     ``_inflight == gen_a`` with ``_pending == (gen_b, ...)`` for a newer
     gen_b — ``_pending`` is NEVER set while ``_inflight`` is None, and
     submitters, runners and callbacks are never invoked under the lock.
+
+    LINEARIZABLE DISPOSITION: the under-lock reservation
+    (``_reserve``) atomically classifies every request and returns an
+    explicit immutable decision — DISPATCH, PARKED or CLOSED — so
+    ownership is NEVER inferred later from the mutable ``_inflight``. A
+    DISPATCH reservation commits its submit through ``_attempt``; every
+    other dispatch (a parked request promoted by the completing worker,
+    or a request detached by a rejection recovery) has exactly ONE
+    dispatcher — a parked request's original ``request()`` call never
+    submits it, even when the promotion completes before that call
+    returns.
 
     Reservation/commit protocol: ``request()`` reserves the slot under
     the lock; every external submit goes through ``_attempt()``, which
@@ -457,15 +490,20 @@ class _ConnectionCoordinator:
     replaces the parked one, and the superseded request is completed
     as ``CANCELLED`` through its own callback by an ITERATIVE drain
     (``_drain_cancelled``) outside the lock, before the parking
-    ``request()`` returns. A superseded request is never dispatched, so
-    its cancellation is its single terminal disposition. A replacement
-    callback that raises or re-enters ``request()`` cannot corrupt
-    ``_inflight``/``_pending``, recurse without bound or duplicate a
-    completion: the re-entrant request parks (or replaces) under the
-    lock and appends to the drain, which the outermost drain on the
-    calling thread pops with a constant stack depth. After editor
-    shutdown (or a stale editor row) a completion is silently
-    discarded — the only silent cases.
+    ``request()`` returns on the calling thread. A superseded request
+    is never dispatched, so its cancellation is its single terminal
+    disposition. The drain ownership is a LOCK-PROTECTED handoff: the
+    claim (observe ``_draining`` clear → set it) and the empty-exit
+    (observe ``_cancelled`` empty → clear it) are single critical
+    sections, so a replacement appended while a drainer exits is either
+    consumed by that drainer or atomically claims a successor — no
+    wakeup is ever lost. A replacement callback that raises or re-enters
+    ``request()`` cannot corrupt ``_inflight``/``_pending``, recurse
+    without bound or duplicate a completion: the re-entrant request
+    parks (or replaces) under the lock and appends to the drain, which
+    the outermost drain on the calling thread pops with a constant
+    stack depth. After editor shutdown (or a stale editor row) a
+    completion is silently discarded — the only silent cases.
 
     Failure recovery is ITERATIVE, never recursive: on a rejected
     submit (first or promoted) the failed generation is cleared and the
@@ -495,16 +533,46 @@ class _ConnectionCoordinator:
         #: Superseded requests awaiting their CANCELLED completion,
         #: published ITERATIVELY by the drain (never under the lock).
         self._cancelled: list[tuple[int, ProviderProfile, Any, Any]] = []
-        #: True while a drain runs on some thread: a replacement
-        #: callback re-entering ``request()`` appends to ``_cancelled``
-        #: instead of recursing into a nested drain (constant stack).
+        #: Drain ownership flag — read AND written ONLY under ``_lock``;
+        #: the claim and the empty-exit are single critical sections so
+        #: the handoff cannot lose wakeups. True while a drain runs on
+        #: some thread: a replacement callback re-entering ``request()``
+        #: appends to ``_cancelled`` instead of recursing into a nested
+        #: drain (constant stack).
         self._draining = False
 
+    def _reserve(
+        self, profile: ProviderProfile, token: Any, callback: Any
+    ) -> tuple[_Disposition, tuple[int, ProviderProfile, Any, Any] | None]:
+        """Atomically classify the request under the lock and mutate the
+        slots: DISPATCH when the slot is free (this caller owns the
+        submit), PARKED when the request is appended as the newest
+        pending (atomically replacing — and drain-queueing — an older
+        pending request), CLOSED when shutdown already won. The returned
+        decision is immutable: no later re-read of ``_inflight`` may
+        change who dispatches the request.
+        """
+        with self._lock:
+            if self._shutdown.is_set():
+                return _Disposition.CLOSED, None
+            self._generation += 1
+            generation = self._generation
+            request = (generation, profile, token, callback)
+            if self._inflight is not None:
+                replaced = self._pending
+                self._pending = request  # newest wins
+                if replaced is not None:
+                    self._cancelled.append(replaced)  # atomic detach under the lock
+                return _Disposition.PARKED, request
+            self._inflight = generation
+            return _Disposition.DISPATCH, request
+
     def request(self, profile: ProviderProfile, token: Any, callback: Any) -> bool:
-        """Reserve the slot under the lock; the commit (shutdown recheck
-        plus external submit) happens through ``_attempt`` outside the
-        lock. Returns False when close already won, when close wins
-        before the commit, or when THIS first submit was rejected.
+        """Reserve the slot under the lock and act on the EXPLICIT,
+        immutable disposition — ownership is never inferred later from
+        the mutable ``_inflight``. Returns False only when close already
+        won, when close wins before the commit (CLOSED), or when THIS
+        first submit was rejected.
 
         Replacement ordering (deterministic, documented): under the
         lock the new request ATOMICALLY replaces the parked one; the
@@ -519,29 +587,22 @@ class _ConnectionCoordinator:
         corrupt the slots, recurse without bound or duplicate a
         completion.
         """
-        with self._lock:
-            if self._shutdown.is_set():
-                return False  # close racing with request: no new work
-            self._generation += 1
-            generation = self._generation
-            if self._inflight is not None:
-                replaced = self._pending
-                self._pending = (generation, profile, token, callback)  # newest wins
-                if replaced is not None:
-                    self._cancelled.append(replaced)  # atomic detach under the lock
-            else:
-                self._inflight = generation
-        if self._inflight == generation:
+        disposition, request = self._reserve(profile, token, callback)
+        if disposition is _Disposition.DISPATCH:
+            assert request is not None
             # First request: the drain runs AFTER the submit attempt so
             # a cancellation callback can never widen the
             # reservation→commit window — a request it parks lands
             # behind this generation, never stealing the slot.
-            result = self._attempt((generation, profile, token, callback))
+            result = self._attempt(request)
             self._drain_cancelled()
             return result
-        # Parked request: publish the superseded CANCELLED completions
-        # before returning — the park is dispatched only when the
-        # in-flight generation completes.
+        if disposition is _Disposition.CLOSED:
+            return False
+        # PARKED: this call NEVER submits — the completing worker or
+        # the rejection recovery is the single dispatcher, even when
+        # the promotion completes before this call returns. Publish the
+        # superseded CANCELLED completions before returning.
         self._drain_cancelled()
         return True
 
@@ -651,26 +712,44 @@ class _ConnectionCoordinator:
 
     def _drain_cancelled(self) -> None:
         """Publish the CANCELLED completions queued by replacements,
-        ITERATIVELY — never recursively. A replacement callback that
-        re-enters ``request()`` parks (or replaces) under the lock and
-        appends to the drain instead of recursing; the OUTERMOST drain
-        on the calling thread keeps popping until the drain is empty,
-        so the stack depth stays constant no matter how many requests
-        park during a cancellation. Every request is popped under the
-        lock and completed exactly once, outside the lock, never
-        raising (a failing publisher must not wedge the coordinator)."""
-        if self._draining:
-            return  # an enclosing drain on this thread owns the list
-        self._draining = True
+        ITERATIVELY — never recursively — with a LOCK-PROTECTED
+        ownership/handoff that cannot lose wakeups. The claim (observe
+        ``_draining`` clear → set it) and the empty-exit (observe
+        ``_cancelled`` empty → clear it) are single critical sections:
+        a request appended while a drainer exits is either consumed by
+        that drainer's next iteration or, when the atomic exit already
+        ran, atomically claims a successor through the appender's own
+        drain call. A replacement callback that re-enters ``request()``
+        parks (or replaces) under the lock and appends to the drain
+        instead of recursing; the OUTERMOST drain on the calling thread
+        keeps popping until the drain is empty, so the stack depth stays
+        constant no matter how many requests park during a cancellation.
+        Every request is popped under the lock and completed exactly
+        once, outside the lock, never raising (a failing publisher must
+        not wedge the coordinator)."""
+        with self._lock:
+            if self._draining:
+                return  # an active drainer owns the list and will pop this
+            self._draining = True  # atomic claim under the lock
         try:
             while True:
                 with self._lock:
                     if not self._cancelled:
+                        # ATOMIC empty-exit: the ownership release and
+                        # the emptiness decision are one critical
+                        # section — an append after this sees
+                        # ``_draining`` False and atomically claims a
+                        # successor; an append before it is popped here.
+                        self._draining = False
                         return
                     request = self._cancelled.pop(0)
                 self._cancel_replaced(request)
-        finally:
-            self._draining = False
+        except BaseException:
+            # Defensive: never leave the drain latched if a pop/callback
+            # path somehow raises (callbacks already swallow).
+            with self._lock:
+                self._draining = False
+            raise
 
     @staticmethod
     def _cancel_replaced(request: tuple[int, ProviderProfile, Any, Any]) -> None:
