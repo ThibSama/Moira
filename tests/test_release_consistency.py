@@ -192,15 +192,16 @@ def test_readme_documents_integrations_view() -> None:
     assert "newest-wins coordinator" in readme
     # The activity setup reference now points at the Integrations view.
     assert "configured in the Integrations view" in readme
-    # Deferred scope is stated honestly: provider editing and Keyring
-    # credentials are implemented (local only); the rest stays deferred.
+    # Deferred scope is stated honestly: provider editing, Keyring
+    # credentials and bounded read-only connection tests are implemented
+    # (local only, fakes-only in the suite); the rest stays deferred.
     for deferred in (
         "Hermes writes",
-        "connection tests",
         "DeepSeek balance",
         "financial units",
     ):
         assert deferred in readme, deferred
+    assert "Test connection" in readme
     assert "Edit providers" in readme
     assert "GNOME Keyring" in readme
 

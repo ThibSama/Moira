@@ -523,6 +523,7 @@ def run_bounded(
     *,
     timeout: float,
     max_bytes: int = MAX_OUTPUT_BYTES,
+    stdin_data: bytes | None = None,
 ) -> BoundedResult | None:
     """Run one subprocess with independent hard caps on stdout and stderr.
 
@@ -532,11 +533,16 @@ def run_bounded(
     nor retained memory grows with the child's output volume. Returns
     None only on spawn failure (transport). Failure results carry no
     output at all.
+
+    ``stdin_data`` is written to the child through a PRIVATE pipe (never
+    argv, environment, disk or logs) and the pipe is closed before the
+    bounded read loop — used to hand secrets to a dedicated child.
     """
     try:
+        stdin: Any = subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL
         process = subprocess.Popen(
             args,
-            stdin=subprocess.DEVNULL,
+            stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -547,6 +553,18 @@ def run_bounded(
     def fail(outcome: ProbeOutcome) -> BoundedResult:
         _terminate_group(process)
         return BoundedResult("", "", None, outcome)
+
+    if stdin_data is not None:
+        try:
+            assert process.stdin is not None
+            process.stdin.write(stdin_data)
+            process.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except Exception:
+                pass
 
     stdout_buf = bytearray()
     stderr_buf = bytearray()

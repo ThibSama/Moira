@@ -25,6 +25,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import GLib, Gtk  # noqa: E402
 
+from .connection_test import ConnectionResult, ConnectionState, run_connection_test
 from .i18n import tr
 from .integrations import (
     MAX_PROFILES,
@@ -62,6 +63,21 @@ _KIND_LABELS = {
     ProviderKind.OPENAI: "OpenAI",
     ProviderKind.LOCAL: "Local",
     ProviderKind.CUSTOM: "Custom",
+}
+
+#: Connection-test state labels (translated at render; every state has a
+#: key, so an unknown state can never reach the UI).
+_CONNECTION_STATE_LABELS = {
+    ConnectionState.CONNECTED: "Connected",
+    ConnectionState.NOT_CONFIGURED: "Not configured",
+    ConnectionState.AUTH_FAILED: "Authentication failed",
+    ConnectionState.MODEL_NOT_FOUND: "Model not found",
+    ConnectionState.UNREACHABLE: "Unreachable",
+    ConnectionState.TLS_ERROR: "TLS error",
+    ConnectionState.RATE_LIMITED: "Rate limited",
+    ConnectionState.INVALID_RESPONSE: "Invalid response",
+    ConnectionState.UNSUPPORTED: "Unsupported",
+    ConnectionState.CANCELLED: "Cancelled",
 }
 
 #: Stable sanitized success text per operation kind.
@@ -416,6 +432,59 @@ def _form_error_key(exc: ValueError) -> str:
     return "Invalid profile."
 
 
+class _ConnectionCoordinator:
+    """One in-flight connection test plus one NEWEST pending request.
+
+    Runs off GTK through the editor's submit; every request bumps a
+    generation and a completion publishes only while its generation is
+    still the in-flight one — newer requests replace the parked one and
+    shutdown (``cancel``) discards everything, so stale results never
+    publish. The row-level token check (widget identity + render epoch)
+    additionally discards results for edited, renamed, removed or
+    disabled profiles.
+    """
+
+    def __init__(self, submit: Any, shutdown_event: threading.Event) -> None:
+        self._submit = submit
+        self._shutdown = shutdown_event
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._inflight: int | None = None
+        self._pending: tuple[int, ProviderProfile, Any, Any] | None = None
+
+    def request(self, profile: ProviderProfile, token: Any, callback: Any) -> bool:
+        if self._shutdown.is_set():
+            return False
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+            if self._inflight is not None:
+                self._pending = (generation, profile, token, callback)  # newest wins
+                return True
+            self._inflight = generation
+        self._submit(self._run, generation, profile, token, callback)
+        return True
+
+    def _run(self, generation: int, profile: ProviderProfile, token: Any, callback: Any) -> None:
+        result = run_connection_test(profile)
+        with self._lock:
+            if self._shutdown.is_set() or generation != self._inflight:
+                return  # superseded or closed: never publish
+            pending = self._pending
+            self._pending = None
+            self._inflight = pending[0] if pending is not None else None
+        callback(token, result)
+        if pending is not None:
+            _, pprofile, ptoken, pcallback = pending
+            self._submit(self._run, pending[0], pprofile, ptoken, pcallback)
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._generation += 1
+            self._inflight = None
+            self._pending = None
+
+
 class ProviderEditor(Gtk.Window):
     """Modal editor window: list, add, edit, enable/disable, remove."""
 
@@ -431,6 +500,7 @@ class ProviderEditor(Gtk.Window):
         self._on_profiles_changed = on_profiles_changed
         self._shutdown = False
         self._shutdown_event = threading.Event()
+        self._connection_coordinator = _ConnectionCoordinator(submit, self._shutdown_event)
         self._recovery_blocked = False
         self._in_flight = False
         self._pending_op: ProfileOp | None = None
@@ -440,6 +510,7 @@ class ProviderEditor(Gtk.Window):
         self._editing_slug: str | None = None
         self._pending_removal: str | None = None
         self._rendering = False
+        self._row_epoch = 0
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         root.set_margin_top(14)
@@ -553,6 +624,7 @@ class ProviderEditor(Gtk.Window):
     def _render_list(self) -> None:
         self._rendering = True
         try:
+            self._row_epoch += 1  # every rebuild invalidates in-flight test results
             self.list_box.remove_all()
             self._row_widgets: dict[str, dict[str, Gtk.Widget]] = {}
             for profile in self._profiles:
@@ -596,6 +668,12 @@ class ProviderEditor(Gtk.Window):
         remove_credential.set_visible(self._configured.get(slug, False))
         remove_credential.connect("clicked", self._on_remove_credential, slug)
         actions.append(remove_credential)
+        test_button = Gtk.Button(label=_("Test connection"))
+        test_button.connect("clicked", self._on_test_connection, slug)
+        actions.append(test_button)
+        test_status = Gtk.Label(label="", xalign=0)
+        test_status.add_css_class("dim-label")
+        actions.append(test_status)
         edit_button = Gtk.Button(label=_("Edit"))
         edit_button.connect("clicked", self._on_edit_clicked, slug)
         actions.append(edit_button)
@@ -628,6 +706,8 @@ class ProviderEditor(Gtk.Window):
             "switch": switch,
             "credential": credential,
             "remove_credential": remove_credential,
+            "test": test_button,
+            "test_status": test_status,
             "edit": edit_button,
             "remove": remove_button,
             "confirm": confirm,
@@ -646,6 +726,7 @@ class ProviderEditor(Gtk.Window):
         widgets["remove_credential"].set_visible(
             not confirming and self._configured.get(slug, False)
         )
+        widgets["test"].set_visible(not confirming)
         widgets["edit"].set_visible(not confirming)
         widgets["remove"].set_visible(not confirming)
 
@@ -689,6 +770,35 @@ class ProviderEditor(Gtk.Window):
         if self._shutdown:
             return
         self._request_op(ProfileOp("remove_credential", slug=slug))
+
+    # ── Connection test ──
+
+    def _on_test_connection(self, _button: Any, slug: str) -> None:
+        """Explicit click only; runs one bounded, read-only test per
+        request. Disabled profiles remain testable (the toggle controls
+        usage, not testability); editing, renaming, removing, disabling
+        or closing the profile discards any in-flight result."""
+        if self._shutdown:
+            return
+        widgets = self._row_widgets.get(slug)
+        if widgets is None:
+            return
+        profile = next((p for p in self._profiles if p.slug == slug), None)
+        if profile is None:
+            return
+        widgets["test_status"].set_text(_("Testing…"))
+        token = (slug, self._row_epoch, id(widgets))
+        self._connection_coordinator.request(profile, token, self._publish_test_result)
+
+    def _publish_test_result(self, token: Any, result: ConnectionResult) -> None:
+        GLib.idle_add(self._apply_test_result, token, result)
+
+    def _apply_test_result(self, token: Any, result: ConnectionResult) -> None:
+        slug, epoch, widgets_id = token
+        widgets = self._row_widgets.get(slug)
+        if widgets is None or id(widgets) != widgets_id or epoch != self._row_epoch:
+            return  # edited, renamed, removed, disabled or closed: discard
+        widgets["test_status"].set_text(_(_CONNECTION_STATE_LABELS[result.state]))
 
     # ── Add/edit form ──
 
@@ -820,3 +930,4 @@ class ProviderEditor(Gtk.Window):
         self._shutdown = True
         self._shutdown_event.set()
         self._pending_op = None
+        self._connection_coordinator.cancel()

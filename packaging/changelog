@@ -38,7 +38,13 @@ moira (0.3.0) unstable; urgency=medium
     profile validation, mandatory backup cleanup, idempotent recovery
     at startup through a bounded and reaped subprocess and no
     credential loss, and other settings saves never wiping profiles);
-    Hermes writes, connection tests, DeepSeek balance and financial
-    units remain deferred.
+    each profile row adds an explicit bounded read-only connection
+    test (Keyring credential via a private child stdin pipe, documented
+    Models endpoints only, verified TLS, no redirects, no proxies,
+    resolved-address policy, connect/read/total deadlines with reaping,
+    ten sanitized states, one in-flight plus one newest pending, stale
+    results discarded on edit/remove/disable/close, nothing persisted);
+    Hermes writes, DeepSeek balance, financial units and publication
+    remain deferred.
 
  -- Thibault Paul <xpaul.thibault@gmail.com>  Wed, 05 Aug 2026 11:00:00 +0200
