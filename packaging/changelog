@@ -42,8 +42,11 @@ moira (0.3.0) unstable; urgency=medium
     test (Keyring credential via a private child stdin pipe delivered
     inside the total deadline, documented Models endpoints only,
     classification before any Keyring read or spawn, a single validated
-    DNS resolution with the peer verified before any credential, strict
-    Models JSON parsing, connect/read/total deadlines with reaping,
+    DNS resolution carried as an immutable family/socktype/proto/
+    sockaddr target with a direct connect and a getpeername check
+    before any credential, nonblocking stdin delivery inside the
+    deadline, strict Models JSON parsing, connect/read/total deadlines
+    with reaping,
     ten sanitized states, one in-flight plus one newest pending, stale
     results discarded on edit/remove/disable/close, nothing persisted);
     Hermes writes, DeepSeek balance, financial units and publication

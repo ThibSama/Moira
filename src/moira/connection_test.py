@@ -12,12 +12,19 @@ stdin pipe only (never argv, environment, disk, config, journal,
 diagnostics or logs). The child performs one strict HTTP GET with
 verified TLS, no redirects, no proxy environment, resolved-address
 policy checks (remote kinds reject non-public addresses; ``local`` is
-loopback-only) and bounded connect/read deadlines; the parent enforces
-the total wall-time bound, output caps and process-group reaping
-(SIGTERM then unconditional SIGKILL escalation). The child prints
-NOTHING — the outcome travels as a sanitized exit code — and no
-response body, header, account data, host, IP or exception text is
-ever retained or rendered.
+loopback-only) and bounded connect/read deadlines. The target is
+resolved EXACTLY ONCE: ``resolve_target`` returns an immutable
+``ValidatedTarget`` (family, socktype, proto, sockaddr from the single
+accepted ``getaddrinfo`` call) and the child creates the socket
+directly, ``connect``s to that sockaddr (no second lookup, no
+resolving helper), then normalizes and compares ``getpeername()``
+with the validated sockaddr BEFORE any TLS handshake or HTTP header —
+a mismatch is UNREACHABLE with zero credential transmission. The
+parent enforces the total wall-time bound, output caps and
+process-group reaping (SIGTERM then unconditional SIGKILL escalation).
+The child prints NOTHING — the outcome travels as a sanitized exit
+code — and no response body, header, account data, host, IP or
+exception text is ever retained or rendered.
 """
 
 from __future__ import annotations
@@ -69,27 +76,69 @@ def contains_secret_keys(payload: dict[str, Any]) -> bool:
     return False
 
 
-def resolve_target(host: str, port: int, policy: str) -> str | None:
-    """Resolve ONCE and return the validated address to connect to.
+def _endpoint_key(sockaddr: tuple[Any, ...]) -> tuple[str, int]:
+    """Normalized endpoint identity: address (zone stripped) + port.
 
-    The caller connects ONLY to this address — there is never a second,
-    unchecked resolution, so DNS rebinding cannot pass the policy check
-    and reach a private target. ``remote`` refuses the whole resolution
-    if ANY address is loopback/private/link-local/multicast/reserved/
-    unspecified; ``local`` refuses unless every address is loopback.
-    None means unresolvable or refused by policy.
+    ``getaddrinfo`` may return a scope-qualified IPv6 address (``%zone``)
+    and flowinfo/scope_id that differ from the socket's ``getpeername``
+    view — only the normalized address and port are compared, so a
+    legitimate connect is never misjudged while any real mismatch still
+    fails closed.
+    """
+    return (str(sockaddr[0]).split("%", 1)[0], int(sockaddr[1]))
+
+
+def same_endpoint(peer: tuple[Any, ...], validated: tuple[Any, ...]) -> bool:
+    """True when the connected peer matches the validated sockaddr.
+
+    Used by the child IMMEDIATELY after ``connect`` and BEFORE any TLS
+    handshake or HTTP header: a mismatch means the socket is not on the
+    validated endpoint and the run fails closed (UNREACHABLE) with zero
+    credential transmission.
+    """
+    return _endpoint_key(peer) == _endpoint_key(validated)
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedTarget:
+    """Immutable validated connect target from ONE ``getaddrinfo`` call.
+
+    Carries the exact family, socktype, proto and sockaddr of the single
+    accepted resolution so the child can create the socket directly and
+    connect to the validated sockaddr — there is never a second lookup,
+    so DNS rebinding cannot pass the policy check and win.
+    """
+
+    family: int
+    socktype: int
+    proto: int
+    sockaddr: tuple[Any, ...]
+
+
+def resolve_target(host: str, port: int, policy: str) -> ValidatedTarget | None:
+    """Resolve ONCE and return the validated target to connect to.
+
+    The caller connects ONLY to this target's sockaddr — there is never
+    a second, unchecked resolution, so DNS rebinding cannot pass the
+    policy check and reach a private address. ``remote`` refuses the
+    whole resolution if ANY address is loopback/private/link-local/
+    multicast/reserved/unspecified; ``local`` refuses unless every
+    address is loopback. None means unresolvable or refused by policy.
     """
     try:
         infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except OSError:
         return None
     addresses: list[str] = []
+    first: tuple[Any, ...] | None = None
     for info in infos:
         try:
             address = ipaddress.ip_address(info[4][0])
         except ValueError:
             continue
         addresses.append(str(address))
+        if first is None:
+            first = info
     if not addresses:
         return None
     if policy == "local":
@@ -105,7 +154,9 @@ def resolve_target(host: str, port: int, policy: str) -> str | None:
         for item in addresses
     ):
         return None
-    return addresses[0]
+    assert first is not None
+    family, socktype, proto, _canonname, sockaddr = first
+    return ValidatedTarget(family, socktype, proto, sockaddr)
 
 
 def _preflight(
@@ -241,8 +292,12 @@ def endpoint_url(kind: ProviderKind, base_url: str) -> str | None:
 #: wall-clock alarm, verified TLS with the peer verified BEFORE any
 #: credential leaves (SNI/hostname verification against the ORIGINAL
 #: hostname), no redirects, no proxy environment, and connects ONLY to
-#: the single address validated by ``resolve_target`` (no second
-#: resolution — DNS rebinding cannot win). Outcome = exit code only.
+#: the single validated target from ``resolve_target`` (the socket is
+#: created from its family/socktype/proto and ``connect``ed to its
+#: sockaddr — no second resolution, no resolving helper; DNS rebinding
+#: cannot win) with ``getpeername`` normalized and compared to the
+#: validated sockaddr before any TLS or HTTP header. Outcome = exit
+#: code only.
 _CHILD_CODE = r"""
 import http.client
 import json
@@ -252,7 +307,7 @@ import ssl
 import sys
 from urllib.parse import urlsplit
 
-from moira.connection_test import contains_secret_keys, resolve_target
+from moira.connection_test import contains_secret_keys, resolve_target, same_endpoint
 
 
 def main() -> int:
@@ -282,23 +337,32 @@ def main() -> int:
         port = parts.port or (443 if use_https else 80)
     except ValueError:
         return 7
-    # Resolve ONCE; connect ONLY to the validated address. The peer is
-    # verified (TLS) before any credential is sent.
+    # Resolve ONCE; connect ONLY to the validated sockaddr. The peer is
+    # verified (getpeername against the validated sockaddr, then TLS)
+    # before any credential is sent.
     target = resolve_target(host, port, policy)
     if target is None:
         return 4  # unreachable: refused by address policy or unresolved
     try:
-        sock = socket.create_connection((target, port), timeout=connect)
+        sock = socket.socket(target.family, target.socktype, target.proto)
+        sock.settimeout(connect)
+        sock.connect(target.sockaddr)
     except socket.timeout:
         return 4
     except OSError:
         return 4
     try:
+        peer = sock.getpeername()
+    except OSError:
+        return 4
+    if not same_endpoint(peer, target.sockaddr):
+        return 4  # peer mismatch: UNREACHABLE, zero credential transmission
+    try:
         if use_https:
             context = ssl.create_default_context()  # verified TLS
             sock = context.wrap_socket(sock, server_hostname=host)  # SNI + hostname verification
         conn = http.client.HTTPConnection(host, port, timeout=connect)
-        conn.sock = sock  # pre-connected to the validated address
+        conn.sock = sock  # pre-connected to the validated sockaddr
         conn.sock.settimeout(read)  # per-read deadline from here on
         if auth == "x-api-key":
             headers = {"x-api-key": key}

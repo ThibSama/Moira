@@ -167,7 +167,7 @@ def _local_profile(server: Any, model: str = "deepseek-chat") -> ProviderProfile
 
 def test_resolve_target_rejects_mixed_public_private(monkeypatch: pytest.MonkeyPatch) -> None:
     """resolve_target performs EXACTLY ONE resolution and returns the
-    validated address — a rebinding second resolution never happens, so
+    validated target — a rebinding second resolution never happens, so
     the first (public) result can never be followed by a private one."""
     public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
     private = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 443))]
@@ -178,14 +178,15 @@ def test_resolve_target_rejects_mixed_public_private(monkeypatch: pytest.MonkeyP
         return public if calls["n"] == 1 else private
 
     monkeypatch.setattr(socket, "getaddrinfo", rebinding_getaddrinfo)
-    assert ctest.resolve_target("api.example.com", 443, "remote") == "8.8.8.8"
+    target = ctest.resolve_target("api.example.com", 443, "remote")
+    assert target is not None and target.sockaddr[0] == "8.8.8.8"
     assert calls["n"] == 1  # exactly one resolution — no TOCTOU window
 
 
 def test_resolve_target_rejects_mixed_ipv4_ipv6(monkeypatch: pytest.MonkeyPatch) -> None:
     """Mixed families: a public IPv4 + private IPv6 resolution is refused
     (the ANY-non-public rule), and a loopback-only resolution passes the
-    local policy with a single chosen address."""
+    local policy with a single chosen target."""
     mixed = [
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443)),
         (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fd00::1", 443)),
@@ -198,13 +199,15 @@ def test_resolve_target_rejects_mixed_ipv4_ipv6(monkeypatch: pytest.MonkeyPatch)
         (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 80)),
     ]
     monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: loopback)
-    assert ctest.resolve_target("localhost", 80, "local") == "127.0.0.1"
+    target = ctest.resolve_target("localhost", 80, "local")
+    assert target is not None and target.sockaddr[0] == "127.0.0.1"
 
 
 def test_resolve_target_public_only_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
     monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: public)
-    assert ctest.resolve_target("api.example.com", 443, "remote") == "8.8.8.8"
+    target = ctest.resolve_target("api.example.com", 443, "remote")
+    assert target is not None and target.sockaddr[0] == "8.8.8.8"
 
 
 def test_resolve_target_unresolvable_or_private_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -603,5 +606,7 @@ def test_click_rejection_resets_row_status(
     ed._show_list()
     widgets = ed._row_widgets["local-main"]
     widgets["test"].emit("clicked")
-    assert widgets["test_status"].get_text() == ""  # reverted, not stuck on "Testing…"
+    # The deterministic rejection completion resets the row to the
+    # translated sanitized failure — never stuck on "Testing…".
+    assert widgets["test_status"].get_text() == "Unreachable"
     ed.shutdown()

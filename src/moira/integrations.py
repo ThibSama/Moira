@@ -537,10 +537,13 @@ def run_bounded(
     output at all.
 
     ``stdin_data`` is written to the child through a PRIVATE pipe (never
-    argv, environment, disk or logs) INSIDE the same deadline: the write
-    participates in the selector loop with bounded chunks, so a child
-    that never reads stdin (or a full pipe) is terminated and reaped at
-    the total bound — used to hand secrets to a dedicated child.
+    argv, environment, disk or logs) INSIDE the same deadline: the pipe
+    is put in NONBLOCKING mode before the selector loop and delivered in
+    bounded chunks with partial-write/``BlockingIOError`` handling, so a
+    child that never reads stdin, a full or reduced-size pipe, or a
+    child that closes stdin early can never block the parent past the
+    total bound — the child is terminated and reaped at the deadline.
+    The pipe is closed on every terminal path.
     """
     try:
         stdin: Any = subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL
@@ -554,7 +557,23 @@ def run_bounded(
     except (OSError, ValueError):
         return None
 
+    if stdin_data is not None:
+        # Nonblocking BEFORE the selector loop: select-readiness only
+        # guarantees that SOME bytes fit, never that a whole 8192-byte
+        # blocking write fits. Without this, a partial reader could keep
+        # the parent blocked inside os.write past the total deadline.
+        try:
+            os.set_blocking(process.stdin.fileno(), False)  # type: ignore[union-attr]
+        except OSError:
+            _terminate_group(process)
+            return None
+
     def fail(outcome: ProbeOutcome) -> BoundedResult:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
         _terminate_group(process)
         return BoundedResult("", "", None, outcome)
 
@@ -589,11 +608,16 @@ def run_bounded(
     def deliver() -> ProbeOutcome | None:
         """Write one bounded stdin chunk; close the pipe when done.
         None normally; a pipe failure just drops the rest (the child's
-        exit code tells the story) — never an unbounded block."""
+        exit code tells the story). With the pipe nonblocking a full
+        buffer raises BlockingIOError — retried on a later select round,
+        still inside the deadline — and a partial write just advances
+        the pending buffer: never an unbounded block."""
         nonlocal pending_stdin
         assert pending_stdin is not None and process.stdin is not None
         try:
             written = os.write(process.stdin.fileno(), pending_stdin[:_WRITE_CHUNK])
+        except BlockingIOError:
+            return None  # full for now: the next writable round retries
         except (BrokenPipeError, OSError, ValueError):
             try:
                 process.stdin.close()
@@ -642,6 +666,15 @@ def run_bounded(
                 outcome = consume(stream, stdout_buf if stream is process.stdout else stderr_buf)
                 if outcome is not None:
                     return fail(outcome)
+        if process.stdin is not None:
+            try:
+                process.stdin.close()  # every terminal path closes the pipe
+            except Exception:
+                pass
+        if process.poll() is None:
+            # stdout/stderr EOF'd but the child lingered (e.g. it closed
+            # all its stdio): reap it now, bounded — never a wait raise.
+            _terminate_group(process)
         process.wait(timeout=_KILL_WAIT)
         return BoundedResult(
             stdout_buf.decode("utf-8", "replace"),
