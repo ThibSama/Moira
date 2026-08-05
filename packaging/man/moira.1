@@ -35,8 +35,10 @@ cost) and the Hermes main model plus discovered named providers, read
 from the installed Hermes CLI (\fBhermes config get model \-\-json\fR and
 \fBhermes config get providers \-\-json\fR) after a version/help probe.
 Base URLs, credentials, paths and raw output are never displayed;
-Claude remains percentage\-only, Codex keeps its exact account\-usage
-contract, and unknown balance/cost is a state, never zero. DeepSeek
+Claude remains percentage\-only, the Codex exact\-token badge follows
+the latest typed availability observation in History (with stored exact
+data or an official summary for the available state), and unknown
+balance/cost is a state, never zero. DeepSeek
 balance is reported as not configured (no \fB/user/balance\fR call).
 Provider editing, Keyring credentials, DeepSeek balance and financial
 units are deferred. Independent Codex CLI sessions are never observed.

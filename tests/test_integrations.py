@@ -28,7 +28,7 @@ from moira.agent_integration import CapabilityReport
 from moira.i18n import tr
 from moira.integrations import (
     CAPABILITY_SLUGS,
-    MAX_OUTPUT_CHARS,
+    MAX_OUTPUT_BYTES,
     CapabilityState,
     HermesInventory,
     IntegrationCoordinator,
@@ -37,10 +37,11 @@ from moira.integrations import (
     ModelAssignment,
     ProviderIdentity,
     RuntimeIntegration,
+    TokenStatusView,
     build_snapshot,
     probe_hermes_inventory,
 )
-from moira.models import QuotaReading, QuotaStatus, Service
+from moira.models import HistoryStatus, QuotaReading, QuotaStatus, Service, TokenAvailabilityRecord
 
 NOW = datetime(2026, 8, 5, 10, 0, 0, tzinfo=UTC)
 RESET = NOW + timedelta(days=5)
@@ -355,7 +356,7 @@ def test_probe_malformed_model_json(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 
 def test_probe_oversized_model_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _fake_hermes(tmp_path, monkeypatch, model_json="x" * (MAX_OUTPUT_CHARS + 1))
+    _fake_hermes(tmp_path, monkeypatch, model_json="x" * (MAX_OUTPUT_BYTES + 1))
     inventory = probe_hermes_inventory()
     assert inventory.state is IntegrationState.INVALID
     assert inventory.detail == "config output oversized"
@@ -496,11 +497,26 @@ def _matrix(snapshot: IntegrationSnapshot) -> dict[tuple[str, str], Any]:
     return {(c.provider, c.capability): c for c in snapshot.capabilities}
 
 
+def _codex_exact_view() -> TokenStatusView:
+    return TokenStatusView(
+        (
+            TokenAvailabilityRecord(
+                Service.CODEX,
+                NOW,
+                "codex-app-server:account/usage/read",
+                HistoryStatus.AVAILABLE_EXACT,
+            ),
+        ),
+        codex_has_exact_data=True,
+    )
+
+
 def test_snapshot_full_capability_matrix() -> None:
     snapshot = build_snapshot(
         hermes=_full_inventory(),
         capabilities=_capabilities(),
         quota_readings=[_reading(Service.CLAUDE), _reading(Service.CODEX)],
+        token_status=_codex_exact_view(),
         collect_claude=True,
         collect_codex=True,
     )
@@ -756,9 +772,19 @@ def _wait_for(predicate: Any, timeout: float = 5.0) -> bool:
     return False
 
 
-def _make_coordinator(probe: Any, published: list[HermesInventory]) -> IntegrationCoordinator:
+def _make_coordinator(
+    probe: Any, published: list[HermesInventory], *, fallback: Any = None
+) -> IntegrationCoordinator[Any]:
     coordinator = IntegrationCoordinator(
-        submit=_run_in_thread, probe=probe, publish=published.append
+        submit=_run_in_thread,
+        probe=probe,
+        publish=published.append,
+        fallback=fallback
+        or (
+            lambda: HermesInventory(
+                IntegrationState.TEMPORARILY_UNAVAILABLE, detail="inventory probe failed"
+            )
+        ),
     )
     coordinator.start()
     return coordinator
@@ -843,6 +869,7 @@ def test_coordinator_request_before_start_rejected() -> None:
         submit=_run_in_thread,
         probe=lambda: HermesInventory(IntegrationState.AVAILABLE),
         publish=lambda _inventory: None,
+        fallback=lambda: HermesInventory(IntegrationState.TEMPORARILY_UNAVAILABLE),
     )
     assert coordinator.request_refresh() is False
     coordinator.start()

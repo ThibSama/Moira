@@ -311,6 +311,7 @@ _FRENCH: dict[str, str] = {
     "config output invalid": "sortie config invalide",
     "collection disabled": "collecte désactivée",
     "no reading yet": "aucune lecture pour l'instant",
+    "no exact token data yet": "aucune donnée de jetons exacts pour l'instant",
     "checking": "vérification",
     "deferred": "différé",
     "no default model": "aucun modèle par défaut",

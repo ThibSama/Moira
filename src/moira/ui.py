@@ -63,11 +63,13 @@ from .history_db import HistoryCoordinator
 from .history_page import HistoryPage
 from .i18n import is_french, tr
 from .integrations import (
-    HermesInventory,
     IntegrationCoordinator,
+    IntegrationProbe,
     IntegrationState,
+    TokenStatusView,
     build_snapshot,
     probe_hermes_inventory,
+    read_token_status_view,
 )
 from .integrations_page import IntegrationsPage
 from .models import (
@@ -353,14 +355,17 @@ class MainWindow(Adw.ApplicationWindow):
         self._activity_watcher = ActivityWatcher(self._activity_store, self._update_activity_panel)
         self._capabilities: dict[AgentRuntime, CapabilityReport] = {}
         # Integration inventory: bounded newest-wins probes off the GTK
-        # thread. Probes start only on page visibility / explicit Refresh.
+        # thread. Probes start only on page visibility / explicit Refresh;
+        # each probe reads the Hermes inventory AND the history-backed
+        # exact-token status view under one generation.
         self._integration_coordinator = IntegrationCoordinator(
             submit=self._submit_probe,
-            probe=probe_hermes_inventory,
+            probe=self._integration_probe,
             publish=self._publish_inventory,
+            fallback=self._integration_fallback,
         )
         self._integration_coordinator.start()
-        self._last_inventory: HermesInventory | None = None
+        self._last_probe: IntegrationProbe | None = None
         self._restore_geometry()
         self._build()
         self._render()
@@ -618,21 +623,41 @@ class MainWindow(Adw.ApplicationWindow):
         """Run one bounded inventory probe on the shared worker executor."""
         self.executor.submit(fn)
 
+    def _integration_probe(self) -> IntegrationProbe:
+        """One bounded off-GTK probe: the Hermes inventory and the
+        history-backed exact-token status view, read under one generation.
+        Never raises (both readers fail closed)."""
+        inventory = probe_hermes_inventory()
+        view = read_token_status_view()
+        return IntegrationProbe(inventory=inventory, token_status=view)
+
+    def _integration_fallback(self) -> IntegrationProbe:
+        """Sanitized fallback when the injected probe itself raises."""
+        from .integrations import HermesInventory
+
+        return IntegrationProbe(
+            inventory=HermesInventory(
+                IntegrationState.TEMPORARILY_UNAVAILABLE, detail="inventory probe failed"
+            ),
+            token_status=TokenStatusView((), False),
+        )
+
     def _request_integrations_refresh(self, *_args: Any) -> None:
         """Request one bounded inventory probe (page visibility or Refresh)."""
         self._integrations_page.render_status(_("Checking…"))
         self._integration_coordinator.request_refresh()
 
-    def _publish_inventory(self, inventory: HermesInventory) -> None:
-        """Worker-thread publication (under the coordinator lock): dispatch
-        the newest inventory onto the GLib idle loop. Stale generations and
-        results after shutdown never reach this point."""
-        GLib.idle_add(self._apply_inventory, inventory)
+    def _publish_inventory(self, probe: IntegrationProbe) -> None:
+        """Worker-thread publication: dispatch the newest probe onto the
+        GLib idle loop. Stale generations and results after shutdown never
+        reach this point (the coordinator gates them)."""
+        GLib.idle_add(self._apply_inventory, probe)
 
-    def _apply_inventory(self, inventory: HermesInventory) -> bool:
+    def _apply_inventory(self, probe: IntegrationProbe) -> bool:
         if self._integrations_page._shutdown:
             return False
-        self._last_inventory = inventory
+        self._last_probe = probe
+        inventory = probe.inventory
         if inventory.state is IntegrationState.AVAILABLE:
             text = f"{_('Inventory refreshed.')} {_('Hermes ')}{inventory.version}"
         else:
@@ -642,18 +667,20 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _maybe_render_integrations(self) -> None:
-        """Re-render the Integrations page from the newest cached inventory
-        when the page is visible. Never triggers a probe."""
-        inventory = getattr(self, "_last_inventory", None)
-        if inventory is None:
+        """Re-render the Integrations page from the newest cached probe
+        (inventory + history token view) when the page is visible. Never
+        triggers a probe."""
+        probe = getattr(self, "_last_probe", None)
+        if probe is None:
             return
         page = getattr(self, "_integrations_page", None)
         if page is None or not page.is_visible_page():
             return
         snapshot = build_snapshot(
-            hermes=inventory,
+            hermes=probe.inventory,
             capabilities=self._capabilities,
             quota_readings=self.state.readings,
+            token_status=probe.token_status,
             collect_claude=self.settings.collect_claude,
             collect_codex=self.settings.collect_codex,
         )
