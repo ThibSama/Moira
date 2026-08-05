@@ -282,9 +282,11 @@ def test_wrong_shape_is_invalid_response(server: Any) -> None:
 
 
 def test_non_string_ids_never_match(server: Any) -> None:
+    """A malformed item (non-string id) makes the WHOLE response
+    invalid — a mixed response can never become CONNECTED."""
     server.configure(body=b'{"data": [{"id": 123}]}')
     result = ctest.bounded_connection_test(_local_profile(server, model="123"), "sk-7j")
-    assert result.state is ctest.ConnectionState.MODEL_NOT_FOUND
+    assert result.state is ctest.ConnectionState.INVALID_RESPONSE
 
 
 def test_oversized_body_is_invalid_response(server: Any) -> None:
@@ -303,7 +305,9 @@ def test_unknown_outcome_never_connected(
         "run_bounded",
         lambda *a, **k: BoundedResult("", "", 99, ProbeOutcome.OK),  # unknown exit code
     )
-    result = ctest.bounded_connection_test(_profile(ProviderKind.LOCAL), "sk-7j")
+    result = ctest.bounded_connection_test(
+        _profile(ProviderKind.LOCAL, base_url="http://127.0.0.1:9"), "sk-7j"
+    )
     assert result.state is ctest.ConnectionState.INVALID_RESPONSE
 
 
@@ -381,7 +385,9 @@ def test_key_reaches_child_only_via_stdin(
         return None
 
     monkeypatch.setattr(ctest, "run_bounded", capture)
-    result = ctest.bounded_connection_test(_profile(ProviderKind.LOCAL), "sk-7j-very-secret")
+    result = ctest.bounded_connection_test(
+        _profile(ProviderKind.LOCAL, base_url="http://127.0.0.1:9"), "sk-7j-very-secret"
+    )
     assert result.state is ctest.ConnectionState.UNREACHABLE  # spawn "failed" -> mapped
     joined = "\n".join(captured["args"])
     assert "sk-7j-very-secret" not in joined  # never argv

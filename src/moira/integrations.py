@@ -70,6 +70,8 @@ _KILL_WAIT = 2.0
 _READ_SLICE = 0.05
 #: Bounded read chunk per stream.
 _READ_CHUNK = 65536
+#: Bounded write chunk for the private stdin pipe.
+_WRITE_CHUNK = 8192
 
 _VERSION_RE = re.compile(r"Hermes Agent v(\d+)\.(\d+)\.(\d+)")
 
@@ -535,8 +537,10 @@ def run_bounded(
     output at all.
 
     ``stdin_data`` is written to the child through a PRIVATE pipe (never
-    argv, environment, disk or logs) and the pipe is closed before the
-    bounded read loop — used to hand secrets to a dedicated child.
+    argv, environment, disk or logs) INSIDE the same deadline: the write
+    participates in the selector loop with bounded chunks, so a child
+    that never reads stdin (or a full pipe) is terminated and reaped at
+    the total bound — used to hand secrets to a dedicated child.
     """
     try:
         stdin: Any = subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL
@@ -554,17 +558,7 @@ def run_bounded(
         _terminate_group(process)
         return BoundedResult("", "", None, outcome)
 
-    if stdin_data is not None:
-        try:
-            assert process.stdin is not None
-            process.stdin.write(stdin_data)
-            process.stdin.close()
-        except (BrokenPipeError, OSError, ValueError):
-            try:
-                if process.stdin is not None:
-                    process.stdin.close()
-            except Exception:
-                pass
+    pending_stdin: memoryview | None = memoryview(stdin_data) if stdin_data is not None else None
 
     stdout_buf = bytearray()
     stderr_buf = bytearray()
@@ -592,26 +586,58 @@ def run_bounded(
             return ProbeOutcome.STDERR_OVERFLOW
         return None
 
+    def deliver() -> ProbeOutcome | None:
+        """Write one bounded stdin chunk; close the pipe when done.
+        None normally; a pipe failure just drops the rest (the child's
+        exit code tells the story) — never an unbounded block."""
+        nonlocal pending_stdin
+        assert pending_stdin is not None and process.stdin is not None
+        try:
+            written = os.write(process.stdin.fileno(), pending_stdin[:_WRITE_CHUNK])
+        except (BrokenPipeError, OSError, ValueError):
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+            pending_stdin = None
+            return None
+        pending_stdin = pending_stdin[written:]
+        if not pending_stdin:
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+            pending_stdin = None
+        return None
+
     try:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return fail(ProbeOutcome.TIMEOUT)
-            streams: list[Any] = []
+            read_streams: list[Any] = []
+            write_streams: list[Any] = []
             if not stdout_eof:
-                streams.append(process.stdout)
+                read_streams.append(process.stdout)
             if not stderr_eof:
-                streams.append(process.stderr)
-            if not streams:
+                read_streams.append(process.stderr)
+            if pending_stdin is not None and len(pending_stdin) > 0:
+                write_streams.append(process.stdin)  # a write end belongs in the write set
+            if not read_streams and not write_streams:
                 break
             try:
-                ready, _, _ = select.select(streams, [], [], min(_READ_SLICE, remaining))
+                ready, writable, _ = select.select(
+                    read_streams, write_streams, [], min(_READ_SLICE, remaining)
+                )
             except OSError:
                 break
-            if not ready:
+            if not ready and not writable:
                 if process.poll() is not None:
                     break
                 continue
+            for stream in writable:
+                if stream is process.stdin:
+                    deliver()
             for stream in ready:
                 outcome = consume(stream, stdout_buf if stream is process.stdout else stderr_buf)
                 if outcome is not None:

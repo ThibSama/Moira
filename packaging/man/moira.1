@@ -56,7 +56,10 @@ documented Models endpoints only, no inference or balance calls,
 verified TLS, no redirects, no proxies, resolved-address policy,
 wall-time bounds with reaping, ten sanitized states, one in-flight
 plus one newest pending, results discarded on edit/remove/disable/
-close and ephemeral — nothing persisted).
+close and ephemeral — nothing persisted, single validated resolution
+with the peer verified before any credential, bounded stdin delivery
+inside the total deadline, strict Models JSON and fail-closed
+preflight before any Keyring read or spawn).
 Hermes writes, DeepSeek balance and financial units
 are deferred. Independent Codex CLI sessions are never observed.
 Inventory probes run only on page visibility and the explicit Refresh

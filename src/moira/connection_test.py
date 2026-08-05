@@ -22,13 +22,110 @@ ever retained or rendered.
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 import sys
 import threading
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 from .integrations import ProbeOutcome, ProviderKind, ProviderProfile, run_bounded
 from .secrets import KeyringLookup, inspect_provider_secret
+
+#: Maximum accepted credential length (bytes). A larger credential is an
+#: invalid input — fail closed BEFORE any spawn, so stdin delivery stays
+#: inside the wall-time bound.
+MAX_KEY_BYTES = 4096
+#: Maximum accepted number of model entries and per-id length in the
+#: strict Models payload; beyond these the response is INVALID_RESPONSE.
+MAX_MODELS = 10_000
+MAX_ID_LEN = 200
+#: Substrings that make a JSON key secret- or account-bearing. Any such
+#: key in the Models payload (top level or inside a model item) makes
+#: the response INVALID_RESPONSE — the response must never carry
+#: credentials, account data or endpoints.
+_SECRET_KEY_SUBSTRINGS = (
+    "key",
+    "token",
+    "secret",
+    "credential",
+    "password",
+    "auth",
+    "cookie",
+    "session",
+    "account",
+)
+
+
+def contains_secret_keys(payload: dict[str, Any]) -> bool:
+    """True when any payload key is secret- or account-bearing (case-
+    insensitive substring match)."""
+    for key in payload:
+        lowered = key.lower()
+        for fragment in _SECRET_KEY_SUBSTRINGS:
+            if fragment in lowered:
+                return True
+    return False
+
+
+def resolve_target(host: str, port: int, policy: str) -> str | None:
+    """Resolve ONCE and return the validated address to connect to.
+
+    The caller connects ONLY to this address — there is never a second,
+    unchecked resolution, so DNS rebinding cannot pass the policy check
+    and reach a private target. ``remote`` refuses the whole resolution
+    if ANY address is loopback/private/link-local/multicast/reserved/
+    unspecified; ``local`` refuses unless every address is loopback.
+    None means unresolvable or refused by policy.
+    """
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except OSError:
+        return None
+    addresses: list[str] = []
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        addresses.append(str(address))
+    if not addresses:
+        return None
+    if policy == "local":
+        if any(not ipaddress.ip_address(item).is_loopback for item in addresses):
+            return None
+    elif any(
+        ipaddress.ip_address(item).is_loopback
+        or ipaddress.ip_address(item).is_private
+        or ipaddress.ip_address(item).is_link_local
+        or ipaddress.ip_address(item).is_multicast
+        or ipaddress.ip_address(item).is_reserved
+        or ipaddress.ip_address(item).is_unspecified
+        for item in addresses
+    ):
+        return None
+    return addresses[0]
+
+
+def _preflight(
+    profile: ProviderProfile, cancel_event: threading.Event | None
+) -> ConnectionResult | None:
+    """Classification BEFORE any Keyring read or spawn. None means the
+    test may proceed; otherwise the run fails closed with the given
+    result. Cancellation wins over everything (a closed editor performs
+    zero Keyring calls and zero spawn); ``custom`` is UNSUPPORTED
+    regardless of any credential."""
+    if cancel_event is not None and cancel_event.is_set():
+        return ConnectionResult(ConnectionState.CANCELLED, profile.slug)
+    adapter = adapter_for(profile.kind)
+    if adapter is None or not (adapter.url or adapter.base_url_models):
+        return ConnectionResult(ConnectionState.UNSUPPORTED, profile.slug)
+    if not profile.model:
+        return ConnectionResult(ConnectionState.NOT_CONFIGURED, profile.slug)
+    if adapter.base_url_models and not profile.base_url:
+        return ConnectionResult(ConnectionState.NOT_CONFIGURED, profile.slug)
+    return None
 
 
 #: The fixed result states. A test outcome is ALWAYS one of these; an
@@ -139,14 +236,15 @@ def endpoint_url(kind: ProviderKind, base_url: str) -> str | None:
     return base_url.rstrip("/") + "/models"
 
 
-#: The dedicated child: self-contained, prints NOTHING, receives the
-#: credential on stdin (private pipe), enforces connect/read deadlines
-#: plus a self-armed wall-clock alarm, verified TLS, no redirects, no
-#: proxy environment and the resolved-address policy. Outcome = exit
-#: code only.
+#: The dedicated child: prints NOTHING, receives the credential on stdin
+#: (private pipe), enforces connect/read deadlines plus a self-armed
+#: wall-clock alarm, verified TLS with the peer verified BEFORE any
+#: credential leaves (SNI/hostname verification against the ORIGINAL
+#: hostname), no redirects, no proxy environment, and connects ONLY to
+#: the single address validated by ``resolve_target`` (no second
+#: resolution — DNS rebinding cannot win). Outcome = exit code only.
 _CHILD_CODE = r"""
 import http.client
-import ipaddress
 import json
 import signal
 import socket
@@ -154,31 +252,7 @@ import ssl
 import sys
 from urllib.parse import urlsplit
 
-
-def _policy_rejected(host: str, port: int, policy: str) -> bool:
-    try:
-        infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
-    except OSError:
-        return True  # unresolvable target
-    addresses = []
-    for info in infos:
-        try:
-            addresses.append(ipaddress.ip_address(info[4][0]))
-        except ValueError:
-            continue
-    if not addresses:
-        return True
-    if policy == "local":
-        return any(not ip.is_loopback for ip in addresses)
-    return any(
-        ip.is_loopback
-        or ip.is_private
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-        for ip in addresses
-    )
+from moira.connection_test import contains_secret_keys, resolve_target
 
 
 def main() -> int:
@@ -208,25 +282,31 @@ def main() -> int:
         port = parts.port or (443 if use_https else 80)
     except ValueError:
         return 7
-    if _policy_rejected(host, port, policy):
-        return 4  # unreachable: refused by address policy (SSRF guard)
+    # Resolve ONCE; connect ONLY to the validated address. The peer is
+    # verified (TLS) before any credential is sent.
+    target = resolve_target(host, port, policy)
+    if target is None:
+        return 4  # unreachable: refused by address policy or unresolved
+    try:
+        sock = socket.create_connection((target, port), timeout=connect)
+    except socket.timeout:
+        return 4
+    except OSError:
+        return 4
     try:
         if use_https:
             context = ssl.create_default_context()  # verified TLS
-            conn = http.client.HTTPSConnection(host, port, timeout=connect, context=context)
-        else:
-            conn = http.client.HTTPConnection(host, port, timeout=connect)
-    except (OSError, ValueError):
-        return 7
-    if auth == "x-api-key":
-        headers = {"x-api-key": key}
-    else:
-        headers = {"Authorization": "Bearer " + key}
-    if kind == "anthropic":
-        headers["anthropic-version"] = "2023-06-01"
-    try:
-        conn.request("GET", parts.path or "/", headers=headers)
+            sock = context.wrap_socket(sock, server_hostname=host)  # SNI + hostname verification
+        conn = http.client.HTTPConnection(host, port, timeout=connect)
+        conn.sock = sock  # pre-connected to the validated address
         conn.sock.settimeout(read)  # per-read deadline from here on
+        if auth == "x-api-key":
+            headers = {"x-api-key": key}
+        else:
+            headers = {"Authorization": "Bearer " + key}
+        if kind == "anthropic":
+            headers["anthropic-version"] = "2023-06-01"
+        conn.request("GET", parts.path or "/", headers=headers)
         response = conn.getresponse()
         status = response.status
         if status in (401, 403):
@@ -241,25 +321,41 @@ def main() -> int:
         if len(body) > cap:
             return 7  # invalid response: oversized body
     except ssl.SSLError:
-        return 5  # TLS error
+        return 5  # TLS error (including peer/hostname mismatch)
     except socket.timeout:
         return 4  # unreachable: deadline exceeded
     except (OSError, http.client.HTTPException):
         return 4  # unreachable: transport failure
+    # Strict Models payload: every item must be a dict with exactly one
+    # string id, no secret/account-bearing keys anywhere, no duplicate
+    # or excessive entries. CONNECTED requires a fully valid response
+    # and one exact model match.
     try:
         payload = json.loads(body)
     except (ValueError, UnicodeDecodeError):
         return 7  # invalid response: malformed JSON
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or contains_secret_keys(payload):
         return 7
     items = payload.get("data")
     if not isinstance(items, list):
         return 7
-    ids = [
-        item.get("id")
-        for item in items
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    ]
+    if len(items) > %(max_models)d:
+        return 7  # excessive model count
+    ids = []
+    for item in items:
+        if not isinstance(item, dict) or contains_secret_keys(item):
+            return 7
+        value = item.get("id")
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > %(max_id_len)d
+            or any(ord(char) < 32 for char in value)
+        ):
+            return 7  # malformed model id
+        if value in ids:
+            return 7  # duplicate ambiguity
+        ids.append(value)
     if model and model in ids:
         return 0  # connected: authentication/reachability + model present
     return 3  # model not found in the strict models list
@@ -267,7 +363,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-"""
+""".replace("%(max_models)d", str(MAX_MODELS)).replace("%(max_id_len)d", str(MAX_ID_LEN))
 
 #: Default wall-clock bounds (seconds) and response-body cap (bytes).
 DEFAULT_CONNECT_TIMEOUT = 5.0
@@ -320,12 +416,17 @@ def bounded_connection_test(
     The child prints nothing; the outcome is its sanitized exit code.
     Timeout, overflow, spawn failure and unknown codes are mapped to
     non-CONNECTED states; a cancelled run (shutdown) is CANCELLED.
+    Classification happens BEFORE anything: unsupported kinds, missing
+    model or base URL and oversized credentials fail closed with no
+    spawn.
     """
-    if cancel_event is not None and cancel_event.is_set():
-        return ConnectionResult(ConnectionState.CANCELLED, profile.slug)
+    preflight = _preflight(profile, cancel_event)
+    if preflight is not None:
+        return preflight
+    if len(key.encode("utf-8")) > MAX_KEY_BYTES:
+        return ConnectionResult(ConnectionState.INVALID_RESPONSE, profile.slug)
     adapter = adapter_for(profile.kind)
-    if adapter is None or not (adapter.url or adapter.base_url_models):
-        return ConnectionResult(ConnectionState.UNSUPPORTED, profile.slug)
+    assert adapter is not None
     result = run_bounded(
         _child_command(
             profile,
@@ -359,10 +460,14 @@ def run_connection_test(
     body_cap: int = DEFAULT_BODY_CAP,
     cancel_event: threading.Event | None = None,
 ) -> ConnectionResult:
-    """Read the credential from the Keyring IMMEDIATELY before testing
+    """Classify FIRST (unsupported/missing model/base URL/cancellation),
+    then read the credential from the Keyring IMMEDIATELY before testing
     and run the bounded child. A missing credential or an unavailable
     Keyring fails closed as NOT_CONFIGURED BEFORE any network or spawn;
     the credential never reaches argv, environment, disk or logs."""
+    preflight = _preflight(profile, cancel_event)
+    if preflight is not None:
+        return preflight
     inspection = inspect_provider_secret(profile.slug)
     if inspection is None or inspection.state is KeyringLookup.UNAVAILABLE:
         # With the vault unavailable the credential state is unknown:

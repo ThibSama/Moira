@@ -439,9 +439,13 @@ class _ConnectionCoordinator:
     generation and a completion publishes only while its generation is
     still the in-flight one — newer requests replace the parked one and
     shutdown (``cancel``) discards everything, so stale results never
-    publish. The row-level token check (widget identity + render epoch)
-    additionally discards results for edited, renamed, removed or
-    disabled profiles.
+    publish. Submit rejections (first or promotion) clear the slot so
+    later requests are accepted and never propagate to GTK; queued work
+    checks cancellation BEFORE executing, so after close it performs
+    zero Keyring reads and zero spawns (the shutdown event is passed to
+    the test as its cancellation signal). The row-level token check
+    (widget identity + render epoch) additionally discards results for
+    edited, renamed, removed or disabled profiles.
     """
 
     def __init__(self, submit: Any, shutdown_event: threading.Event) -> None:
@@ -462,21 +466,39 @@ class _ConnectionCoordinator:
                 self._pending = (generation, profile, token, callback)  # newest wins
                 return True
             self._inflight = generation
-        self._submit(self._run, generation, profile, token, callback)
+        try:
+            self._submit(self._run, generation, profile, token, callback)
+        except Exception:
+            # Submit rejection: clear the slot (never latched), never
+            # propagate to GTK; later requests are accepted.
+            with self._lock:
+                if self._inflight == generation:
+                    self._inflight = None
+            return False
         return True
 
     def _run(self, generation: int, profile: ProviderProfile, token: Any, callback: Any) -> None:
-        result = run_connection_test(profile)
+        if self._shutdown.is_set():
+            return  # queued work after close: zero Keyring, zero spawn
+        result = run_connection_test(profile, cancel_event=self._shutdown)
         with self._lock:
             if self._shutdown.is_set() or generation != self._inflight:
                 return  # superseded or closed: never publish
             pending = self._pending
             self._pending = None
             self._inflight = pending[0] if pending is not None else None
-        callback(token, result)
+        try:
+            callback(token, result)
+        except Exception:
+            pass  # a failing publisher must not wedge the coordinator
         if pending is not None:
             _, pprofile, ptoken, pcallback = pending
-            self._submit(self._run, pending[0], pprofile, ptoken, pcallback)
+            try:
+                self._submit(self._run, pending[0], pprofile, ptoken, pcallback)
+            except Exception:
+                with self._lock:
+                    if self._inflight == pending[0]:
+                        self._inflight = None
 
     def cancel(self) -> None:
         with self._lock:
@@ -788,7 +810,8 @@ class ProviderEditor(Gtk.Window):
             return
         widgets["test_status"].set_text(_("Testing…"))
         token = (slug, self._row_epoch, id(widgets))
-        self._connection_coordinator.request(profile, token, self._publish_test_result)
+        if not self._connection_coordinator.request(profile, token, self._publish_test_result):
+            widgets["test_status"].set_text("")  # rejected submit: revert, not stuck
 
     def _publish_test_result(self, token: Any, result: ConnectionResult) -> None:
         GLib.idle_add(self._apply_test_result, token, result)
