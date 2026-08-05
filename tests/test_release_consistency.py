@@ -167,6 +167,48 @@ def test_appstream_release_notes_cover_0_3_0_features() -> None:
     # Activity claims are privacy-minimal and never overclaim Codex capability.
     assert "hashed session identities" in description
     assert "no polling or terminal scraping" in description
+    # Package 7a: the Integrations page and inventory are documented
+    # truthfully — read-only now, editing and balance deferred.
+    for keyword in ("read-only", "integrations", "providers and models", "inventory"):
+        assert keyword in description, keyword
+    assert "deferred" in description
+    assert "deepseek balance is not configured" in description
+
+
+def test_appstream_about_text_mentions_integrations() -> None:
+    description = " ".join(p.text or "" for p in _metainfo().findall("./description/p")).lower()
+    assert "integrations" in description
+
+
+def test_readme_documents_integrations_view() -> None:
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "## Integrations" in readme
+    assert "**Integrations** view" in readme
+    assert "Agents" in readme and "Providers and models" in readme
+    assert "hermes config get model --json" in readme
+    assert "never parses the whole Hermes YAML" in readme
+    assert "auth.json" in readme
+    assert "no `/user/balance` call" in readme
+    assert "newest-wins coordinator" in readme
+    # The activity setup reference now points at the Integrations view.
+    assert "configured in the Integrations view" in readme
+    # Deferred scope is stated honestly.
+    for deferred in (
+        "Provider editing",
+        "Keyring credentials",
+        "DeepSeek balance",
+        "financial units",
+    ):
+        assert deferred in readme, deferred
+
+
+def test_man_page_documents_integrations_view() -> None:
+    man = (REPO_ROOT / "packaging" / "man" / "moira.1").read_text(encoding="utf-8")
+    assert "Integrations view" in man
+    assert "Providers and models" in man
+    assert "hermes config get model \\-\\-json" in man
+    assert "never zero" in man
+    assert "deferred" in man
 
 
 # ── Runtime derivation (no circular imports, correct values) ──

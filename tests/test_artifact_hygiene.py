@@ -167,6 +167,8 @@ def test_wheel_hygiene_and_metadata(artifacts: dict[str, Path]) -> None:
             "hermes_hooks.py",
             "codex_activity.py",
             "activity_view.py",
+            "integrations.py",
+            "integrations_page.py",
         ):
             assert f"moira/{module}" in modules, module
         wheel = zf.read(f"{DIST_INFO}/WHEEL").decode("utf-8")
@@ -360,11 +362,12 @@ def test_deb_policy_docs_and_manpages(installed_root: Path, artifacts: dict[str,
 
 
 def test_deb_policy_changelog_package_mapping(installed_root: Path) -> None:
-    """Package 6f — the installed changelog maps the six 0.3.0 packages to
-    their accepted scopes, in order: local History foundation, History UI,
+    """The installed changelog maps the seven 0.3.0 packages to their
+    accepted scopes, in order: local History foundation, History UI,
     exact Codex token activity, exact statistics/indicators, complementary
-    UX, release integration. Quota collection is never attributed to the
-    wrong package, and Package 6 states that publication stays deferred."""
+    UX, release integration, integration registry/Hermes inventory. Quota
+    collection is never attributed to the wrong package, and Package 6
+    states that publication stays deferred."""
     changelog = subprocess.run(
         ["zcat", str(installed_root / "usr/share/doc/moira/changelog.gz")],
         check=True,
@@ -375,7 +378,7 @@ def test_deb_policy_changelog_package_mapping(installed_root: Path) -> None:
 
     lines = changelog.splitlines()
     starts = [i for i, line in enumerate(lines) if re.match(r"^\s+\* Package \d+:", line)]
-    assert len(starts) == 6, "expected exactly six package bullets"
+    assert len(starts) == 7, "expected exactly seven package bullets"
     scopes: dict[int, str] = {}
     for position, start in enumerate(starts):
         end = starts[position + 1] if position + 1 < len(starts) else len(lines)
@@ -383,7 +386,7 @@ def test_deb_policy_changelog_package_mapping(installed_root: Path) -> None:
         assert bullet is not None
         joined = re.sub(r"\s+", " ", " ".join(lines[start:end]))
         scopes[int(bullet.group(1))] = joined.strip()
-    assert list(scopes) == [1, 2, 3, 4, 5, 6]
+    assert list(scopes) == [1, 2, 3, 4, 5, 6, 7]
 
     # Package 1 — local History foundation and privacy-safe persistence.
     assert "History foundation" in scopes[1]
@@ -427,6 +430,29 @@ def test_deb_policy_changelog_package_mapping(installed_root: Path) -> None:
     # multi-turn correction and Debian compliance; publication deferred.
     for keyword in ("0.3.0", "artifact hygiene", "activity", "multi-turn", "Debian", "deferred"):
         assert keyword in scopes[6], keyword
+
+    # Package 7 — read-only integration registry and Hermes inventory;
+    # provider editing, Keyring credentials, DeepSeek balance and
+    # financial units deferred.
+    for keyword in (
+        "integration registry",
+        "Hermes inventory",
+        "read-only",
+        "Integrations",
+        "Agents",
+        "Providers and models",
+        "main/named",
+        "Hermes CLI",
+        "capability badges",
+        "percentage-only",
+        "never zero",
+        "newest-wins",
+        "deferred",
+    ):
+        assert keyword in scopes[7], keyword
+    assert "Keyring credentials" in scopes[7]
+    assert "DeepSeek" in scopes[7]
+    assert "financial units" in scopes[7]
 
 
 def test_deb_policy_manpages_exact_production_paths(installed_root: Path) -> None:

@@ -42,6 +42,7 @@ select = ["E", "F", "I", "UP", "B"]
 "src/moira/history_chart.py" = ["E402"]
 "src/moira/history_page.py" = ["E402"]
 "src/moira/activity_view.py" = ["E402"]
+"src/moira/integrations_page.py" = ["E402"]
 "tests/test_package5_ui.py" = ["E402"]
 "tests/test_activity_view.py" = ["E402"]
 
@@ -49,4 +50,4 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.11"
 strict = true
 files = ["src/moira", "tests"]
-exclude = ["src/moira/ui.py", "src/moira/app.py", "src/moira/secrets.py", "src/moira/history_chart.py", "src/moira/history_page.py", "src/moira/activity_view.py"]
+exclude = ["src/moira/ui.py", "src/moira/app.py", "src/moira/secrets.py", "src/moira/history_chart.py", "src/moira/history_page.py", "src/moira/activity_view.py", "src/moira/integrations_page.py"]

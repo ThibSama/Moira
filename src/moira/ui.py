@@ -62,6 +62,14 @@ from .history import HistoryStatus
 from .history_db import HistoryCoordinator
 from .history_page import HistoryPage
 from .i18n import is_french, tr
+from .integrations import (
+    HermesInventory,
+    IntegrationCoordinator,
+    IntegrationState,
+    build_snapshot,
+    probe_hermes_inventory,
+)
+from .integrations_page import IntegrationsPage
 from .models import (
     CodexSummary,
     CollectorResult,
@@ -344,6 +352,15 @@ class MainWindow(Adw.ApplicationWindow):
         self._activity_store = ActivityStore()
         self._activity_watcher = ActivityWatcher(self._activity_store, self._update_activity_panel)
         self._capabilities: dict[AgentRuntime, CapabilityReport] = {}
+        # Integration inventory: bounded newest-wins probes off the GTK
+        # thread. Probes start only on page visibility / explicit Refresh.
+        self._integration_coordinator = IntegrationCoordinator(
+            submit=self._submit_probe,
+            probe=probe_hermes_inventory,
+            publish=self._publish_inventory,
+        )
+        self._integration_coordinator.start()
+        self._last_inventory: HermesInventory | None = None
         self._restore_geometry()
         self._build()
         self._render()
@@ -425,6 +442,10 @@ class MainWindow(Adw.ApplicationWindow):
         home.append(actions)
         self._stack.add_titled(home, "home", _("Quotas"))
         self._stack.add_titled(self._settings_page(), "notifications", _("Notifications"))
+        self._integrations_page = self._integrations_page_content()
+        integrations_scroll = Gtk.ScrolledWindow()
+        integrations_scroll.set_child(self._integrations_page)
+        self._stack.add_titled(integrations_scroll, "integrations", _("Integrations"))
         self._history_page = HistoryPage(self.executor)
         history_scroll = Gtk.ScrolledWindow()
         history_scroll.set_child(self._history_page)
@@ -534,9 +555,34 @@ class MainWindow(Adw.ApplicationWindow):
         update_row.append(self.update_status)
         update_box.append(update_row)
         box.append(update_box)
-        integration_heading = Gtk.Label(label=_("Agent integrations"), xalign=0)
-        integration_heading.add_css_class("heading")
-        box.append(integration_heading)
+        shortcut_buttons = Gtk.Box(spacing=8)
+        create_desktop = Gtk.Button(label=_("Create desktop shortcut"))
+        create_desktop.connect("clicked", self._create_desktop_shortcut)
+        remove_desktop = Gtk.Button(label=_("Remove desktop shortcut"))
+        remove_desktop.connect("clicked", self._remove_desktop_shortcut)
+        shortcut_buttons.append(create_desktop)
+        shortcut_buttons.append(remove_desktop)
+        box.append(shortcut_buttons)
+        self.settings_status = Gtk.Label(xalign=0)
+        self.settings_status.set_wrap(True)
+        box.append(self.settings_status)
+        page.set_child(box)
+        return page
+
+    def _integrations_page_content(self) -> IntegrationsPage:
+        """Build the scrollable Integrations page and its Agents section.
+
+        The Set up / Remove / Test controls are moved here from the
+        Settings view without any behavior change: the same handlers,
+        the same status labels and the same activity-event suffix.
+        """
+        page = IntegrationsPage(on_visible_refresh=self._request_integrations_refresh)
+        self._integrations_page = page
+        self._build_agents_section()
+        return page
+
+    def _build_agents_section(self) -> None:
+        """Per-runtime Set up / Remove / Test rows (moved from Settings)."""
         self._integration_status: dict[AgentRuntime, Gtk.Label] = {}
         for runtime in AgentRuntime:
             row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -563,21 +609,55 @@ class MainWindow(Adw.ApplicationWindow):
             status.set_wrap(True)
             status.add_css_class("dim-label")
             row.append(status)
-            box.append(row)
+            self._integrations_page.agents_box.append(row)
             self._integration_status[runtime] = status
-        shortcut_buttons = Gtk.Box(spacing=8)
-        create_desktop = Gtk.Button(label=_("Create desktop shortcut"))
-        create_desktop.connect("clicked", self._create_desktop_shortcut)
-        remove_desktop = Gtk.Button(label=_("Remove desktop shortcut"))
-        remove_desktop.connect("clicked", self._remove_desktop_shortcut)
-        shortcut_buttons.append(create_desktop)
-        shortcut_buttons.append(remove_desktop)
-        box.append(shortcut_buttons)
-        self.settings_status = Gtk.Label(xalign=0)
-        self.settings_status.set_wrap(True)
-        box.append(self.settings_status)
-        page.set_child(box)
-        return page
+
+    # ── Integration inventory (bounded newest-wins coordinator) ──
+
+    def _submit_probe(self, fn: Any) -> None:
+        """Run one bounded inventory probe on the shared worker executor."""
+        self.executor.submit(fn)
+
+    def _request_integrations_refresh(self, *_args: Any) -> None:
+        """Request one bounded inventory probe (page visibility or Refresh)."""
+        self._integrations_page.render_status(_("Checking…"))
+        self._integration_coordinator.request_refresh()
+
+    def _publish_inventory(self, inventory: HermesInventory) -> None:
+        """Worker-thread publication (under the coordinator lock): dispatch
+        the newest inventory onto the GLib idle loop. Stale generations and
+        results after shutdown never reach this point."""
+        GLib.idle_add(self._apply_inventory, inventory)
+
+    def _apply_inventory(self, inventory: HermesInventory) -> bool:
+        if self._integrations_page._shutdown:
+            return False
+        self._last_inventory = inventory
+        if inventory.state is IntegrationState.AVAILABLE:
+            text = f"{_('Inventory refreshed.')} {_('Hermes ')}{inventory.version}"
+        else:
+            text = f"{_('Inventory unavailable: ')}{_(inventory.detail)}"
+        self._integrations_page.render_status(text)
+        self._maybe_render_integrations()
+        return False
+
+    def _maybe_render_integrations(self) -> None:
+        """Re-render the Integrations page from the newest cached inventory
+        when the page is visible. Never triggers a probe."""
+        inventory = getattr(self, "_last_inventory", None)
+        if inventory is None:
+            return
+        page = getattr(self, "_integrations_page", None)
+        if page is None or not page.is_visible_page():
+            return
+        snapshot = build_snapshot(
+            hermes=inventory,
+            capabilities=self._capabilities,
+            quota_readings=self.state.readings,
+            collect_claude=self.settings.collect_claude,
+            collect_codex=self.settings.collect_codex,
+        )
+        page.render_snapshot(snapshot)
 
     @staticmethod
     def _labeled(label: str, widget: Gtk.Widget) -> Gtk.Widget:
@@ -609,6 +689,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.codex_card.show_disabled()
         self._update_refresh_info()
         self._update_diagnostics()
+        self._maybe_render_integrations()
 
     def _update_diagnostics(self) -> None:
         """Refresh the sanitized diagnostics tab content."""
@@ -765,13 +846,15 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_close_request(self, *_args: Any) -> bool:
         """Persist geometry, then stop the history worker cleanly on close.
 
-        The coordinator shutdown is bounded (joins with a 3-second timeout,
-        strictly above the 1-second SQLite write timeout) so the worker
-        terminates before the join expires. Pending work is discarded
-        with a sanitized status. Never blocks GTK for more than 3 seconds.
+        The coordinator shutdown is bounded (idempotent, no joins): the
+        in-flight inventory probe self-bounds through its subprocess
+        timeout and never publishes after shutdown. The integrations page
+        stops routing refreshes.
         """
         self._persist_geometry()
         self._activity_watcher.shutdown()
+        self._integration_coordinator.shutdown()
+        self._integrations_page.shutdown()
         self._history_coordinator.clear_write_success_callback()
         self._history_page.shutdown()
         self._history_coordinator.shutdown()
@@ -787,18 +870,22 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._history_page.on_refresh_complete)
 
     def _on_stack_changed(self, *_args: Any) -> None:
-        """Refresh History tab when it becomes visible; hide when not."""
+        """Refresh the History and Integrations tabs when they become
+        visible; inventory probes run only on page visibility and the
+        explicit page Refresh button."""
         visible_child = self._stack.get_visible_child()
-        if visible_child is not None:
-            page = visible_child
-            if isinstance(page, Gtk.ScrolledWindow):
-                child = page.get_child()
-                if isinstance(child, HistoryPage):
-                    child.on_visible()
-                else:
-                    self._history_page.on_hidden()
-            else:
+        if isinstance(visible_child, Gtk.ScrolledWindow):
+            child = visible_child.get_child()
+            if isinstance(child, HistoryPage):
+                self._history_page.on_visible()
+                self._integrations_page.on_hidden()
+                return
+            if isinstance(child, IntegrationsPage):
                 self._history_page.on_hidden()
+                self._integrations_page.on_visible()
+                return
+        self._history_page.on_hidden()
+        self._integrations_page.on_hidden()
 
     def _compute_next_refresh_str(self) -> str:
         if self._next_refresh_time <= 0:
@@ -1091,6 +1178,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _apply_capability(self, runtime: AgentRuntime, report: CapabilityReport) -> bool:
         self._capabilities[runtime] = report
         self._update_integration_status(runtime)
+        self._maybe_render_integrations()
         return False
 
     def _update_integration_status(self, runtime: AgentRuntime) -> None:
@@ -1122,6 +1210,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self._capabilities[runtime] = result.capability
         self._update_integration_status(runtime)
+        self._maybe_render_integrations()
 
     def _remove_agent(self, _button: Any, runtime: AgentRuntime) -> None:
         try:
@@ -1131,6 +1220,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self._capabilities[runtime] = result.capability
         self._update_integration_status(runtime)
+        self._maybe_render_integrations()
 
     def _test_agent(self, _button: Any, runtime: AgentRuntime) -> None:
         """Prove the integration boundary off the GTK thread.
@@ -1156,6 +1246,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _apply_test_result(self, runtime: AgentRuntime, result: IntegrationResult) -> bool:
         self._capabilities[runtime] = result.capability
         self._update_integration_status(runtime)
+        self._maybe_render_integrations()
         return False
 
     def _create_desktop_shortcut(self, *_args: Any) -> None:

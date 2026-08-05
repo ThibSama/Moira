@@ -26,10 +26,23 @@ recovery, reset and error events. Diagnostics are sanitized and can be
 copied; history can be exported as CSV/JSON; manual update checks use
 strict SemVer parsing.
 .PP
-The Settings view can install and remove Moira\-owned Claude Code hooks
-and Hermes shell hooks for privacy\-minimal agent activity display, and
-probe Moira\-owned Codex app\-server sessions. Independent Codex CLI
-sessions are never observed.
+The Integrations view contains the Agents section (Set up / Remove /
+Test controls for Claude Code and Hermes hooks and Moira\-owned Codex
+app\-server sessions, moved from the Settings view without behavior
+change) and a read\-only Providers and models inventory: capability
+badges per provider (activity, quota percentage, exact tokens, balance,
+cost) and the Hermes main model plus discovered named providers, read
+from the installed Hermes CLI (\fBhermes config get model \-\-json\fR and
+\fBhermes config get providers \-\-json\fR) after a version/help probe.
+Base URLs, credentials, paths and raw output are never displayed;
+Claude remains percentage\-only, Codex keeps its exact account\-usage
+contract, and unknown balance/cost is a state, never zero. DeepSeek
+balance is reported as not configured (no \fB/user/balance\fR call).
+Provider editing, Keyring credentials, DeepSeek balance and financial
+units are deferred. Independent Codex CLI sessions are never observed.
+Inventory probes run only on page visibility and the explicit Refresh
+button, off the GTK thread, bounded and newest\-wins with sanitized
+translated statuses.
 .SH OPTIONS
 .TP
 .B \-\-smoke\-test
