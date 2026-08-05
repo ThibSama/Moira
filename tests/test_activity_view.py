@@ -1,4 +1,4 @@
-"""Package 6c — activity panel and watcher tests.
+"""Package 6c/6d — activity panel and watcher tests.
 
 Panel tests (Xvfb-gated): spinner while running, concurrent count, latest
 sanitized model label, terminal symbolic icons, presence in full/compact
@@ -55,23 +55,28 @@ def _write_external(store: ActivityStore, event: ActivityEvent) -> None:
 # ── Pure display derivation (no display required) ──
 
 
+def _v2_session(turns: list[tuple[str, str, int]]) -> dict[str, Any]:
+    """A v2 session entry: turns (session, state, updated offset seconds)."""
+    turn_map: dict[str, Any] = {}
+    for index, (session, state, offset) in enumerate(turns, 1):
+        turn_hash = hash_identity(f"{session}-turn-{index}")
+        turn_map[turn_hash] = {
+            "state": state,
+            "model": "m",
+            "started_at": NOW.isoformat(),
+            "updated_at": (NOW + timedelta(seconds=offset)).isoformat(),
+        }
+    current = next(reversed(turn_map))
+    return {"turns": turn_map, "current": current, "next_seq": len(turn_map) + 1}
+
+
 def test_view_running_spinner_state_and_count() -> None:
     data = {
-        "version": 1,
+        "version": 2,
         "sessions": {
             "claude": {
-                hash_identity("a"): {
-                    "state": "RUNNING",
-                    "model": "m1",
-                    "started_at": NOW.isoformat(),
-                    "updated_at": (NOW + timedelta(seconds=2)).isoformat(),
-                },
-                hash_identity("b"): {
-                    "state": "RUNNING",
-                    "model": "m2",
-                    "started_at": NOW.isoformat(),
-                    "updated_at": (NOW + timedelta(seconds=1)).isoformat(),
-                },
+                hash_identity("a"): _v2_session([("a", "RUNNING", 2)]),
+                hash_identity("b"): _v2_session([("b", "RUNNING", 1)]),
             }
         },
         "last_events": {},
@@ -80,7 +85,7 @@ def test_view_running_spinner_state_and_count() -> None:
     claude = view[AgentRuntime.CLAUDE]
     assert claude.state is ActivityState.RUNNING
     assert claude.active_count == 2
-    assert claude.model == "m1"  # latest sanitized model label
+    assert claude.model == "m"  # latest sanitized model label
     assert view[AgentRuntime.CODEX].visible is False
     assert view[AgentRuntime.HERMES].visible is False
 
@@ -88,15 +93,10 @@ def test_view_running_spinner_state_and_count() -> None:
 def test_view_terminal_icon_states() -> None:
     for state in (ActivityState.COMPLETED, ActivityState.FAILED, ActivityState.INTERRUPTED):
         data = {
-            "version": 1,
+            "version": 2,
             "sessions": {
                 "hermes": {
-                    hash_identity("s"): {
-                        "state": state.value,
-                        "model": "m",
-                        "started_at": NOW.isoformat(),
-                        "updated_at": NOW.isoformat(),
-                    }
+                    hash_identity("s"): _v2_session([("s", state.value, 0)]),
                 }
             },
             "last_events": {},
@@ -249,7 +249,8 @@ def test_watcher_reloads_on_external_write(tmp_path: Path) -> None:
             ),
         )
         assert _wait_until(lambda: bool(calls)), "on_change never fired"
-        assert store.snapshot()["sessions"]["claude"][hash_identity("s1")]["state"] == "COMPLETED"
+        session = store.snapshot()["sessions"]["claude"][hash_identity("s1")]
+        assert session["turns"][session["current"]]["state"] == "COMPLETED"
     finally:
         watcher.shutdown()
 
@@ -366,15 +367,20 @@ def test_watchdog_persists_interrupted_and_panel_hides_after_window(tmp_path: Pa
     started = datetime.now(UTC) - timedelta(seconds=WATCHDOG_STALE_SECONDS + 60)
     store.record(_event(AgentRuntime.HERMES, ActivityState.RUNNING, "h1", at=started))
     calls: list[bool] = []
+
+    def hermes_state() -> str | None:
+        sessions = store.snapshot()["sessions"].get("hermes", {})
+        if not sessions:
+            return None
+        session = next(iter(sessions.values()))
+        state = session["turns"][session["current"]]["state"]
+        return state if isinstance(state, str) else None
+
     watcher = ActivityWatcher(store, lambda: calls.append(True))
     try:
-        assert _wait_until(
-            lambda: (
-                store.snapshot()["sessions"].get("hermes", {})
-                and next(iter(store.snapshot()["sessions"]["hermes"].values()))["state"]
-                == "INTERRUPTED"
-            )
-        ), "watchdog never expired the stale session"
+        assert _wait_until(lambda: hermes_state() == "INTERRUPTED"), (
+            "watchdog never expired the stale session"
+        )
         terminal = latest_terminal_event(store.snapshot(), AgentRuntime.HERMES)
         assert terminal is not None and terminal[0] is ActivityState.INTERRUPTED
     finally:

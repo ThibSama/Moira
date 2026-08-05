@@ -17,7 +17,7 @@
       <description>
         <p>Adds the History tab with selectable 24h/7d/30d/90d ranges and per-service filters, quota series with reset transitions, availability states, and exact daily token statistics computed from official Codex account usage (Claude remains percentage-only).</p>
         <p>Adds per-provider collection toggles and alert rules, native desktop and NTFY notification channels with deduplicated exhaustion, recovery, reset and error events, compact mode, sanitized diagnostics with copy actions, deterministic CSV/JSON export, history deletion, and manual update checks.</p>
-        <p>Adds agent activity visibility independent from quotas: a spinner while Claude Code, Codex CLI or Hermes works, then a symbolic success/failure/interrupted state for five minutes. Privacy-minimal activity events (hashed session identities, sanitized model labels, UTC timestamps only) are recorded through Moira-owned Claude Code hooks and Hermes shell hooks, and watched live with no polling or terminal scraping.</p>
+        <p>Adds agent activity visibility independent from quotas: a spinner while Claude Code, Hermes or a Moira-owned Codex app-server session works, then a symbolic success/failure/interrupted state for five minutes. Privacy-minimal activity events (hashed session identities, sanitized model labels, UTC timestamps only) are recorded through Moira-owned Claude Code hooks, Hermes shell hooks and the documented Codex app-server protocol, and watched live with no polling or terminal scraping.</p>
       </description>
     </release>
     <release version="0.2.2" date="2026-08-02">

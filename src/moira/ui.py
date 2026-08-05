@@ -42,6 +42,7 @@ from .activity import ActivityState, ActivityStore, AgentRuntime, derive_runtime
 from .activity_view import ActivityPanel, ActivityWatcher, latest_terminal_event
 from .agent_integration import (
     CapabilityReport,
+    IntegrationResult,
     probe_capability,
     remove_runtime,
     setup_runtime,
@@ -1132,14 +1133,30 @@ class MainWindow(Adw.ApplicationWindow):
         self._update_integration_status(runtime)
 
     def _test_agent(self, _button: Any, runtime: AgentRuntime) -> None:
-        """Prove the callbacks fire; fake events never persist."""
-        try:
-            result = test_runtime(runtime)
-        except Exception:
-            self._update_integration_status(runtime)
-            return
+        """Prove the integration boundary off the GTK thread.
+
+        The Codex test drives a real app-server session (bounded ~30 s),
+        so the verification always runs on the executor; fake events never
+        persist into the real store.
+        """
+        self._integration_status[runtime].set_text(_("Checking…"))
+
+        def run() -> IntegrationResult:
+            try:
+                return test_runtime(runtime)
+            except Exception:
+                return IntegrationResult(
+                    False, CapabilityReport("unsupported", _("Callback verification failed."))
+                )
+
+        self.executor.submit(run).add_done_callback(
+            lambda future: GLib.idle_add(self._apply_test_result, runtime, future.result())
+        )
+
+    def _apply_test_result(self, runtime: AgentRuntime, result: IntegrationResult) -> bool:
         self._capabilities[runtime] = result.capability
         self._update_integration_status(runtime)
+        return False
 
     def _create_desktop_shortcut(self, *_args: Any) -> None:
         try:

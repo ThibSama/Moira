@@ -55,6 +55,12 @@ def _sessions(store: ActivityStore) -> dict[str, dict[str, Any]]:
     return cast("dict[str, dict[str, Any]]", store.snapshot()["sessions"])
 
 
+def _current_turn(store: ActivityStore, runtime: str, session_hash: str) -> dict[str, Any]:
+    """The session's current turn entry (v2 turn lifecycle shape)."""
+    session = _sessions(store)[runtime][session_hash]
+    return cast("dict[str, Any]", session["turns"][session["current"]])
+
+
 def _last(store: ActivityStore) -> dict[str, dict[str, Any]]:
     store.reload()
     return cast("dict[str, dict[str, Any]]", store.snapshot()["last_events"])
@@ -66,6 +72,7 @@ def test_claude_user_prompt_submit_starts(state_home: Path, claude_home: Path) -
             {
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": "claude-session-1",
+                "prompt_id": "prompt-1",
                 "prompt": "please do the thing",
                 "transcript_path": "/private/transcript.jsonl",
             }
@@ -75,40 +82,60 @@ def test_claude_user_prompt_submit_starts(state_home: Path, claude_home: Path) -
     store = ActivityStore()
     sessions = _sessions(store)
     assert len(sessions["claude"]) == 1
-    entry = sessions["claude"][hash_identity("claude-session-1")]
-    assert entry["state"] == ActivityState.RUNNING.value
-    assert entry["model"] == "opus-fixture"
+    turn = _current_turn(store, "claude", hash_identity("claude-session-1"))
+    assert turn["state"] == ActivityState.RUNNING.value
+    assert turn["model"] == "opus-fixture"
 
 
 def test_claude_stop_completes_and_stop_failure_fails(state_home: Path, claude_home: Path) -> None:
-    _fire({"hook_event_name": "UserPromptSubmit", "session_id": "s"})
-    _fire({"hook_event_name": "Stop", "session_id": "s", "last_assistant_message": "secret answer"})
+    _fire(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s",
+            "prompt_id": "prompt-1",
+        }
+    )
+    _fire(
+        {
+            "hook_event_name": "Stop",
+            "session_id": "s",
+            "prompt_id": "prompt-1",
+            "last_assistant_message": "secret answer",
+        }
+    )
     store = ActivityStore()
-    assert _sessions(store)["claude"][hash_identity("s")]["state"] == ActivityState.COMPLETED.value
-    _fire({"hook_event_name": "UserPromptSubmit", "session_id": "s2"})
+    assert (
+        _current_turn(store, "claude", hash_identity("s"))["state"] == ActivityState.COMPLETED.value
+    )
+    _fire({"hook_event_name": "UserPromptSubmit", "session_id": "s2", "prompt_id": "prompt-2"})
     _fire(
         {
             "hook_event_name": "StopFailure",
             "session_id": "s2",
+            "prompt_id": "prompt-2",
             "error": "rate limit exceeded",
             "error_details": {"raw": "sensitive"},
         }
     )
-    assert _sessions(store)["claude"][hash_identity("s2")]["state"] == ActivityState.FAILED.value
+    assert (
+        _current_turn(store, "claude", hash_identity("s2"))["state"] == ActivityState.FAILED.value
+    )
     assert _last(store)["claude"]["state"] == ActivityState.FAILED.value
 
 
 def test_claude_session_end_interrupts(state_home: Path, claude_home: Path) -> None:
-    _fire({"hook_event_name": "UserPromptSubmit", "session_id": "s"})
+    _fire({"hook_event_name": "UserPromptSubmit", "session_id": "s", "prompt_id": "prompt-1"})
     _fire({"hook_event_name": "SessionEnd", "session_id": "s", "reason": "user_closed"})
     store = ActivityStore()
     assert (
-        _sessions(store)["claude"][hash_identity("s")]["state"] == ActivityState.INTERRUPTED.value
+        _current_turn(store, "claude", hash_identity("s"))["state"]
+        == ActivityState.INTERRUPTED.value
     )
-    # A terminal session is never replaced by a later Stop.
+    # A terminal turn is never replaced by a later Stop.
     _fire({"hook_event_name": "Stop", "session_id": "s"})
     assert (
-        _sessions(store)["claude"][hash_identity("s")]["state"] == ActivityState.INTERRUPTED.value
+        _current_turn(store, "claude", hash_identity("s"))["state"]
+        == ActivityState.INTERRUPTED.value
     )
 
 
@@ -120,37 +147,51 @@ def test_claude_unowned_events_are_ignored(state_home: Path, claude_home: Path) 
 
 def test_hermes_pre_post_and_session_end(state_home: Path) -> None:
     payloads: list[dict[str, object]] = [
-        {"hook_event_name": "pre_llm_call", "session_id": "h-1", "extra": {"model": "m1"}},
-        {"hook_event_name": "post_llm_call", "session_id": "h-1", "extra": {"model": "m1"}},
+        {
+            "hook_event_name": "pre_llm_call",
+            "session_id": "h-1",
+            "extra": {"model": "m1", "turn_id": "turn-1"},
+        },
+        {
+            "hook_event_name": "post_llm_call",
+            "session_id": "h-1",
+            "extra": {"model": "m1", "turn_id": "turn-1"},
+        },
         {
             "hook_event_name": "on_session_end",
             "session_id": "h-1",
-            "extra": {"completed": True, "interrupted": False, "model": "m1"},
+            "extra": {"completed": True, "interrupted": False, "model": "m1", "turn_id": "turn-1"},
         },
     ]
     for payload in payloads:
         assert _fire(payload, "hermes") == 0
     store = ActivityStore()
-    session = _sessions(store)["hermes"][hash_identity("h-1")]
-    assert session["state"] == ActivityState.COMPLETED.value
-    assert session["model"] == "m1"
+    turn = _current_turn(store, "hermes", hash_identity("h-1"))
+    assert turn["state"] == ActivityState.COMPLETED.value
+    assert turn["model"] == "m1"
 
 
 def test_hermes_interrupted_session_end_wins(state_home: Path) -> None:
     _fire(
-        {"hook_event_name": "pre_llm_call", "session_id": "h-2", "extra": {"model": "m"}}, "hermes"
+        {
+            "hook_event_name": "pre_llm_call",
+            "session_id": "h-2",
+            "extra": {"model": "m", "turn_id": "turn-1"},
+        },
+        "hermes",
     )
     _fire(
         {
             "hook_event_name": "on_session_end",
             "session_id": "h-2",
-            "extra": {"completed": False, "interrupted": True, "model": "m"},
+            "extra": {"completed": False, "interrupted": True, "model": "m", "turn_id": "turn-1"},
         },
         "hermes",
     )
     store = ActivityStore()
     assert (
-        _sessions(store)["hermes"][hash_identity("h-2")]["state"] == ActivityState.INTERRUPTED.value
+        _current_turn(store, "hermes", hash_identity("h-2"))["state"]
+        == ActivityState.INTERRUPTED.value
     )
 
 

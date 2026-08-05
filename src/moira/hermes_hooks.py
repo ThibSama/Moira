@@ -494,10 +494,11 @@ def test_hooks() -> bool:
     """Prove the configured callbacks fire with the documented payloads.
 
     Runs the packaged hook command against a throwaway XDG_STATE_HOME so
-    no fake event persists into the real activity store. Verifies the full
-    sequence: pre_llm_call starts a session, post_llm_call completes it,
-    and on_session_end records the interrupted last event — a terminal
-    session is never replaced.
+    no fake event persists into the real activity store. Verifies the
+    turn lifecycle end-to-end with the documented ``extra.turn_id``:
+    two pre_llm_call/post_llm_call cycles under one session, and a second
+    turn interrupted through on_session_end (never reopening the first
+    turn, never turning a terminal record back into RUNNING).
     """
     with tempfile.TemporaryDirectory() as temp:
         state_home = Path(temp)
@@ -505,42 +506,64 @@ def test_hooks() -> bool:
         os.environ["XDG_STATE_HOME"] = str(state_home)
         try:
             store = ActivityStore()
+            # Turn 1: pre → post (completed).
             _fire_hook_payload(
                 {
                     "hook_event_name": "pre_llm_call",
                     "session_id": "moira-test-session",
-                    "extra": {"model": "test-model", "is_first_turn": True},
+                    "extra": {"model": "test-model", "is_first_turn": True, "turn_id": "turn-1"},
                 }
             )
-            store.reload()
-            started = store.snapshot()["sessions"].get("hermes", {})
-            if (
-                len(started) != 1
-                or next(iter(started.values()))["state"] != ActivityState.RUNNING.value
-            ):
-                return False
             _fire_hook_payload(
                 {
                     "hook_event_name": "post_llm_call",
                     "session_id": "moira-test-session",
-                    "extra": {"model": "test-model"},
+                    "extra": {"model": "test-model", "turn_id": "turn-1"},
                 }
             )
             store.reload()
-            completed = store.snapshot()["sessions"].get("hermes", {})
-            if (
-                len(completed) != 1
-                or next(iter(completed.values()))["state"] != ActivityState.COMPLETED.value
+            sessions = store.snapshot()["sessions"].get("hermes", {})
+            if len(sessions) != 1:
+                return False
+            turns = next(iter(sessions.values()))["turns"]
+            if len(turns) != 1 or next(iter(turns.values()))["state"] != (
+                ActivityState.COMPLETED.value
             ):
                 return False
+            # Turn 2: a new pre_llm_call in the SAME session starts a new
+            # turn (the original defect rejected it as terminal).
+            _fire_hook_payload(
+                {
+                    "hook_event_name": "pre_llm_call",
+                    "session_id": "moira-test-session",
+                    "extra": {"model": "test-model", "is_first_turn": False, "turn_id": "turn-2"},
+                }
+            )
+            store.reload()
+            turns = next(iter(store.snapshot()["sessions"]["hermes"].values()))["turns"]
+            if len(turns) != 2:
+                return False
+            if not any(turn["state"] == ActivityState.RUNNING.value for turn in turns.values()):
+                return False
+            # Turn 2 is interrupted: post_llm_call is absent (documented),
+            # on_session_end carries interrupted=True and completes the
+            # turn lifecycle.
             _fire_hook_payload(
                 {
                     "hook_event_name": "on_session_end",
                     "session_id": "moira-test-session",
-                    "extra": {"model": "test-model", "completed": True, "interrupted": True},
+                    "extra": {
+                        "model": "test-model",
+                        "completed": False,
+                        "interrupted": True,
+                        "turn_id": "turn-2",
+                    },
                 }
             )
             store.reload()
+            turns = next(iter(store.snapshot()["sessions"]["hermes"].values()))["turns"]
+            if any(turn["state"] == ActivityState.RUNNING.value for turn in turns.values()):
+                return False
             last_event = store.snapshot()["last_events"].get("hermes")
             if last_event is None or last_event["state"] != ActivityState.INTERRUPTED.value:
                 return False

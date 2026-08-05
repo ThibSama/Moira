@@ -236,9 +236,10 @@ class ActivityWatcher:
             if view.state is ActivityState.RUNNING:
                 running = self._store.sessions_for(view.runtime)
                 updates = [
-                    datetime.fromisoformat(entry["updated_at"])
-                    for entry in running.values()
-                    if entry["state"] == ActivityState.RUNNING.value
+                    datetime.fromisoformat(turn["updated_at"])
+                    for session in running.values()
+                    for turn in session["turns"].values()
+                    if turn["state"] == ActivityState.RUNNING.value
                 ]
                 if updates:
                     next_times.append(max(updates) + timedelta(seconds=WATCHDOG_STALE_SECONDS))
@@ -300,19 +301,20 @@ def latest_terminal_event(
             )
         except (ValueError, KeyError):
             pass
-    for entry in data.get("sessions", {}).get(runtime.value, {}).values():
-        if entry["state"] == ActivityState.RUNNING.value:
-            continue
-        try:
-            candidates.append(
-                (
-                    datetime.fromisoformat(entry["updated_at"]),
-                    ActivityState(entry["state"]),
-                    entry.get("model", ""),
+    for session in data.get("sessions", {}).get(runtime.value, {}).values():
+        for turn in session["turns"].values():
+            if turn["state"] == ActivityState.RUNNING.value:
+                continue
+            try:
+                candidates.append(
+                    (
+                        datetime.fromisoformat(turn["updated_at"]),
+                        ActivityState(turn["state"]),
+                        turn.get("model", ""),
+                    )
                 )
-            )
-        except (ValueError, KeyError):
-            pass
+            except (ValueError, KeyError):
+                pass
     if not candidates:
         return None
     at, state, model = max(candidates, key=lambda item: item[0])

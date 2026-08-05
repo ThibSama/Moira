@@ -33,6 +33,7 @@ from .activity import (
     ActivityStore,
     AgentRuntime,
     LastActivityEvent,
+    composite_identity,
     validate_identity,
 )
 
@@ -111,6 +112,27 @@ def _session_hash(payload: dict[str, Any]) -> str | None:
         return None
 
 
+def _turn_hash(payload: dict[str, Any], session_raw: str | None) -> str | None:
+    """Hashed provider turn identity bound to its session, or None.
+
+    Claude Code supplies ``prompt_id`` (a base-field UUID correlating a
+    user prompt with all subsequent events until the next prompt); Hermes
+    supplies ``extra.turn_id``. Missing or oversized identifiers fail
+    closed to None and the store derives an identity from the lifecycle.
+    """
+    if session_raw is None:
+        return None
+    raw = payload.get("prompt_id")
+    if isinstance(raw, str) and raw.strip():
+        return composite_identity(session_raw, raw)
+    extra = payload.get("extra")
+    if isinstance(extra, dict):
+        raw = extra.get("turn_id")
+        if isinstance(raw, str) and raw.strip():
+            return composite_identity(session_raw, raw)
+    return None
+
+
 def _record_claude(payload: dict[str, Any], store: ActivityStore) -> None:
     event_name = payload.get("hook_event_name")
     if not isinstance(event_name, str):
@@ -118,6 +140,7 @@ def _record_claude(payload: dict[str, Any], store: ActivityStore) -> None:
     state = CLAUDE_EVENT_STATES.get(event_name)
     if state is None:
         return  # an event Moira does not own — observer ignores it
+    session_raw = payload.get("session_id")
     session_hash = _session_hash(payload)
     if session_hash is None:
         return
@@ -126,6 +149,7 @@ def _record_claude(payload: dict[str, Any], store: ActivityStore) -> None:
             runtime=AgentRuntime.CLAUDE,
             state=state,
             session_hash=session_hash,
+            turn_hash=_turn_hash(payload, session_raw if isinstance(session_raw, str) else None),
             model=_read_claude_model(),
             at=datetime.now(UTC),
         )
@@ -142,61 +166,62 @@ def _record_hermes(payload: dict[str, Any], store: ActivityStore) -> None:
         raw_model = extra.get("model")
         if isinstance(raw_model, str):
             model = raw_model
+    session_raw = payload.get("session_id")
     session_hash = _session_hash(payload)
+    if session_hash is None:
+        return
+    turn_hash = _turn_hash(payload, session_raw if isinstance(session_raw, str) else None)
     now = datetime.now(UTC)
     if event_name == "pre_llm_call":
-        if session_hash is None:
-            return
         store.record(
             ActivityEvent(
                 runtime=AgentRuntime.HERMES,
                 state=ActivityState.RUNNING,
                 session_hash=session_hash,
+                turn_hash=turn_hash,
                 model=model,
                 at=now,
             )
         )
         return
     if event_name == "post_llm_call":
-        if session_hash is None:
-            return
         store.record(
             ActivityEvent(
                 runtime=AgentRuntime.HERMES,
                 state=ActivityState.COMPLETED,
                 session_hash=session_hash,
+                turn_hash=turn_hash,
                 model=model,
                 at=now,
             )
         )
         return
-    # on_session_end — a session-bound terminal signal when the session is
-    # known, otherwise a runtime-scoped completion notifier. Interrupted
-    # wins over completed; an unknown end defaults to interrupted, never
-    # to success.
+    # on_session_end — a session-bound terminal signal for the session's
+    # current turn when known, otherwise a runtime-scoped completion
+    # notifier. Interrupted wins over completed; an unknown end defaults
+    # to interrupted, never to success.
     interrupted = isinstance(extra, dict) and extra.get("interrupted") is True
     completed = isinstance(extra, dict) and extra.get("completed") is True
     state = ActivityState.INTERRUPTED if (interrupted or not completed) else ActivityState.COMPLETED
-    if session_hash is not None:
-        outcome = store.record(
-            ActivityEvent(
-                runtime=AgentRuntime.HERMES,
-                state=state,
-                session_hash=session_hash,
-                model=model,
-                at=now,
-            )
-        )
-        if outcome is not ActivityOutcome.REJECTED:
-            return
-    store.record_last(
-        LastActivityEvent(
+    outcome = store.record(
+        ActivityEvent(
             runtime=AgentRuntime.HERMES,
             state=state,
+            session_hash=session_hash,
+            turn_hash=turn_hash,
             model=model,
             at=now,
         )
     )
+    if outcome is ActivityOutcome.REJECTED:
+        store.record_last(
+            LastActivityEvent(
+                runtime=AgentRuntime.HERMES,
+                state=state,
+                model=model,
+                at=now,
+            )
+        )
 
 
 def agent_hook_main(argv: list[str] | None = None) -> int:

@@ -172,14 +172,63 @@ def test_codex_setup_reprobes_and_remove_is_noop(
     assert not remove_result.changed
 
 
-def test_codex_test_proves_mapping_without_persisting(
+def test_codex_test_proves_real_boundary_without_persisting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("PATH", str(tmp_path))
+    """The Settings Codex test exercises the subprocess protocol boundary
+    (a fake app-server speaking the documented protocol), not handcrafted
+    dictionaries; fake events never persist into the real store."""
+    binary = tmp_path / "codex"
+    binary.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+THREAD = "moira-thread-1"
+TURN = "moira-turn-1"
+
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\\n")
+    sys.stdout.flush()
+
+
+for raw in sys.stdin:
+    try:
+        message = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    if not isinstance(message, dict):
+        continue
+    request_id = message.get("id")
+    method = message.get("method")
+    if method == "initialize":
+        send({"id": request_id, "result": {}})
+    elif method == "thread/start":
+        send({"id": request_id, "result": {"thread": {"id": THREAD}}})
+    elif method == "turn/start":
+        send(
+            {
+                "method": "turn/started",
+                "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "inProgress"}},
+            }
+        )
+        send({"id": request_id, "result": {"turn": {"id": TURN, "status": "inProgress"}}})
+        send(
+            {
+                "method": "turn/completed",
+                "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "failed"}},
+            }
+        )
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
     real_state = tmp_path / "real-state"
     monkeypatch.setenv("XDG_STATE_HOME", str(real_state))
     result = fire_runtime_test(AgentRuntime.CODEX)
-    assert result.capability.level == "full"
+    assert result.capability.level == "session_owned"
     assert not (real_state / "moira" / "activity.json").exists()
 
 
@@ -198,4 +247,10 @@ def test_live_probes_report_truthfully(tmp_path: Path) -> None:
         report = probe_capability(runtime)
         assert report.detail  # sanitized detail is always present
         # Claude reads the real user settings; report may be either state.
-        assert report.level in ("full", "completion_only", "unsupported", "not_installed")
+        assert report.level in (
+            "full",
+            "session_owned",
+            "completion_only",
+            "unsupported",
+            "not_installed",
+        )

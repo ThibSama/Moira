@@ -4,15 +4,19 @@ One facade the Settings page uses for the three agent runtimes (Claude
 Code, Codex CLI, Hermes):
 
 - ``probe_capability`` reports the current capability (full /
-  completion-only / unsupported / not installed) with a sanitized detail;
+  session-owned / completion-only / unsupported / not installed) with a
+  sanitized detail;
 - ``setup_runtime`` installs only Moira-owned entries (Claude Code hooks
   + status line, Hermes shell hooks) and never touches anything Moira
   does not own; Codex has nothing to install — setup re-probes the
   documented app-server protocol;
 - ``remove_runtime`` removes only owned entries;
-- ``test_runtime`` proves the callbacks fire using a throwaway
-  ``XDG_STATE_HOME`` so fake events never persist into the real activity
-  store and quota-alert deduplication is never altered.
+- ``test_runtime`` proves the integration boundary: Claude and Hermes
+  fire the installed hook callbacks with the documented payloads, Codex
+  starts a real Moira-owned app-server session and verifies real turn
+  notifications — always against a throwaway ``XDG_STATE_HOME`` so fake
+  events never persist into the real activity store and quota-alert
+  deduplication is never altered.
 
 Every failure returns a fixed translated outcome; raw exceptions never
 reach the UI.
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +36,7 @@ from .activity import ActivityState, ActivityStore, AgentRuntime
 from .agent_hooks import agent_hook_main
 from .claude_integration import remove as remove_claude
 from .claude_integration import setup as setup_claude
-from .codex_activity import CodexCapability, probe_codex, record_turn_notification
+from .codex_activity import CodexCapability, CodexSession, CodexSessionError, probe_codex
 from .hermes_hooks import remove as remove_hermes
 from .hermes_hooks import setup as setup_hermes
 from .hermes_hooks import test_hooks as test_hermes_hooks
@@ -42,7 +47,7 @@ _ = tr
 
 @dataclass(frozen=True, slots=True)
 class CapabilityReport:
-    level: str  # "full" | "completion_only" | "unsupported" | "not_installed"
+    level: str  # "full" | "session_owned" | "completion_only" | "unsupported" | "not_installed"
     detail: str  # sanitized, translated
 
 
@@ -95,10 +100,10 @@ def probe_capability(runtime: AgentRuntime) -> CapabilityReport:
         )
     # Codex
     capability = probe_codex()
-    if capability is CodexCapability.FULL:
+    if capability is CodexCapability.SESSION_OWNED:
         return CapabilityReport(
-            "full",
-            _("Codex app-server session ownership available."),
+            "session_owned",
+            _("Codex activity: Moira-owned app-server sessions only."),
         )
     if capability is CodexCapability.COMPLETION_ONLY:
         return CapabilityReport(
@@ -166,44 +171,72 @@ def _fire_payload(payload: dict[str, Any], runtime: str) -> None:
 
 
 def _claude_test() -> bool:
-    """Prove the four Claude hook callbacks fire with documented payloads."""
+    """Prove the installed hook callbacks with documented payloads.
+
+    Exercises the turn lifecycle end-to-end: two turns under one session
+    (the Package 6c regression), including a failing second turn replacing
+    the first success as the most recent terminal event.
+    """
     with tempfile.TemporaryDirectory() as temp:
         previous = os.environ.get("XDG_STATE_HOME")
         os.environ["XDG_STATE_HOME"] = temp
         try:
             store = ActivityStore()
+            # Turn 1: prompt → completed.
             _fire_payload(
                 {
                     "hook_event_name": "UserPromptSubmit",
                     "session_id": "moira-test-session",
+                    "prompt_id": "moira-test-prompt-1",
                     "prompt": "must never be stored",
+                },
+                "claude",
+            )
+            _fire_payload(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "moira-test-session",
+                    "prompt_id": "moira-test-prompt-1",
                 },
                 "claude",
             )
             store.reload()
             sessions = store.snapshot()["sessions"].get("claude", {})
+            if len(sessions) != 1:
+                return False
+            turns = next(iter(sessions.values()))["turns"]
             if (
-                len(sessions) != 1
-                or next(iter(sessions.values()))["state"] != ActivityState.RUNNING.value
+                len(turns) != 1
+                or next(iter(turns.values()))["state"] != ActivityState.COMPLETED.value
             ):
                 return False
-            _fire_payload({"hook_event_name": "Stop", "session_id": "moira-test-session"}, "claude")
-            store.reload()
-            sessions = store.snapshot()["sessions"].get("claude", {})
-            if next(iter(sessions.values()))["state"] != ActivityState.COMPLETED.value:
-                return False
-            # A second session exercises the failure path (a terminal
-            # session is never replaced by a later StopFailure).
+            # Turn 2: a new prompt in the SAME session must display RUNNING
+            # (the original defect: the terminal session rejected it).
             _fire_payload(
                 {
                     "hook_event_name": "UserPromptSubmit",
-                    "session_id": "moira-test-session-2",
+                    "session_id": "moira-test-session",
+                    "prompt_id": "moira-test-prompt-2",
                     "prompt": "must never be stored",
                 },
                 "claude",
             )
+            store.reload()
+            sessions = store.snapshot()["sessions"].get("claude", {})
+            turns = next(iter(sessions.values()))["turns"]
+            if len(turns) != 2:
+                return False
+            if not any(turn["state"] == ActivityState.RUNNING.value for turn in turns.values()):
+                return False
+            # Turn 2 fails: the failure must replace the earlier success.
             _fire_payload(
-                {"hook_event_name": "StopFailure", "session_id": "moira-test-session-2"}, "claude"
+                {
+                    "hook_event_name": "StopFailure",
+                    "session_id": "moira-test-session",
+                    "prompt_id": "moira-test-prompt-2",
+                    "error": "must never be stored",
+                },
+                "claude",
             )
             store.reload()
             last = store.snapshot()["last_events"].get("claude", {})
@@ -218,46 +251,49 @@ def _claude_test() -> bool:
 
 
 def _codex_test() -> bool:
-    """Prove the documented turn-notification mapping with a fake stream."""
+    """Real external integration test: exercise the app-server protocol
+    boundary with a real subprocess and record REAL turn notifications.
+
+    Starts a Moira-owned ``codex app-server --stdio`` session against an
+    isolated ``CODEX_HOME``, owns a thread, drives a real turn and
+    verifies the real ``turn/started`` → ``turn/completed`` notifications
+    were recorded through the ActivityStore (throwaway state). This is NOT
+    a synthetic mapping test: it is the documented protocol boundary.
+    """
+    if shutil.which("codex") is None:
+        return False
     with tempfile.TemporaryDirectory() as temp:
         store = ActivityStore(Path(temp) / "activity.json")
-        owned = {"owned-thread"}
-        record_turn_notification(
-            {
-                "method": "turn/started",
-                "params": {
-                    "threadId": "owned-thread",
-                    "turn": {"id": "turn-1", "status": "inProgress"},
-                },
-            },
-            owned,
-            store,
-        )
+        session = CodexSession(store=store, binary="codex", codex_home=Path(temp) / "codex-home")
+        try:
+            session.start()
+            session.run_turn("Reply with the single word: ok.", deadline=30.0)
+        except (CodexSessionError, TimeoutError, OSError):
+            return False
+        finally:
+            session.close()
         sessions = store.snapshot()["sessions"].get("codex", {})
-        if (
-            len(sessions) != 1
-            or next(iter(sessions.values()))["state"] != ActivityState.RUNNING.value
+        if len(sessions) != 1:
+            return False
+        entry = next(iter(sessions.values()))
+        if not any(
+            turn["state"] != ActivityState.RUNNING.value for turn in entry["turns"].values()
         ):
             return False
-        record_turn_notification(
-            {
-                "method": "turn/completed",
-                "params": {
-                    "threadId": "owned-thread",
-                    "turn": {"id": "turn-1", "status": "completed"},
-                },
-            },
-            owned,
-            store,
-        )
-        sessions = store.snapshot()["sessions"].get("codex", {})
-        if next(iter(sessions.values()))["state"] != ActivityState.COMPLETED.value:
-            return False
-    return True
+        last = store.snapshot()["last_events"].get("codex")
+        return last is not None and last["state"] != ActivityState.RUNNING.value
 
 
 def test_runtime(runtime: AgentRuntime) -> IntegrationResult:
-    """Prove the callbacks fire; never persists fake success."""
+    """Prove the integration boundary; never persists fake success.
+
+    Distinguishes the test kinds: Claude and Hermes fire the installed
+    packaged hook with the documented payloads (installed hook callback
+    test); Codex starts a real app-server session and verifies real turn
+    notifications (external integration test). "Callbacks verified" is
+    never reported unless the actual installed or subprocess protocol
+    boundary was exercised.
+    """
     if runtime is AgentRuntime.CLAUDE:
         ok = _claude_test()
     elif runtime is AgentRuntime.HERMES:
@@ -265,6 +301,14 @@ def test_runtime(runtime: AgentRuntime) -> IntegrationResult:
     else:
         ok = _codex_test()
     if ok:
+        if runtime is AgentRuntime.CODEX:
+            return IntegrationResult(
+                False,
+                CapabilityReport(
+                    "session_owned",
+                    _("Codex turn notifications verified (real app-server session)."),
+                ),
+            )
         return IntegrationResult(False, CapabilityReport("full", _("Callbacks verified.")))
     return IntegrationResult(
         False, CapabilityReport("unsupported", _("Callback verification failed."))

@@ -268,11 +268,16 @@ _FRENCH: dict[str, str] = {
     "hooks probe failed": "échec de la sonde de hooks",
     "shell hooks unsupported": "hooks shell non pris en charge",
     "shell hooks available.": "hooks shell disponibles.",
-    "Codex app-server session ownership available.": ("Session app-server Codex disponible."),
+    "Codex activity: Moira-owned app-server sessions only.": (
+        "Activité Codex : sessions app-server appartenant à Moira uniquement."
+    ),
     "Codex completions only — session ownership unavailable.": (
         "Complétions Codex uniquement — session indisponible."
     ),
     "Codex activity is unsupported.": "L'activité Codex n'est pas prise en charge.",
+    "Codex turn notifications verified (real app-server session).": (
+        "Notifications de tour Codex vérifiées (session app-server réelle)."
+    ),
     "Callbacks verified.": "Rappels vérifiés.",
     "Callback verification failed.": "Échec de la vérification des rappels.",
 }
