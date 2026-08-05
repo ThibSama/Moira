@@ -31,7 +31,12 @@ from .integrations import (
     ProviderProfile,
 )
 from .persistence import load_settings, save_settings
-from .secrets import clear_provider_secret, has_provider_secret, set_provider_secret
+from .secrets import (
+    clear_provider_secret,
+    get_provider_secret,
+    has_provider_secret,
+    set_provider_secret,
+)
 
 _ = tr
 
@@ -57,10 +62,19 @@ _SUCCESS_TEXT = {
 
 @dataclass(frozen=True, slots=True)
 class ProfileOp:
-    """One bounded off-GTK operation, captured entirely on the GTK thread."""
+    """One bounded off-GTK mutation, captured entirely on the GTK thread.
+
+    Ops are typed DELTAS, never full profile tuples: each op carries the
+    profile being upserted (``save_profile``) or the slug being removed,
+    and is applied to the latest committed collection at execution time.
+    Pending ops therefore never capture stale collections, so rapid edits
+    cannot overwrite committed changes. ``old_slug`` marks a rename
+    (create-new plus explicit old removal); ``credential`` may be blank
+    (preserve/migrate the existing secret).
+    """
 
     kind: str  # reload | save_profile | remove_profile | remove_credential
-    profiles: tuple[ProviderProfile, ...] = ()
+    profile: ProviderProfile | None = None
     slug: str = ""
     old_slug: str = ""
     credential: str = ""
@@ -92,52 +106,119 @@ def _persist_profiles(profiles: tuple[ProviderProfile, ...]) -> None:
     save_settings(settings)
 
 
+def _restore_credential(slug: str, value: str | None) -> None:
+    """Best-effort compensation: restore the prior secret state at a slug."""
+    if value is None:
+        clear_provider_secret(slug)
+    else:
+        set_provider_secret(slug, value)
+
+
+def _ok_result(kind: str, profiles: tuple[ProviderProfile, ...], slug: str = "") -> ProfileOpResult:
+    return ProfileOpResult(True, "", profiles, _keyring_states(profiles), kind, slug)
+
+
+def _fail_result(kind: str, reason: str, slug: str = "") -> ProfileOpResult:
+    return ProfileOpResult(False, reason, (), (), kind, slug)
+
+
+def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
+    """Transaction-safe upsert with explicit ordering and compensation.
+
+    Order: store/migrate the credential (new slug) → persist the
+    collection → remove the old slug's credential on rename. Any failure
+    restores the original profiles and the old/new secret states, so the
+    last recoverable state is never destroyed and a credential store
+    followed by a config failure never leaves an orphan.
+    """
+    assert op.profile is not None
+    profile = op.profile
+    rename = bool(op.old_slug) and op.old_slug != profile.slug
+    current = load_settings().provider_profiles
+    base = [p for p in current if p.slug != profile.slug and p.slug != op.old_slug]
+    if len(base) + 1 > MAX_PROFILES:
+        return _fail_result(op.kind, "Operation failed.", profile.slug)
+
+    value = op.credential.strip()
+    if rename and not value:
+        # Blank credential on rename migrates the existing secret.
+        value = get_provider_secret(op.old_slug) or ""
+    prior_new: str | None = None
+    stored = False
+    if value:
+        prior_new = get_provider_secret(profile.slug)  # capture before overwrite
+        if not set_provider_secret(profile.slug, value):
+            return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
+        stored = True
+
+    new_collection = tuple(sorted(base + [profile], key=lambda p: p.slug))
+    try:
+        _persist_profiles(new_collection)
+    except Exception:
+        # Compensate the credential store: restore the new slug's prior
+        # secret state (no orphan, no lost overwritten value).
+        if stored:
+            _restore_credential(profile.slug, prior_new)
+        return _fail_result(op.kind, "Operation failed.", profile.slug)
+
+    if rename:
+        if not clear_provider_secret(op.old_slug):
+            # Roll the whole rename back: original profiles on disk and
+            # the new slug's secret state restored.
+            try:
+                _persist_profiles(current)
+            except Exception:
+                pass
+            if stored:
+                _restore_credential(profile.slug, prior_new)
+            return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
+    return _ok_result(op.kind, new_collection, profile.slug)
+
+
+def _execute_remove_profile(op: ProfileOp) -> ProfileOpResult:
+    """Confirmed removal: either removes both the profile and its Moira
+    credential, or leaves both unchanged. An absent credential is a
+    successful no-op; an unavailable Keyring is a sanitized failure.
+
+    Order: persist the collection without the profile, then clear the
+    credential. A failed clear rolls the collection back (the credential
+    was never touched), so the two stores never diverge.
+    """
+    current = load_settings().provider_profiles
+    new_collection = tuple(p for p in current if p.slug != op.slug)
+    if len(new_collection) == len(current):
+        return _ok_result(op.kind, current, op.slug)  # nothing to remove
+    try:
+        _persist_profiles(new_collection)
+    except Exception:
+        return _fail_result(op.kind, "Operation failed.", op.slug)
+    if not clear_provider_secret(op.slug):
+        try:
+            _persist_profiles(current)
+        except Exception:
+            pass
+        return _fail_result(op.kind, "Keyring unavailable.", op.slug)
+    return _ok_result(op.kind, new_collection, op.slug)
+
+
 def _execute_op(op: ProfileOp) -> ProfileOpResult:
     """Run one operation off GTK (executor thread). Never raises: every
     failure maps to a sanitized stable outcome."""
     try:
         if op.kind == "reload":
             profiles = load_settings().provider_profiles
-            return ProfileOpResult(True, "", profiles, _keyring_states(profiles), "reload", "")
+            return _ok_result("reload", profiles)
         if op.kind == "remove_credential":
             if not clear_provider_secret(op.slug):
-                return ProfileOpResult(
-                    False, "Keyring unavailable.", op.profiles, (), op.kind, op.slug
-                )
-            return ProfileOpResult(
-                True, "", op.profiles, _keyring_states(op.profiles), op.kind, op.slug
-            )
+                return _fail_result(op.kind, "Keyring unavailable.", op.slug)
+            return _ok_result(op.kind, load_settings().provider_profiles, op.slug)
         if op.kind == "save_profile":
-            if op.old_slug and op.old_slug != op.slug:
-                # Slug changes are create-new plus explicit old removal,
-                # including the old slug's Moira-owned credential.
-                if not clear_provider_secret(op.old_slug):
-                    return ProfileOpResult(
-                        False, "Keyring unavailable.", op.profiles, (), op.kind, op.slug
-                    )
-            if op.credential.strip():
-                if not set_provider_secret(op.slug, op.credential.strip()):
-                    return ProfileOpResult(
-                        False, "Keyring unavailable.", op.profiles, (), op.kind, op.slug
-                    )
-            _persist_profiles(op.profiles)
-            return ProfileOpResult(
-                True, "", op.profiles, _keyring_states(op.profiles), op.kind, op.slug
-            )
+            return _execute_save_profile(op)
         if op.kind == "remove_profile":
-            # Clears its Moira-owned Keyring secret; without a confirmed
-            # clear the removal fails closed and the profile is kept.
-            if not clear_provider_secret(op.slug):
-                return ProfileOpResult(
-                    False, "Keyring unavailable.", op.profiles, (), op.kind, op.slug
-                )
-            _persist_profiles(op.profiles)
-            return ProfileOpResult(
-                True, "", op.profiles, _keyring_states(op.profiles), op.kind, op.slug
-            )
+            return _execute_remove_profile(op)
     except Exception:
-        return ProfileOpResult(False, "Operation failed.", op.profiles, (), op.kind, op.slug)
-    return ProfileOpResult(False, "Operation failed.", op.profiles, (), op.kind, op.slug)
+        return _fail_result(op.kind, "Operation failed.", op.slug)
+    return _fail_result(op.kind, "Operation failed.", op.slug)
 
 
 def _form_error_key(exc: ValueError) -> str:
@@ -146,9 +227,14 @@ def _form_error_key(exc: ValueError) -> str:
     for fragment, key in (
         ("profile slug is reserved", "Slug is reserved."),
         ("profile slug must", "Invalid slug."),
+        ("must not contain control characters", "Invalid value."),
         ("profile label", "Label is required."),
         ("remote profiles require an https", "Remote base URLs must use https."),
         ("local profiles require a loopback", "Local base URLs must use a loopback address."),
+        (
+            "remote profiles must not use a loopback",
+            "Remote base URLs must not use a loopback address.",
+        ),
         ("must not embed credentials", "Base URL must not embed credentials, query or fragment."),
         (
             "must not contain a query or fragment",
@@ -225,7 +311,7 @@ class ProviderEditor(Gtk.Window):
         self.set_child(root)
         self._render_list()
         # Initial state: load the persisted collection and keyring states.
-        self._request_op(ProfileOp("reload", ()))
+        self._request_op(ProfileOp("reload"))
 
     # ── Bounded generation pipeline (off GTK) ──
 
@@ -242,7 +328,19 @@ class ProviderEditor(Gtk.Window):
         generation = self._generation
         self._in_flight = True
         self.status_label.set_text(_("Loading…") if op.kind == "reload" else _("Saving…"))
-        self._submit(self._run_op, op, generation)
+        try:
+            self._submit(self._run_op, op, generation)
+        except Exception:
+            # Submit rejection (e.g. a closed executor): clear the slot,
+            # show a fixed translated outcome, then accept later work.
+            # The pending op is promoted immediately (at most one level of
+            # recursion: the pending slot is emptied before promotion).
+            self._in_flight = False
+            self.status_label.set_text(_("Operation failed."))
+            pending = self._pending_op
+            self._pending_op = None
+            if pending is not None:
+                self._start_op(pending)
 
     def _run_op(self, op: ProfileOp, generation: int) -> None:
         result = _execute_op(op)
@@ -385,8 +483,8 @@ class ProviderEditor(Gtk.Window):
         profile = next((p for p in self._profiles if p.slug == slug), None)
         if profile is None:
             return False
-        updated = tuple(replace(p, enabled=state) if p.slug == slug else p for p in self._profiles)
-        self._request_op(ProfileOp("save_profile", profiles=updated, slug=slug))
+        updated = replace(profile, enabled=state)
+        self._request_op(ProfileOp("save_profile", profile=updated))
         return False
 
     def _on_edit_clicked(self, _button: Any, slug: str) -> None:
@@ -406,8 +504,7 @@ class ProviderEditor(Gtk.Window):
         self._pending_removal = None
         if self._shutdown:
             return
-        profiles = tuple(p for p in self._profiles if p.slug != slug)
-        self._request_op(ProfileOp("remove_profile", profiles=profiles, slug=slug))
+        self._request_op(ProfileOp("remove_profile", slug=slug))
 
     def _on_cancel_remove(self, _button: Any, slug: str) -> None:
         if self._pending_removal == slug:
@@ -417,7 +514,7 @@ class ProviderEditor(Gtk.Window):
     def _on_remove_credential(self, _button: Any, slug: str) -> None:
         if self._shutdown:
             return
-        self._request_op(ProfileOp("remove_credential", profiles=self._profiles, slug=slug))
+        self._request_op(ProfileOp("remove_credential", slug=slug))
 
     # ── Add/edit form ──
 
@@ -531,15 +628,13 @@ class ProviderEditor(Gtk.Window):
             self.form_error.set_text(_("Slug already in use."))
             return
         others = [p for p in self._profiles if p.slug != self._editing_slug]
-        new_profiles = tuple(sorted(others + [profile], key=lambda p: p.slug))
-        if len(new_profiles) > MAX_PROFILES:
+        if len(others) + 1 > MAX_PROFILES:
             self.form_error.set_text(_("Too many profiles."))
             return
         self.form_error.set_text("")
         op = ProfileOp(
             "save_profile",
-            profiles=new_profiles,
-            slug=profile.slug,
+            profile=profile,
             old_slug=self._editing_slug or "",
             credential=api_key,
         )

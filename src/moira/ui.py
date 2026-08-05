@@ -693,7 +693,13 @@ class MainWindow(Adw.ApplicationWindow):
     # ── Provider profiles (Edit providers) ──
 
     def _open_provider_editor(self, *_args: Any) -> None:
-        """Open the provider editor once; subsequent clicks focus it."""
+        """Open the provider editor once; subsequent clicks focus it.
+
+        The editor is transient to the main window and its lifecycle is
+        tied to it: closing the editor shuts it down (bounded: no further
+        operations, no callbacks after closure) and drops the reference,
+        so the next click opens one fresh live editor.
+        """
         editor = getattr(self, "_provider_editor", None)
         if editor is not None:
             editor.present()
@@ -702,8 +708,24 @@ class MainWindow(Adw.ApplicationWindow):
             submit=self.executor.submit,
             on_profiles_changed=self._on_profiles_persisted,
         )
+        # Transient ownership: a fully-constructed window (the real app)
+        # marks its editor as a dialog. Bare-window tests are guarded.
+        if getattr(self, "_stack", None) is not None:
+            try:
+                editor.set_transient_for(self)
+            except Exception:
+                pass
+        editor.connect("close-request", self._on_editor_close_request)
         self._provider_editor = editor
         editor.present()
+
+    def _on_editor_close_request(self, _editor: Any = None) -> bool:
+        """Editor closed: bounded shutdown and drop of the reference."""
+        editor = getattr(self, "_provider_editor", None)
+        if editor is not None:
+            editor.shutdown()
+            self._provider_editor = None
+        return False
 
     def _on_profiles_persisted(self) -> None:
         """A profile change landed on disk: refresh the in-memory settings
@@ -911,6 +933,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._activity_watcher.shutdown()
         self._integration_coordinator.shutdown()
         self._integrations_page.shutdown()
+        editor = getattr(self, "_provider_editor", None)
+        if editor is not None:
+            editor.shutdown()
         self._history_coordinator.clear_write_success_callback()
         self._history_page.shutdown()
         self._history_coordinator.shutdown()
@@ -1069,12 +1094,14 @@ class MainWindow(Adw.ApplicationWindow):
             refresh_minutes=refresh_val,
         )
         # Explicit merge: the form never edits the repository, the window
-        # geometry, or the maximized state — saving settings must preserve
-        # every non-editable field exactly as loaded.
+        # geometry, the maximized state, or the provider profiles —
+        # saving settings must preserve every non-editable field exactly
+        # as loaded (a whole-config rewrite must never wipe profiles).
         settings.repo = self.settings.repo
         settings.window_width = self.settings.window_width
         settings.window_height = self.settings.window_height
         settings.window_maximized = self.settings.window_maximized
+        settings.provider_profiles = self.settings.provider_profiles
         settings.validate()
         return settings
 

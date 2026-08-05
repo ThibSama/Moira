@@ -347,6 +347,10 @@ _FRENCH: dict[str, str] = {
     "Keyring unavailable.": "Trousseau indisponible.",
     "Operation failed.": "Échec de l'opération.",
     "Invalid profile.": "Profil invalide.",
+    "Invalid value.": "Valeur invalide.",
+    "Remote base URLs must not use a loopback address.": (
+        "Les URL de base distantes ne doivent pas utiliser une adresse de boucle locale."
+    ),
     "Slug is reserved.": "Identifiant réservé.",
     "Invalid slug.": "Identifiant invalide.",
     "Label is required.": "Le libellé est requis.",

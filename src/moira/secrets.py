@@ -18,6 +18,8 @@ import gi
 gi.require_version("Secret", "1")
 from gi.repository import Secret  # noqa: E402
 
+from .integrations import is_valid_profile_slug
+
 SCHEMA = Secret.Schema.new(
     "io.github.moira.QuotaMonitor",
     Secret.SchemaFlags.NONE,
@@ -33,8 +35,6 @@ ATTRIBUTES = {"account": "ntfy-token"}
 #: Provider-credential attribute family (isolated from the NTFY item).
 _PROVIDER_KIND_ATTRIBUTE = "provider"
 _PROVIDER_PURPOSES = ("api_key",)
-#: Bounded slug used as a Keyring attribute value.
-_MAX_ATTRIBUTE_SLUG_LENGTH = 64
 #: Bounded credential value (never persisted anywhere but the Keyring).
 _MAX_SECRET_LENGTH = 4096
 
@@ -62,21 +62,10 @@ def clear_ntfy_token() -> None:
     Secret.password_clear_sync(SCHEMA, ATTRIBUTES, None)
 
 
-def _valid_slug(slug: str) -> bool:
-    """Bounded, control-character-free slug for Keyring attributes.
-
-    The strict profile slug rule is enforced at profile creation; this
-    layer only guarantees bounded, printable attribute values.
-    """
-    return (
-        isinstance(slug, str)
-        and 0 < len(slug) <= _MAX_ATTRIBUTE_SLUG_LENGTH
-        and not any(ord(ch) < 33 or ord(ch) == 127 for ch in slug)
-    )
-
-
 def _provider_attributes(slug: str, purpose: str) -> dict[str, str] | None:
-    if not _valid_slug(slug) or purpose not in _PROVIDER_PURPOSES:
+    # The strict profile slug contract is shared with ProviderProfile:
+    # invalid or reserved slugs perform ZERO libsecret calls.
+    if not is_valid_profile_slug(slug) or purpose not in _PROVIDER_PURPOSES:
         return None
     return {"kind": _PROVIDER_KIND_ATTRIBUTE, "slug": slug, "purpose": purpose}
 

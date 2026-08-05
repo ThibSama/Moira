@@ -442,8 +442,8 @@ def test_editor_pending_op_replaced_newest_wins(
     ed = _open_editor(env)
     # An op is in flight; two rapid requests arrive: newest wins.
     ed._in_flight = True
-    first = ProfileOp("remove_credential", profiles=ed._profiles, slug="deepseek-main")
-    second = ProfileOp("remove_credential", profiles=ed._profiles, slug="deepseek-main")
+    first = ProfileOp("remove_credential", slug="deepseek-main")
+    second = ProfileOp("remove_credential", slug="deepseek-main")
     ed._request_op(first)
     assert ed._pending_op is first
     ed._request_op(second)

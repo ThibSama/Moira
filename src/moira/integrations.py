@@ -341,6 +341,22 @@ MAX_PROFILES = 50
 _PROFILE_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 
 
+def is_valid_profile_slug(slug: object) -> bool:
+    """THE strict slug contract, shared by profiles and Keyring items.
+
+    Lowercase letters/digits with dashes and underscores inside, bounded
+    to 64 characters, never one of the reserved runtime slugs
+    (``claude``/``codex``/``hermes``). ``ProviderProfile`` and the Keyring
+    layer both use this single validator, so an invalid slug can never
+    reach a libsecret attribute.
+    """
+    return (
+        isinstance(slug, str)
+        and bool(_PROFILE_SLUG_RE.fullmatch(slug))
+        and slug not in RESERVED_PROFILE_SLUGS
+    )
+
+
 def _is_loopback_host(hostname: str) -> bool:
     """True only for literal loopback hosts (localhost or loopback IPs)."""
     if hostname == "localhost":
@@ -386,6 +402,10 @@ def _validate_base_url(kind: ProviderKind, url: str) -> None:
         return
     if parts.scheme != "https":
         raise ValueError("remote profiles require an https base URL")
+    # Loopback is reserved for the local kind: a remote profile pointing
+    # at 127.0.0.1 / localhost / ::1 is refused even over https.
+    if _is_loopback_host(hostname):
+        raise ValueError("remote profiles must not use a loopback base URL")
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,22 +435,28 @@ class ProviderProfile:
                 "profile slug must start and end with a lowercase digit/letter "
                 "(letters, digits, dashes and underscores inside, at most 64)"
             )
-        if self.slug in RESERVED_PROFILE_SLUGS:
+        if not is_valid_profile_slug(self.slug):
             raise ValueError("profile slug is reserved")
         if not isinstance(self.label, str) or not self.label.strip():
             raise ValueError("profile label must be a non-empty string")
         if len(self.label) > MAX_PROFILE_LABEL_LENGTH:
             raise ValueError("profile label is too long")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in self.label):
+            raise ValueError("profile label must not contain control characters")
         if not isinstance(self.kind, ProviderKind):
             raise ValueError("profile kind must be a ProviderKind value")
         if not isinstance(self.model, str) or len(self.model) > MAX_PROFILE_MODEL_LENGTH:
             raise ValueError("profile model must be a bounded string")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in self.model):
+            raise ValueError("profile model must not contain control characters")
         if not isinstance(self.enabled, bool):
             raise ValueError("profile enabled must be a boolean")
         if not isinstance(self.base_url, str) or not isinstance(self.hermes_label, str):
             raise ValueError("profile base_url and hermes_label must be strings")
         if len(self.hermes_label) > MAX_PROFILE_HERMES_LABEL_LENGTH:
             raise ValueError("profile hermes_label is too long")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in self.hermes_label):
+            raise ValueError("profile hermes_label must not contain control characters")
         _validate_base_url(self.kind, self.base_url)
 
 
