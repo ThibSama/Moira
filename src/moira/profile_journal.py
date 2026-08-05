@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -61,6 +62,9 @@ class JournalPhase(StrEnum):
 
 
 _VALID_PHASES = tuple(JournalPhase)
+_JOURNAL_KEYS = frozenset(
+    {"version", "op", "phase", "profile", "old_slug", "slug", "secret_slug", "had_backup"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,19 +122,28 @@ def write_journal(entry: JournalEntry) -> None:
     temporary.replace(path)
 
 
-def clear_journal() -> None:
-    """Remove the journal (the transaction is converged)."""
+def clear_journal() -> bool:
+    """Remove the journal; True when it is gone.
+
+    A failed removal returns False — the journal REMAINS and callers must
+    never report success while it does (recovery retries idempotently).
+    """
     try:
         journal_path().unlink(missing_ok=True)
+        return True
     except OSError:
-        pass
+        return False
 
 
 def read_journal() -> JournalEntry | None:
     """Read and strictly validate the journal; None when absent.
 
     Raises ValueError for a corrupt or unsupported journal (fail closed:
-    recovery must not guess).
+    recovery must not guess). Validation is exact: the key set, the
+    non-bool integer version, the op/phase pair and the phase-specific
+    invariants (a save carries a profile and a non-empty ``secret_slug``
+    at ``staged-secret``; a removal never carries a profile or secret
+    fields). Valid Package 7f journals continue to parse.
     """
     path = journal_path()
     if not path.exists():
@@ -141,7 +154,10 @@ def read_journal() -> JournalEntry | None:
         raise ValueError("journal is not readable JSON") from exc
     if not isinstance(data, dict):
         raise ValueError("journal must be an object")
-    if data.get("version") != JOURNAL_VERSION:
+    if not set(data) <= _JOURNAL_KEYS:
+        raise ValueError("unknown journal keys")
+    version = data.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version != JOURNAL_VERSION:
         raise ValueError("unsupported journal version")
     op = data.get("op")
     phase = data.get("phase")
@@ -159,6 +175,8 @@ def read_journal() -> JournalEntry | None:
     if op == "remove_profile":
         if not is_valid_profile_slug(slug):
             raise ValueError("invalid journal slug")
+        if data.get("profile") is not None or old_slug or secret_slug:
+            raise ValueError("remove journal must not carry profile or secret fields")
         return JournalEntry(JOURNAL_VERSION, op, phase, None, "", slug, "", data["had_backup"])
     raw = data.get("profile")
     if not isinstance(raw, dict):
@@ -175,6 +193,10 @@ def read_journal() -> JournalEntry | None:
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("invalid journal profile") from exc
+    if slug and (not is_valid_profile_slug(slug) or slug != profile.slug):
+        raise ValueError("invalid journal slug")
+    if phase == JournalPhase.STAGED_SECRET and not is_valid_profile_slug(secret_slug):
+        raise ValueError("staged-secret journal requires a secret slug")
     return JournalEntry(
         JOURNAL_VERSION, op, phase, profile, old_slug, "", secret_slug, data["had_backup"]
     )
@@ -257,6 +279,12 @@ def _complete_remove(entry: JournalEntry) -> bool:
     return erase_provider_secret(entry.slug) is KeyringMutation.DONE
 
 
+#: Serializes concurrent recoveries (startup bootstrap + editor reloads):
+#: journal read/converge/clear is atomic across threads. Recovery steps
+#: are idempotent, so a loser simply converges the already-converged state.
+_RECOVERY_LOCK = threading.Lock()
+
+
 def _recover_save(entry: JournalEntry) -> bool:
     phase = entry.phase
     if phase == JournalPhase.STAGED:
@@ -265,28 +293,23 @@ def _recover_save(entry: JournalEntry) -> bool:
         if entry.had_backup and entry.secret_slug:
             if erase_provider_secret(entry.secret_slug, BACKUP_PURPOSE) is not KeyringMutation.DONE:
                 return False
-        clear_journal()
-        return True
+        return clear_journal()
     if phase == JournalPhase.STAGED_SECRET:
         if not _rollback_staged_secret(entry):
             return False
-        clear_journal()
-        return True
+        return clear_journal()
     # CONFIG_COMMITTED: complete forward.
     if not _complete_forward(entry):
         return False
-    clear_journal()
-    return True
+    return clear_journal()
 
 
 def _recover_remove(entry: JournalEntry) -> bool:
     if entry.phase == JournalPhase.STAGED:
-        clear_journal()
-        return True
+        return clear_journal()
     if not _complete_remove(entry):
         return False
-    clear_journal()
-    return True
+    return clear_journal()
 
 
 def recover_pending_transaction() -> bool:
@@ -295,16 +318,17 @@ def recover_pending_transaction() -> bool:
     On failure the journal is KEPT and the caller must surface the
     translated ``Recovery required.`` outcome and retry on the next
     reload. Idempotent: replaying recovery from any phase converges to
-    the same documented state.
+    the same documented state. Serialized across threads.
     """
-    try:
-        entry = read_journal()
-    except ValueError:
-        return False  # corrupt journal: kept for retry
-    if entry is None:
-        return True
-    if entry.op == "save_profile":
-        return _recover_save(entry)
-    if entry.op == "remove_profile":
-        return _recover_remove(entry)
-    return False
+    with _RECOVERY_LOCK:
+        try:
+            entry = read_journal()
+        except ValueError:
+            return False  # corrupt journal: kept for retry
+        if entry is None:
+            return True
+        if entry.op == "save_profile":
+            return _recover_save(entry)
+        if entry.op == "remove_profile":
+            return _recover_remove(entry)
+        return False

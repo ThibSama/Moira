@@ -43,6 +43,7 @@ from .secrets import (
     BACKUP_PURPOSE,
     KeyringLookup,
     KeyringMutation,
+    ProviderSecret,
     erase_provider_secret,
     has_provider_secret,
     inspect_provider_secret,
@@ -176,12 +177,25 @@ def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
 
     secret_slug = profile.slug if value else ""
     had_backup = False
-    target_inspection: Any = None
+    target_inspection: ProviderSecret | None = None
     if value:
+        # Strict target mapping: FOUND → durable backup before overwrite;
+        # ABSENT → no backup; UNAVAILABLE/invalid → fail BEFORE any
+        # journal or mutation (an unknown credential is never overwritten
+        # without a backup).
         target_inspection = inspect_provider_secret(profile.slug)
-        had_backup = (
-            target_inspection is not None and target_inspection.state is KeyringLookup.FOUND
-        )
+        if target_inspection is None or target_inspection.state is KeyringLookup.UNAVAILABLE:
+            return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
+        had_backup = target_inspection.state is KeyringLookup.FOUND
+
+    rollback_entry = _journal_entry(
+        op,
+        JournalPhase.STAGED_SECRET,
+        profile=profile,
+        old_slug=op.old_slug,
+        secret_slug=secret_slug,
+        had_backup=had_backup,
+    )
 
     try:
         write_journal(
@@ -216,7 +230,7 @@ def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
                 )
             )
             if store_provider_secret(profile.slug, value) is not KeyringMutation.DONE:
-                _rollback_and_clear(profile.slug, had_backup)
+                _rollback_staged(rollback_entry)
                 return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
         write_journal(
             _journal_entry(
@@ -232,22 +246,38 @@ def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
         try:
             _persist_profiles(new_collection)
         except Exception:
-            _rollback_and_clear(profile.slug, had_backup)
+            # Known config failure: durably transition to the ROLLBACK
+            # phase BEFORE touching any secret. With no secret staged the
+            # transaction performed zero Keyring side effects — nothing
+            # to undo, the target credential is preserved exactly.
+            if secret_slug:
+                write_journal(rollback_entry)
+                _rollback_staged(rollback_entry)
+            else:
+                clear_journal()
             return _fail_result(op.kind, "Operation failed.", profile.slug)
         if rename:
             if erase_provider_secret(op.old_slug) is not KeyringMutation.DONE:
-                # Roll the config back first; only clean secrets once the
-                # config rollback is durable. If even that fails, keep the
-                # journal at config-committed: forward recovery converges.
+                # Restore the config FIRST; only transition to the
+                # rollback phase once that restoration is durable.
                 try:
                     _persist_profiles(current)
                 except Exception:
+                    # Config restoration failed: retain forward recovery
+                    # (the journal stays at CONFIG_COMMITTED).
                     return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
-                _rollback_and_clear(profile.slug, had_backup)
+                if secret_slug:
+                    write_journal(rollback_entry)
+                    _rollback_staged(rollback_entry)
+                else:
+                    clear_journal()
                 return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
         if had_backup:
             erase_provider_secret(profile.slug, BACKUP_PURPOSE)  # best-effort after commit
-        clear_journal()
+        if not clear_journal():
+            # A required journal remains: never report success. Recovery
+            # completes the committed state forward and clears it later.
+            return _fail_result(op.kind, "Operation failed.", profile.slug)
         return _ok_result(op.kind, new_collection, profile.slug)
     except Exception:
         # Unexpected failure: keep the journal — recovery converges to a
@@ -255,16 +285,14 @@ def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
         return _fail_result(op.kind, "Operation failed.", profile.slug)
 
 
-def _rollback_and_clear(target: str, had_backup: bool) -> None:
-    """Durable rollback of the staged-secret effect (shared semantics
-    with journal recovery): clear the staged value, restore the backup,
-    drop the backup, then clear the journal. If any step fails the
-    journal is kept for recovery."""
+def _rollback_staged(entry: JournalEntry) -> None:
+    """Roll the staged-secret effect back (shared semantics with journal
+    recovery): clear the staged value at the journaled ``secret_slug``,
+    restore the backup, drop the backup. The journal is cleared only when
+    the rollback is durable — otherwise it stays at the rollback phase
+    and recovery retries it idempotently."""
     from .profile_journal import _rollback_staged_secret
 
-    entry = JournalEntry(
-        1, "save_profile", JournalPhase.STAGED_SECRET, None, "", "", target, had_backup
-    )
     if _rollback_staged_secret(entry):
         clear_journal()
 
@@ -297,7 +325,10 @@ def _execute_remove_profile(op: ProfileOp) -> ProfileOpResult:
                 return _fail_result(op.kind, "Keyring unavailable.", op.slug)
             clear_journal()
             return _fail_result(op.kind, "Keyring unavailable.", op.slug)
-        clear_journal()
+        if not clear_journal():
+            # A required journal remains: never report success. Recovery
+            # completes the removal forward and clears it later.
+            return _fail_result(op.kind, "Operation failed.", op.slug)
         return _ok_result(op.kind, new_collection, op.slug)
     except Exception:
         return _fail_result(op.kind, "Operation failed.", op.slug)

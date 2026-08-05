@@ -333,11 +333,6 @@ class MainWindow(Adw.ApplicationWindow):
         super().__init__(
             application=application, title=_("Moira"), default_width=620, default_height=680
         )
-        # Best-effort convergence of any crashed profile transaction
-        # before the persisted state is loaded. On failure the journal is
-        # kept and the provider editor retries recovery on its next
-        # reload (surfacing the translated "Recovery required." outcome).
-        recover_pending_transaction()
         self.settings = load_settings()
         self.state = load_state()
         self.executor = concurrent.futures.ThreadPoolExecutor(
@@ -377,6 +372,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._restore_geometry()
         self._build()
         self._render()
+        # Startup recovery of any crashed profile transaction runs off the
+        # GTK thread (bounded bootstrap on the executor). Mutation
+        # controls stay disabled until it lands; on failure the journal
+        # is kept and retried on the next app start / editor reload — no
+        # raw error, path, URL, JSON or secret reaches the UI.
+        self._closed = False
+        self._save_settings_button.set_sensitive(False)
+        self.executor.submit(self._startup_recovery)
         if not smoke_test:
             GLib.idle_add(self.refresh)
             self._arm_refresh_timer()
@@ -552,6 +555,7 @@ class MainWindow(Adw.ApplicationWindow):
         save = Gtk.Button(label=_("Save settings"))
         save.add_css_class("suggested-action")
         save.connect("clicked", self._save_settings)
+        self._save_settings_button = save
         test = Gtk.Button(label=_("Send test notification"))
         test.connect("clicked", self._test_notification)
         test_native = Gtk.Button(label=_("Send native test notification"))
@@ -931,6 +935,25 @@ class MainWindow(Adw.ApplicationWindow):
         combined.extend(self.pending_availability)
         self._history_coordinator.enqueue(combined, now)
 
+    def _startup_recovery(self) -> None:
+        """Off-GTK bootstrap: converge any crashed profile transaction.
+        Runs on the executor; the outcome is published through the idle
+        loop with a closure guard."""
+        recovered = recover_pending_transaction()
+        GLib.idle_add(self._finish_startup_recovery, recovered)
+
+    def _finish_startup_recovery(self, recovered: bool) -> None:
+        if getattr(self, "_closed", False):
+            return
+        if recovered:
+            self.settings = load_settings()
+            self._render()
+            self._save_settings_button.set_sensitive(True)
+        else:
+            # Journal kept: retried on the next app start / editor
+            # reload. Sanitized translated outcome only.
+            self.settings_status.set_text(_("Recovery required."))
+
     def _on_close_request(self, *_args: Any) -> bool:
         """Persist geometry, then stop the history worker cleanly on close.
 
@@ -939,6 +962,7 @@ class MainWindow(Adw.ApplicationWindow):
         timeout and never publishes after shutdown. The integrations page
         stops routing refreshes.
         """
+        self._closed = True
         self._persist_geometry()
         self._activity_watcher.shutdown()
         self._integration_coordinator.shutdown()

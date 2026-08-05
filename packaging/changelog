@@ -34,8 +34,9 @@ moira (0.3.0) unstable; urgency=medium
     managing local profiles (config v4) with per-profile Keyring
     credentials (local only, HTTPS for remote base URLs, blank input
     preserves, removal confirmed, recoverable writes through a durable
-    journal with idempotent recovery and no credential loss, and other
-    settings saves never wiping profiles); Hermes writes, connection
-    tests, DeepSeek balance and financial units remain deferred.
+    journal with idempotent recovery at startup and on reload, strict
+    target lookups and no credential loss, and other settings saves
+    never wiping profiles); Hermes writes, connection tests, DeepSeek
+    balance and financial units remain deferred.
 
  -- Thibault Paul <xpaul.thibault@gmail.com>  Wed, 05 Aug 2026 11:00:00 +0200

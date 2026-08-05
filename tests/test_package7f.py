@@ -177,7 +177,13 @@ def _journal_path(env: tuple[Path, _FakeSecret]) -> Path:
 def test_failed_compensation_restore_is_not_swallowed(env: tuple[Path, _FakeSecret]) -> None:
     """An edit whose config persist fails AND whose compensation restore
     also fails must not silently leave the NEW credential in the Keyring
-    (config and Keyring divergent)."""
+    (config and Keyring divergent).
+
+    Call order: the first store is the BACKUP, the second is the target
+    store, so the third (the restore of the overwritten credential) is
+    the call that must fail. The rollback journal is kept and a recovery
+    retry converges to the pre-op credential.
+    """
     _seed(env, _profile("deepseek-main"))
     env[1].items[("deepseek-main", "api_key")] = "sk-old"
     op = ProfileOp(
@@ -185,12 +191,16 @@ def test_failed_compensation_restore_is_not_swallowed(env: tuple[Path, _FakeSecr
         profile=_profile("deepseek-main", label="Renamed"),
         credential="sk-new",
     )
-    env[1].fail_on_call["store"] = 2  # first store (sk-new) ok; the restore fails
+    env[1].fail_on_call["store"] = 3  # backup=1, target store=2, restore=3 fails
+    from moira.profile_journal import recover_pending_transaction
+
     with patch("moira.persistence.save_settings", side_effect=OSError("disk full")):
         result = _execute_op(op)
     assert result.ok is False
+    assert recover_pending_transaction() is True
     # The pre-op credential must be back (never a divergent sk-new).
     assert env[1].items[("deepseek-main", "api_key")] == "sk-old"
+    assert _journal_path(env).exists() is False
 
 
 # ── Finding 2: unavailable lookup is never absence (no credential loss) ──────
