@@ -118,6 +118,18 @@ def artifacts(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     return _build_artifacts(output)
 
 
+@pytest.fixture(scope="module")
+def installed_root(artifacts: dict[str, Path], tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The .deb unpacked into a fresh directory, mirroring a dpkg install."""
+    root = tmp_path_factory.mktemp("installed-root")
+    subprocess.run(
+        ["dpkg-deb", "-x", str(artifacts["deb"]), str(root)],
+        check=True,
+        capture_output=True,
+    )
+    return root
+
+
 def test_contract_version_is_supported_release() -> None:
     assert VERSION == "0.3.0"
 
@@ -312,7 +324,7 @@ def test_deb_policy_description_covers_features_without_overclaiming(
     assert "Independent Codex CLI sessions are never observed" in control
 
 
-def test_deb_policy_docs_and_manpages(artifacts: dict[str, Path]) -> None:
+def test_deb_policy_docs_and_manpages(installed_root: Path, artifacts: dict[str, Path]) -> None:
     """Policy docs and man pages are installed with 0644 modes; the
     changelog is a readable, timestamp-free gzip (MTIME 0 in the header)."""
     entries = _deb_entries(artifacts["deb"])
@@ -326,36 +338,128 @@ def test_deb_policy_docs_and_manpages(artifacts: dict[str, Path]) -> None:
         assert path in entries, path
         assert entries[path][0] == "-rw-r--r--", (path, entries[path])
 
-    extracted = Path(
-        subprocess.run(["mktemp", "-d"], check=True, capture_output=True, text=True).stdout.strip()
-    )
-    try:
-        subprocess.run(
-            ["dpkg-deb", "-x", str(artifacts["deb"]), str(extracted)],
+    changelog = installed_root / "usr/share/doc/moira/changelog.gz"
+    header = changelog.read_bytes()[:8]
+    assert header == b"\x1f\x8b\x08\x00\x00\x00\x00\x00", header.hex()
+    text = subprocess.run(
+        ["zcat", str(changelog)], check=True, capture_output=True, text=True
+    ).stdout
+    assert "moira (0.3.0) unstable; urgency=medium" in text
+    for man in (
+        "moira.1.gz",
+        "moira-claude-statusline.1.gz",
+        "moira-agent-hook.1.gz",
+    ):
+        man_text = subprocess.run(
+            ["zcat", str(installed_root / "usr/share/man/man1" / man)],
             check=True,
             capture_output=True,
-        )
-        changelog = extracted / "usr/share/doc/moira/changelog.gz"
-        header = changelog.read_bytes()[:8]
-        assert header == b"\x1f\x8b\x08\x00\x00\x00\x00\x00", header.hex()
-        text = subprocess.run(
-            ["zcat", str(changelog)], check=True, capture_output=True, text=True
+            text=True,
         ).stdout
-        assert "moira (0.3.0) unstable; urgency=medium" in text
-        for man in (
-            "moira.1.gz",
-            "moira-claude-statusline.1.gz",
-            "moira-agent-hook.1.gz",
-        ):
-            man_text = subprocess.run(
-                ["zcat", str(extracted / "usr/share/man/man1" / man)],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-            assert ".TH " in man_text and ".SH NAME" in man_text
-    finally:
-        subprocess.run(["rm", "-rf", str(extracted)], check=False)
+        assert ".TH " in man_text and ".SH NAME" in man_text
+
+
+def test_deb_policy_changelog_package_mapping(installed_root: Path) -> None:
+    """Package 6f — the installed changelog maps the six 0.3.0 packages to
+    their accepted scopes, in order: local History foundation, History UI,
+    exact Codex token activity, exact statistics/indicators, complementary
+    UX, release integration. Quota collection is never attributed to the
+    wrong package, and Package 6 states that publication stays deferred."""
+    changelog = subprocess.run(
+        ["zcat", str(installed_root / "usr/share/doc/moira/changelog.gz")],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "moira (0.3.0) unstable; urgency=medium" in changelog
+
+    lines = changelog.splitlines()
+    starts = [i for i, line in enumerate(lines) if re.match(r"^\s+\* Package \d+:", line)]
+    assert len(starts) == 6, "expected exactly six package bullets"
+    scopes: dict[int, str] = {}
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        bullet = re.match(r"^\s+\* Package (\d+):", lines[start])
+        assert bullet is not None
+        joined = re.sub(r"\s+", " ", " ".join(lines[start:end]))
+        scopes[int(bullet.group(1))] = joined.strip()
+    assert list(scopes) == [1, 2, 3, 4, 5, 6]
+
+    # Package 1 — local History foundation and privacy-safe persistence.
+    assert "History foundation" in scopes[1]
+    assert "privacy" in scopes[1]
+    assert "status-line" not in scopes[1] and "Claude" not in scopes[1]
+
+    # Package 2 — History interface, 24h/7d/30d/90d visualization/filtering.
+    for span in ("24h", "7d", "30d", "90d"):
+        assert span in scopes[2], span
+    assert "Codex" not in scopes[2]
+
+    # Package 3 — official exact Codex account usage, daily totals/summary
+    # and availability semantics; Claude percentage-only, no estimates.
+    for keyword in ("official", "Codex", "availability", "percentage-only", "estimates"):
+        assert keyword in scopes[3], keyword
+    assert "History" not in scopes[3] and "24h" not in scopes[3]
+
+    # Package 4 — exact statistics/activity indicators and capability-aware
+    # rendering, not provider toggles.
+    for keyword in ("statistics", "activity indicators", "capability-aware"):
+        assert keyword in scopes[4], keyword
+    assert "toggles" not in scopes[4] and "notification" not in scopes[4]
+
+    # Package 5 — complementary UX: provider toggles/rules, native+NTFY
+    # notifications, diagnostics/copy, export, deletion, update checks,
+    # compact mode and persisted settings.
+    for keyword in (
+        "toggles",
+        "NTFY",
+        "diagnostics",
+        "export",
+        "deletion",
+        "update checks",
+        "compact mode",
+        "settings",
+    ):
+        assert keyword in scopes[5], keyword
+    assert "localization" not in scopes[5]
+
+    # Package 6 — 0.3.0 integration, artifact hygiene, agent activity,
+    # multi-turn correction and Debian compliance; publication deferred.
+    for keyword in ("0.3.0", "artifact hygiene", "activity", "multi-turn", "Debian", "deferred"):
+        assert keyword in scopes[6], keyword
+
+
+def test_deb_policy_manpages_exact_production_paths(installed_root: Path) -> None:
+    """Package 6f — every file path documented in the installed man pages
+    matches the exact location production helpers use: config and Claude
+    integration metadata under $XDG_CONFIG_HOME/moira, state, History,
+    activity and rate-limit stores under $XDG_STATE_HOME/moira."""
+    man_dir = installed_root / "usr/share/man/man1"
+    expectations: dict[str, tuple[str, ...]] = {
+        "moira.1.gz": (
+            "$XDG_CONFIG_HOME/moira/config.json",
+            "$XDG_STATE_HOME/moira/state.json",
+            "$XDG_STATE_HOME/moira/history.sqlite3",
+            "$XDG_STATE_HOME/moira/activity.json",
+        ),
+        "moira-claude-statusline.1.gz": (
+            "$XDG_STATE_HOME/moira/claude-rate-limits.json",
+            "$XDG_CONFIG_HOME/moira/claude-integration.json",
+        ),
+        "moira-agent-hook.1.gz": ("$XDG_STATE_HOME/moira/activity.json",),
+    }
+    for page, paths in expectations.items():
+        text = subprocess.run(
+            ["zcat", str(man_dir / page)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        for path in paths:
+            assert path in text, f"{page} must document {path}"
+        # The Claude integration metadata must never be documented under
+        # the state root: production stores it under the config root.
+        assert "$XDG_STATE_HOME/moira/claude-integration.json" not in text, page
 
 
 def test_deb_build_is_reproducible(tmp_path: Path) -> None:

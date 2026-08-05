@@ -28,9 +28,10 @@ and standard error pass through unchanged.
 Minimal sanitized cache of the structured rate-limit data (normally
 .IR ~/.local/state/moira/claude-rate-limits.json ).
 .TP
-.I $XDG_STATE_HOME/moira/claude-integration.json
+.I $XDG_CONFIG_HOME/moira/claude-integration.json
 Moira-owned integration metadata, including the preserved original
-status-line command.
+status-line command (normally
+.IR ~/.config/moira/claude-integration.json ).
 .SH EXIT STATUS
 Returns the delegate command's exit status when one is configured, and
 0 otherwise.
