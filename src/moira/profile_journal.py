@@ -139,11 +139,16 @@ def read_journal() -> JournalEntry | None:
     """Read and strictly validate the journal; None when absent.
 
     Raises ValueError for a corrupt or unsupported journal (fail closed:
-    recovery must not guess). Validation is exact: the key set, the
-    non-bool integer version, the op/phase pair and the phase-specific
-    invariants (a save carries a profile and a non-empty ``secret_slug``
-    at ``staged-secret``; a removal never carries a profile or secret
-    fields). Valid Package 7f journals continue to parse.
+    recovery must not guess). Validation is EXACT: the key set must equal
+    ``_JOURNAL_KEYS`` (no missing, no additional fields), every field is
+    type-checked before any default (slugs are strings, ``had_backup`` is
+    a real bool, the version is a non-bool integer), and the
+    phase-specific invariants hold (a save carries a profile; ``old_slug``
+    never equals the profile slug; a non-empty ``secret_slug`` always
+    matches the profile slug; a backup implies a staged secret;
+    ``staged-secret`` requires a non-empty secret slug; a removal never
+    carries a profile, secret or backup field). Valid Package 7f/7g
+    journals continue to parse.
     """
     path = journal_path()
     if not path.exists():
@@ -154,8 +159,8 @@ def read_journal() -> JournalEntry | None:
         raise ValueError("journal is not readable JSON") from exc
     if not isinstance(data, dict):
         raise ValueError("journal must be an object")
-    if not set(data) <= _JOURNAL_KEYS:
-        raise ValueError("unknown journal keys")
+    if set(data) != _JOURNAL_KEYS:
+        raise ValueError("journal key set must be exact")
     version = data.get("version")
     if not isinstance(version, int) or isinstance(version, bool) or version != JOURNAL_VERSION:
         raise ValueError("unsupported journal version")
@@ -164,21 +169,25 @@ def read_journal() -> JournalEntry | None:
     if op not in ("save_profile", "remove_profile") or phase not in _VALID_PHASES:
         raise ValueError("invalid journal op or phase")
     assert op is not None and phase is not None
-    if not isinstance(data.get("had_backup"), bool):
+    for name in ("old_slug", "slug", "secret_slug"):
+        if not isinstance(data[name], str):
+            raise ValueError(f"invalid journal {name} type")
+    had_backup = data["had_backup"]
+    if not isinstance(had_backup, bool):
         raise ValueError("invalid journal had_backup")
-    old_slug = data.get("old_slug") or ""
-    slug = data.get("slug") or ""
-    secret_slug = data.get("secret_slug") or ""
+    old_slug = data["old_slug"]
+    slug = data["slug"]
+    secret_slug = data["secret_slug"]
     for name, value in (("old_slug", old_slug), ("slug", slug), ("secret_slug", secret_slug)):
         if value and not is_valid_profile_slug(value):
             raise ValueError(f"invalid journal {name}")
     if op == "remove_profile":
         if not is_valid_profile_slug(slug):
             raise ValueError("invalid journal slug")
-        if data.get("profile") is not None or old_slug or secret_slug:
-            raise ValueError("remove journal must not carry profile or secret fields")
-        return JournalEntry(JOURNAL_VERSION, op, phase, None, "", slug, "", data["had_backup"])
-    raw = data.get("profile")
+        if data["profile"] is not None or old_slug or secret_slug or had_backup:
+            raise ValueError("remove journal must not carry profile, secret or backup fields")
+        return JournalEntry(JOURNAL_VERSION, op, phase, None, "", slug, "", had_backup)
+    raw = data["profile"]
     if not isinstance(raw, dict):
         raise ValueError("invalid journal profile")
     try:
@@ -195,11 +204,15 @@ def read_journal() -> JournalEntry | None:
         raise ValueError("invalid journal profile") from exc
     if slug and (not is_valid_profile_slug(slug) or slug != profile.slug):
         raise ValueError("invalid journal slug")
+    if old_slug == profile.slug:
+        raise ValueError("journal old_slug equals profile slug")
+    if secret_slug and secret_slug != profile.slug:
+        raise ValueError("journal secret_slug does not match profile slug")
+    if had_backup and not secret_slug:
+        raise ValueError("journal backup requires a staged secret")
     if phase == JournalPhase.STAGED_SECRET and not is_valid_profile_slug(secret_slug):
         raise ValueError("staged-secret journal requires a secret slug")
-    return JournalEntry(
-        JOURNAL_VERSION, op, phase, profile, old_slug, "", secret_slug, data["had_backup"]
-    )
+    return JournalEntry(JOURNAL_VERSION, op, phase, profile, old_slug, "", secret_slug, had_backup)
 
 
 # ── Recovery helpers (shared with the op failure paths) ──────────────────────

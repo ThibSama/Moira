@@ -248,18 +248,30 @@ def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
         except Exception:
             # Known config failure: durably transition to the ROLLBACK
             # phase BEFORE touching any secret. With no secret staged the
-            # transaction performed zero Keyring side effects — nothing
-            # to undo, the target credential is preserved exactly.
+            # transaction performed zero Keyring side effects — durably
+            # select the no-op (pre-effect) phase first, so a failed
+            # cleanup can never leave a forward journal that would
+            # complete the already-failed op.
             if secret_slug:
                 write_journal(rollback_entry)
                 _rollback_staged(rollback_entry)
             else:
+                write_journal(
+                    _journal_entry(
+                        op,
+                        JournalPhase.STAGED,
+                        profile=profile,
+                        old_slug=op.old_slug,
+                        secret_slug="",
+                        had_backup=False,
+                    )
+                )
                 clear_journal()
             return _fail_result(op.kind, "Operation failed.", profile.slug)
         if rename:
             if erase_provider_secret(op.old_slug) is not KeyringMutation.DONE:
                 # Restore the config FIRST; only transition to the
-                # rollback phase once that restoration is durable.
+                # rollback/no-op phase once that restoration is durable.
                 try:
                     _persist_profiles(current)
                 except Exception:
@@ -270,10 +282,25 @@ def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
                     write_journal(rollback_entry)
                     _rollback_staged(rollback_entry)
                 else:
+                    write_journal(
+                        _journal_entry(
+                            op,
+                            JournalPhase.STAGED,
+                            profile=profile,
+                            old_slug=op.old_slug,
+                            secret_slug="",
+                            had_backup=False,
+                        )
+                    )
                     clear_journal()
                 return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
         if had_backup:
-            erase_provider_secret(profile.slug, BACKUP_PURPOSE)  # best-effort after commit
+            # Mandatory backup cleanup: a Moira backup remaining after a
+            # committed overwrite is never reported as success. Keep the
+            # forward journal and return a sanitized failure; idempotent
+            # recovery removes the backup before clearing the journal.
+            if erase_provider_secret(profile.slug, BACKUP_PURPOSE) is not KeyringMutation.DONE:
+                return _fail_result(op.kind, "Operation failed.", profile.slug)
         if not clear_journal():
             # A required journal remains: never report success. Recovery
             # completes the committed state forward and clears it later.
@@ -314,7 +341,11 @@ def _execute_remove_profile(op: ProfileOp) -> ProfileOpResult:
         try:
             _persist_profiles(new_collection)
         except Exception:
-            clear_journal()  # config unchanged; nothing else happened
+            # Config unchanged: durably select the no-op (pre-effect)
+            # phase BEFORE cleanup, so a failed cleanup can never leave a
+            # forward journal that would complete the failed removal.
+            write_journal(_journal_entry(op, JournalPhase.STAGED))
+            clear_journal()
             return _fail_result(op.kind, "Operation failed.", op.slug)
         if erase_provider_secret(op.slug) is not KeyringMutation.DONE:
             try:
@@ -323,6 +354,9 @@ def _execute_remove_profile(op: ProfileOp) -> ProfileOpResult:
                 # Rollback persist failed: keep the journal at
                 # config-committed — forward recovery completes the removal.
                 return _fail_result(op.kind, "Keyring unavailable.", op.slug)
+            # Config restoration durable: durably select the no-op phase
+            # before cleanup (the credential was never cleared).
+            write_journal(_journal_entry(op, JournalPhase.STAGED))
             clear_journal()
             return _fail_result(op.kind, "Keyring unavailable.", op.slug)
         if not clear_journal():
@@ -508,7 +542,10 @@ class ProviderEditor(Gtk.Window):
         else:
             self._recovery_blocked = result.reason == "Recovery required."
             self.status_label.set_text(_(result.reason))
-        if pending is not None:
+        if pending is not None and not self._recovery_blocked:
+            # A failed reload recovery admits NO pending mutation: the
+            # parked work is discarded (the persisted state is unknown);
+            # only a later successful explicit reload re-enables mutations.
             self._start_op(pending)
         return False
 

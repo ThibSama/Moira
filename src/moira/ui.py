@@ -373,13 +373,27 @@ class MainWindow(Adw.ApplicationWindow):
         self._build()
         self._render()
         # Startup recovery of any crashed profile transaction runs off the
-        # GTK thread (bounded bootstrap on the executor). Mutation
-        # controls stay disabled until it lands; on failure the journal
-        # is kept and retried on the next app start / editor reload — no
-        # raw error, path, URL, JSON or secret reaches the UI.
+        # GTK thread on a DEDICATED single-worker bootstrap executor —
+        # bounded, single-use, generation-guarded — so it can never
+        # occupy the shared collector executor or starve refresh/probes.
+        # Every config/profile mutation control stays disabled until the
+        # bootstrap succeeds or fails closed; a worker failure maps to a
+        # sanitized failure; no raw error, path, URL, JSON or secret
+        # reaches the UI. Retried on the next app start / editor reload.
         self._closed = False
+        self._recovery_generation = 0
+        self._bootstrap_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="moira-bootstrap"
+        )
         self._save_settings_button.set_sensitive(False)
-        self.executor.submit(self._startup_recovery)
+        self._integrations_page.edit_providers_button.set_sensitive(False)
+        try:
+            self._recovery_generation += 1
+            self._bootstrap_executor.submit(self._startup_recovery)
+        except Exception:
+            # Bootstrap could not be submitted: fail closed — mutation
+            # controls stay disabled (recovery retries on the next start).
+            pass
         if not smoke_test:
             GLib.idle_add(self.refresh)
             self._arm_refresh_timer()
@@ -936,22 +950,33 @@ class MainWindow(Adw.ApplicationWindow):
         self._history_coordinator.enqueue(combined, now)
 
     def _startup_recovery(self) -> None:
-        """Off-GTK bootstrap: converge any crashed profile transaction.
-        Runs on the executor; the outcome is published through the idle
-        loop with a closure guard."""
-        recovered = recover_pending_transaction()
-        GLib.idle_add(self._finish_startup_recovery, recovered)
+        """Off-GTK, single-use bootstrap on the dedicated worker: converge
+        any crashed profile transaction. Every worker failure maps to a
+        sanitized failure; the outcome (and the post-recovery settings,
+        loaded on this worker — never in a GTK callback) is published
+        through the idle loop with generation and closure guards."""
+        try:
+            recovered = recover_pending_transaction()
+            settings = load_settings() if recovered else None
+        except Exception:
+            recovered = False
+            settings = None
+        GLib.idle_add(self._finish_startup_recovery, recovered, settings, self._recovery_generation)
 
-    def _finish_startup_recovery(self, recovered: bool) -> None:
-        if getattr(self, "_closed", False):
-            return
-        if recovered:
-            self.settings = load_settings()
+    def _finish_startup_recovery(
+        self, recovered: bool, settings: Settings | None, generation: int
+    ) -> None:
+        if self._closed or generation != self._recovery_generation:
+            return  # late publication after close is rejected
+        if recovered and settings is not None:
+            self.settings = settings
             self._render()
             self._save_settings_button.set_sensitive(True)
+            self._integrations_page.edit_providers_button.set_sensitive(True)
         else:
-            # Journal kept: retried on the next app start / editor
-            # reload. Sanitized translated outcome only.
+            # Journal kept (or bootstrap failed): controls stay disabled,
+            # retried on the next app start / editor reload. Sanitized
+            # translated outcome only.
             self.settings_status.set_text(_("Recovery required."))
 
     def _on_close_request(self, *_args: Any) -> bool:
@@ -960,9 +985,14 @@ class MainWindow(Adw.ApplicationWindow):
         The coordinator shutdown is bounded (idempotent, no joins): the
         in-flight inventory probe self-bounds through its subprocess
         timeout and never publishes after shutdown. The integrations page
-        stops routing refreshes.
+        stops routing refreshes. The bootstrap executor is shut down
+        without joining (single-use; its daemon worker dies with the
+        process and its completion is rejected by the closure guard).
         """
         self._closed = True
+        bootstrap = getattr(self, "_bootstrap_executor", None)
+        if bootstrap is not None:
+            bootstrap.shutdown(wait=False, cancel_futures=True)
         self._persist_geometry()
         self._activity_watcher.shutdown()
         self._integration_coordinator.shutdown()
