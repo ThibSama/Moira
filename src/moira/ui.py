@@ -28,6 +28,7 @@ import concurrent.futures
 import functools
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -88,9 +89,10 @@ from .persistence import (
     Settings,
     load_settings,
     load_state,
-    save_settings,
     save_state,
+    update_settings,
 )
+from .profile_journal import recover_pending_transaction
 from .provider_editor import ProviderEditor
 from .secrets import get_ntfy_token, set_ntfy_token
 from .updates import (
@@ -331,6 +333,11 @@ class MainWindow(Adw.ApplicationWindow):
         super().__init__(
             application=application, title=_("Moira"), default_width=620, default_height=680
         )
+        # Best-effort convergence of any crashed profile transaction
+        # before the persisted state is loaded. On failure the journal is
+        # kept and the provider editor retries recovery on its next
+        # reload (surfacing the translated "Recovery required." outcome).
+        recover_pending_transaction()
         self.settings = load_settings()
         self.state = load_state()
         self.executor = concurrent.futures.ThreadPoolExecutor(
@@ -401,11 +408,14 @@ class MainWindow(Adw.ApplicationWindow):
         """Save window size and maximized state on close (best-effort)."""
         try:
             width, height = self.get_width(), self.get_height()
-            if width > 0 and height > 0:
-                self.settings.window_width = width
-                self.settings.window_height = height
-            self.settings.window_maximized = self.is_maximized()
-            save_settings(self.settings)
+
+            def transform(current: Settings) -> Settings:
+                updated = replace(current, window_maximized=self.is_maximized())
+                if width > 0 and height > 0:
+                    updated = replace(updated, window_width=width, window_height=height)
+                return updated
+
+            update_settings(transform)
         except Exception:
             pass
 
@@ -1107,15 +1117,37 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _save_settings(self, *_args: Any) -> None:
         try:
-            settings = self._read_form()
+            form = self._read_form()
             token = self.token.get_text()
+
+            def transform(current: Settings) -> Settings:
+                # Apply only the form-editable fields onto the freshly
+                # loaded settings through the single config boundary, so
+                # concurrent profile/geometry changes survive.
+                return replace(
+                    current,
+                    ntfy_server=form.ntfy_server,
+                    ntfy_topic=form.ntfy_topic,
+                    ntfy_enabled=form.ntfy_enabled,
+                    native_notifications=form.native_notifications,
+                    thresholds=list(form.thresholds),
+                    reset_alerts=form.reset_alerts,
+                    error_alerts=form.error_alerts,
+                    rules=form.rules,
+                    collect_claude=form.collect_claude,
+                    collect_codex=form.collect_codex,
+                    compact_mode=form.compact_mode,
+                    autostart=form.autostart,
+                    refresh_minutes=form.refresh_minutes,
+                )
+
+            settings = update_settings(transform)
             if token:
                 set_ntfy_token(token)
                 self.token.set_text("")
             old_interval = self.settings.refresh_minutes
             old_collect = (self.settings.collect_claude, self.settings.collect_codex)
             old_compact = self.settings.compact_mode
-            save_settings(settings)
             set_autostart(settings.autostart)
             self.settings = settings
             # Replace the GLib provider timer immediately if interval changed

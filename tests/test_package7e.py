@@ -93,6 +93,7 @@ class _FakeSecret:
 @pytest.fixture
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, _FakeSecret]:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     fake = _FakeSecret()
     monkeypatch.setattr(Secret, "password_lookup_sync", fake.password_lookup_sync)
     monkeypatch.setattr(Secret, "password_store_sync", fake.password_store_sync)
@@ -340,7 +341,7 @@ def test_add_credential_store_then_config_failure_leaves_no_orphan(
 ) -> None:
     _seed(env)
     op = ProfileOp("save_profile", profile=_profile("new-slug"), credential="sk-new")
-    with patch("moira.provider_editor.save_settings", side_effect=OSError("disk full")):
+    with patch("moira.persistence.save_settings", side_effect=OSError("disk full")):
         result = _execute_op(op)
     assert result.ok is False and result.reason == "Operation failed."
     assert load_settings().provider_profiles == ()  # nothing persisted
@@ -357,7 +358,7 @@ def test_edit_new_credential_then_config_failure_restores_old_credential(
         profile=_profile("deepseek-main", label="Renamed"),
         credential="sk-new",
     )
-    with patch("moira.provider_editor.save_settings", side_effect=OSError("disk full")):
+    with patch("moira.persistence.save_settings", side_effect=OSError("disk full")):
         result = _execute_op(op)
     assert result.ok is False
     assert load_settings().provider_profiles[0].label == "DeepSeek main"  # original
@@ -370,7 +371,7 @@ def test_rename_migrates_then_config_failure_restores_both_slug_states(
     _seed(env, _profile("old-slug"))
     env[1].items[("old-slug", "api_key")] = "sk-old"
     op = ProfileOp("save_profile", profile=_profile("new-slug"), old_slug="old-slug")
-    with patch("moira.provider_editor.save_settings", side_effect=OSError("disk full")):
+    with patch("moira.persistence.save_settings", side_effect=OSError("disk full")):
         result = _execute_op(op)
     assert result.ok is False
     assert [p.slug for p in load_settings().provider_profiles] == ["old-slug"]
@@ -420,7 +421,7 @@ def test_remove_profile_config_failure_keeps_credential(
     _seed(env, _profile("deepseek-main"))
     env[1].items[("deepseek-main", "api_key")] = "sk-abc"
     op = ProfileOp("remove_profile", slug="deepseek-main")
-    with patch("moira.provider_editor.save_settings", side_effect=OSError("disk full")):
+    with patch("moira.persistence.save_settings", side_effect=OSError("disk full")):
         result = _execute_op(op)
     assert result.ok is False
     # The credential was never cleared ahead of persistence.
@@ -596,16 +597,21 @@ def test_barrier_pending_replacement_newest_wins(
 def test_delayed_completion_after_shutdown_touches_neither_widgets_nor_disk(
     env: tuple[Path, _FakeSecret], english: None, idle_inline: None
 ) -> None:
+    """A REAL queued mutation across shutdown: the parked ``_run_op``
+    executes after shutdown and must not write to disk or Keyring (the
+    shutdown event gates the executor entry point)."""
+    _seed(env, _profile("deepseek-main"))
     gate = _GatedSubmit()
-    ed = _open_editor(env, submit=gate)  # reload parked, in flight
+    ed = _open_editor(env, submit=gate)
+    gate.flush()  # reload lands
+    ed._row_widgets["deepseek-main"]["switch"].set_active(False)  # mutation queued
+    assert gate.calls
     ed.shutdown()
-    ghost = ProfileOpResult(
-        True, "", (_profile("ghost"),), (("ghost", True),), "save_profile", "ghost"
-    )
-    assert ed._apply_op(ghost, ed._generation) is False
-    assert ed._profiles == ()
-    assert "ghost" not in ed._row_widgets
-    assert load_settings().provider_profiles == ()
+    gate.flush()  # _run_op executes AFTER shutdown
+    assert ed._profiles[0].enabled is True  # widgets untouched
+    disk = load_settings()
+    assert disk.provider_profiles[0].enabled is True  # disk untouched
+    assert ("deepseek-main", "api_key") not in env[1].items
 
 
 def test_stale_completion_updates_neither_widgets_nor_disk(

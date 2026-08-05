@@ -44,8 +44,10 @@ Provider editing is available as an Edit providers view managing local
 profiles (config v4) and per-profile Keyring credentials: remote base
 URLs require HTTPS and reject loopback (local accepts only loopback),
 blank input preserves the existing secret, removal is confirmed and
-never touches Hermes files, operations are transactional with rollback
-on failure, and saving other settings never wipes profiles.
+never touches Hermes files, writes are recoverable through a durable
+0600 journal (idempotent recovery on reload, typed Keyring outcomes,
+no credential loss), saving other settings never wipes profiles, and
+concurrent saves preserve each other.
 Hermes writes, connection tests, DeepSeek balance and financial units
 are deferred. Independent Codex CLI sessions are never observed.
 Inventory probes run only on page visibility and the explicit Refresh

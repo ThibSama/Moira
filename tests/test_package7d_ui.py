@@ -81,6 +81,7 @@ class _FakeSecret:
 @pytest.fixture
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, _FakeSecret]:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     fake = _FakeSecret()
     monkeypatch.setattr(Secret, "password_lookup_sync", fake.password_lookup_sync)
     monkeypatch.setattr(Secret, "password_store_sync", fake.password_store_sync)

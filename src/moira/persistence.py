@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -527,6 +529,29 @@ def save_settings(settings: Settings) -> None:
         for profile in settings.provider_profiles
     }
     _atomic_json(config_dir() / "config.json", payload)
+
+
+#: Single read-modify-write boundary for the whole config. Every
+#: application mutation (profile deltas, notification form saves, window
+#: geometry persistence) goes through ``update_settings`` so concurrent
+#: saves can never overwrite unrelated changes.
+_CONFIG_LOCK = threading.Lock()
+
+
+def update_settings(transform: Callable[[Settings], Settings]) -> Settings:
+    """Atomically read-merge-write the whole config under one lock.
+
+    ``transform`` receives the freshly loaded Settings (all fields
+    current) and returns the new Settings to persist; fields it does not
+    touch are preserved exactly. Raises when validation or persistence
+    fails (nothing is saved on failure).
+    """
+    with _CONFIG_LOCK:
+        current = load_settings()
+        updated = transform(current)
+        updated.validate()
+        save_settings(updated)
+        return updated
 
 
 def load_state() -> AppState:

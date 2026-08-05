@@ -346,6 +346,7 @@ _FRENCH: dict[str, str] = {
     "Credential removed.": "Identifiant retiré.",
     "Keyring unavailable.": "Trousseau indisponible.",
     "Operation failed.": "Échec de l'opération.",
+    "Recovery required.": "Récupération requise.",
     "Invalid profile.": "Profil invalide.",
     "Invalid value.": "Valeur invalide.",
     "Remote base URLs must not use a loopback address.": (

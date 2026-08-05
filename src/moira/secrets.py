@@ -3,15 +3,21 @@
 The libsecret schema carries three attribute families under one schema
 name: the legacy NTFY item (``account=ntfy-token``, API unchanged) and
 provider credentials keyed by validated slug + purpose (``kind=provider``,
-``slug=...``, ``purpose=api_key``). Provider operations are typed with
-safe outcomes: a Keyring failure (unavailable or locked vault, DBus
-errors) never raises — lookups return None, mutations return False, and
-raw exception text never reaches callers. Blank credential input
-preserves the existing secret; only an explicit ``clear_provider_secret``
-removes it.
+``slug=...``, ``purpose=api_key`` or ``purpose=backup``). Provider
+operations are typed: lookups distinguish FOUND / ABSENT / UNAVAILABLE
+(never interpreting an unavailable vault as absence), and mutations
+distinguish DONE / UNAVAILABLE / REJECTED. A Keyring failure (unavailable
+or locked vault, DBus errors) never raises; raw exception text never
+reaches callers. Blank credential input preserves the existing secret;
+only an explicit ``erase_provider_secret`` removes it. ``backup`` entries
+are Moira-owned transient copies used by the recoverable transaction
+protocol (never shown by the UI, never persisted outside the Keyring).
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum
 
 import gi
 
@@ -34,9 +40,37 @@ ATTRIBUTES = {"account": "ntfy-token"}
 
 #: Provider-credential attribute family (isolated from the NTFY item).
 _PROVIDER_KIND_ATTRIBUTE = "provider"
-_PROVIDER_PURPOSES = ("api_key",)
+#: Credential purpose values. ``backup`` holds transient Moira-owned
+#: copies of overwritten credentials for the recoverable transaction
+#: protocol; it is never rendered by the UI.
+_PROVIDER_PURPOSES = ("api_key", "backup")
+BACKUP_PURPOSE = "backup"
 #: Bounded credential value (never persisted anywhere but the Keyring).
 _MAX_SECRET_LENGTH = 4096
+
+
+class KeyringLookup(StrEnum):
+    """Typed outcome of a provider-secret lookup."""
+
+    FOUND = "found"
+    ABSENT = "absent"
+    UNAVAILABLE = "unavailable"
+
+
+class KeyringMutation(StrEnum):
+    """Typed outcome of a provider-secret mutation."""
+
+    DONE = "done"
+    UNAVAILABLE = "unavailable"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderSecret:
+    """One typed lookup result; ``value`` is set only when FOUND."""
+
+    state: KeyringLookup
+    value: str | None = None
 
 
 def get_ntfy_token() -> str | None:
@@ -70,11 +104,12 @@ def _provider_attributes(slug: str, purpose: str) -> dict[str, str] | None:
     return {"kind": _PROVIDER_KIND_ATTRIBUTE, "slug": slug, "purpose": purpose}
 
 
-def get_provider_secret(slug: str, purpose: str = "api_key") -> str | None:
-    """Return the stored provider credential, or None (safe outcome).
+def inspect_provider_secret(slug: str, purpose: str = "api_key") -> ProviderSecret | None:
+    """Typed lookup: FOUND(value), ABSENT, UNAVAILABLE.
 
-    A Keyring failure and an invalid slug/purpose both map to None; the
-    raw libsecret exception never reaches the caller.
+    Returns None only for an invalid/reserved slug or purpose (zero
+    libsecret calls). UNAVAILABLE is a real state — callers must never
+    interpret it as absence (a blank-credential rename fails closed).
     """
     attributes = _provider_attributes(slug, purpose)
     if attributes is None:
@@ -82,24 +117,27 @@ def get_provider_secret(slug: str, purpose: str = "api_key") -> str | None:
     try:
         value = Secret.password_lookup_sync(SCHEMA, attributes, None)
     except Exception:
-        return None
-    return str(value) if value else None
+        return ProviderSecret(KeyringLookup.UNAVAILABLE)
+    if value:
+        return ProviderSecret(KeyringLookup.FOUND, str(value))
+    return ProviderSecret(KeyringLookup.ABSENT)
 
 
-def set_provider_secret(slug: str, token: str, purpose: str = "api_key") -> bool:
-    """Store one provider credential; True on success.
+def store_provider_secret(slug: str, token: str, purpose: str = "api_key") -> KeyringMutation:
+    """Store one provider credential: DONE on success.
 
-    Blank input never touches the Keyring and returns False: the
-    existing secret is preserved. Oversized credentials are rejected.
-    A Keyring failure returns False without raising.
+    Blank input never touches the Keyring and returns REJECTED: the
+    existing secret is preserved. Oversized credentials and invalid
+    slugs/purposes are REJECTED; a Keyring failure returns UNAVAILABLE
+    without raising.
     """
     attributes = _provider_attributes(slug, purpose)
     if attributes is None:
-        return False
+        return KeyringMutation.REJECTED
     if not isinstance(token, str) or not token.strip():
-        return False  # blank input preserves the existing secret
+        return KeyringMutation.REJECTED  # blank input preserves the existing secret
     if len(token) > _MAX_SECRET_LENGTH:
-        return False
+        return KeyringMutation.REJECTED
     try:
         Secret.password_store_sync(
             SCHEMA,
@@ -109,35 +147,51 @@ def set_provider_secret(slug: str, token: str, purpose: str = "api_key") -> bool
             token,
             None,
         )
-        return True
+        return KeyringMutation.DONE
     except Exception:
-        return False
+        return KeyringMutation.UNAVAILABLE
 
 
-def has_provider_secret(slug: str, purpose: str = "api_key") -> bool:
-    """True when a credential is stored for the slug+purpose (safe)."""
-    attributes = _provider_attributes(slug, purpose)
-    if attributes is None:
-        return False
-    try:
-        value = Secret.password_lookup_sync(SCHEMA, attributes, None)
-    except Exception:
-        return False
-    return bool(value)
+def erase_provider_secret(slug: str, purpose: str = "api_key") -> KeyringMutation:
+    """Explicitly remove the stored credential: DONE on success.
 
-
-def clear_provider_secret(slug: str, purpose: str = "api_key") -> bool:
-    """Explicitly remove the stored credential; True on success.
-
-    Only this explicit call clears a provider credential — blank inputs
-    to ``set_provider_secret`` never do. A Keyring failure returns False
-    without raising.
+    An absent credential is a successful no-op (DONE). Only this explicit
+    call clears a provider credential — blank inputs to
+    ``store_provider_secret`` never do. A Keyring failure returns
+    UNAVAILABLE without raising.
     """
     attributes = _provider_attributes(slug, purpose)
     if attributes is None:
-        return False
+        return KeyringMutation.REJECTED
     try:
         Secret.password_clear_sync(SCHEMA, attributes, None)
-        return True
+        return KeyringMutation.DONE
     except Exception:
-        return False
+        return KeyringMutation.UNAVAILABLE
+
+
+# ── Legacy boolean/None wrappers (unchanged public semantics) ────────────────
+
+
+def get_provider_secret(slug: str, purpose: str = "api_key") -> str | None:
+    """Legacy safe lookup: the value, or None for absent AND unavailable."""
+    result = inspect_provider_secret(slug, purpose)
+    if result is None or result.state is not KeyringLookup.FOUND:
+        return None
+    return result.value
+
+
+def has_provider_secret(slug: str, purpose: str = "api_key") -> bool:
+    """Legacy safe check: True only when a credential is stored."""
+    result = inspect_provider_secret(slug, purpose)
+    return result is not None and result.state is KeyringLookup.FOUND
+
+
+def set_provider_secret(slug: str, token: str, purpose: str = "api_key") -> bool:
+    """Legacy wrapper: True when the store succeeded (DONE)."""
+    return store_provider_secret(slug, token, purpose) is KeyringMutation.DONE
+
+
+def clear_provider_secret(slug: str, purpose: str = "api_key") -> bool:
+    """Legacy wrapper: True when the erase succeeded (DONE)."""
+    return erase_provider_secret(slug, purpose) is KeyringMutation.DONE

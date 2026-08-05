@@ -15,6 +15,7 @@ profile JSON and secrets never reach the UI.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -30,12 +31,22 @@ from .integrations import (
     ProviderKind,
     ProviderProfile,
 )
-from .persistence import load_settings, save_settings
+from .persistence import load_settings, update_settings
+from .profile_journal import (
+    JournalEntry,
+    JournalPhase,
+    clear_journal,
+    recover_pending_transaction,
+    write_journal,
+)
 from .secrets import (
-    clear_provider_secret,
-    get_provider_secret,
+    BACKUP_PURPOSE,
+    KeyringLookup,
+    KeyringMutation,
+    erase_provider_secret,
     has_provider_secret,
-    set_provider_secret,
+    inspect_provider_secret,
+    store_provider_secret,
 )
 
 _ = tr
@@ -99,19 +110,9 @@ def _keyring_states(profiles: tuple[ProviderProfile, ...]) -> tuple[tuple[str, b
 
 
 def _persist_profiles(profiles: tuple[ProviderProfile, ...]) -> None:
-    """Validate the whole collection and persist it (raises on failure)."""
-    settings = load_settings()
-    settings.provider_profiles = profiles
-    settings.validate()
-    save_settings(settings)
-
-
-def _restore_credential(slug: str, value: str | None) -> None:
-    """Best-effort compensation: restore the prior secret state at a slug."""
-    if value is None:
-        clear_provider_secret(slug)
-    else:
-        set_provider_secret(slug, value)
+    """Validate the whole collection and persist it through the single
+    config boundary (raises on failure; unrelated fields are preserved)."""
+    update_settings(lambda settings: replace(settings, provider_profiles=profiles))
 
 
 def _ok_result(kind: str, profiles: tuple[ProviderProfile, ...], slug: str = "") -> ProfileOpResult:
@@ -122,14 +123,38 @@ def _fail_result(kind: str, reason: str, slug: str = "") -> ProfileOpResult:
     return ProfileOpResult(False, reason, (), (), kind, slug)
 
 
-def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
-    """Transaction-safe upsert with explicit ordering and compensation.
+def _journal_entry(
+    op: ProfileOp,
+    phase: JournalPhase,
+    *,
+    profile: ProviderProfile | None = None,
+    old_slug: str = "",
+    secret_slug: str = "",
+    had_backup: bool = False,
+) -> JournalEntry:
+    slug = profile.slug if profile is not None else op.slug
+    return JournalEntry(1, op.kind, phase, profile, old_slug, slug, secret_slug, had_backup)
 
-    Order: store/migrate the credential (new slug) → persist the
-    collection → remove the old slug's credential on rename. Any failure
-    restores the original profiles and the old/new secret states, so the
-    last recoverable state is never destroyed and a credential store
-    followed by a config failure never leaves an orphan.
+
+def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
+    """Recoverable save/edit/toggle/rename with a durable phase journal.
+
+    Protocol (every side effect happens after its intent is journaled):
+
+    1. ``staged`` — intent recorded; nothing mutated yet.
+    2. backup any credential being overwritten at the target slug
+       (Moira-owned ``backup`` Keyring entry) — lossless recovery.
+    3. ``staged-secret`` — store/migrate the credential at the target.
+    4. ``config-committed`` — persist the collection under the config
+       lock (preserving every concurrent change).
+    5. rename: clear the old slug's credential (create-new then old
+       removal).
+    6. clear the obsolete backup, clear the journal.
+
+    On any failure the transaction is rolled back with the journal
+    cleared ONLY when the rollback is durable; otherwise the journal is
+    KEPT at its phase and ``recover_pending_transaction`` converges it
+    on the next reload (never destroying the last recoverable state).
     """
     assert op.profile is not None
     profile = op.profile
@@ -141,64 +166,141 @@ def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
 
     value = op.credential.strip()
     if rename and not value:
-        # Blank credential on rename migrates the existing secret.
-        value = get_provider_secret(op.old_slug) or ""
-    prior_new: str | None = None
-    stored = False
-    if value:
-        prior_new = get_provider_secret(profile.slug)  # capture before overwrite
-        if not set_provider_secret(profile.slug, value):
+        # Blank credential on rename migrates the existing secret — but a
+        # UNAVAILABLE lookup is never absence: fail closed so the last
+        # credential is never cleared on a failed lookup.
+        inspection = inspect_provider_secret(op.old_slug)
+        if inspection is None or inspection.state is KeyringLookup.UNAVAILABLE:
             return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
-        stored = True
+        value = inspection.value or ""
 
-    new_collection = tuple(sorted(base + [profile], key=lambda p: p.slug))
+    secret_slug = profile.slug if value else ""
+    had_backup = False
+    target_inspection: Any = None
+    if value:
+        target_inspection = inspect_provider_secret(profile.slug)
+        had_backup = (
+            target_inspection is not None and target_inspection.state is KeyringLookup.FOUND
+        )
+
     try:
-        _persist_profiles(new_collection)
+        write_journal(
+            _journal_entry(
+                op,
+                JournalPhase.STAGED,
+                profile=profile,
+                old_slug=op.old_slug,
+                secret_slug=secret_slug,
+                had_backup=had_backup,
+            )
+        )
+        if value:
+            if had_backup:
+                assert target_inspection is not None and target_inspection.value is not None
+                if (
+                    store_provider_secret(profile.slug, target_inspection.value, BACKUP_PURPOSE)
+                    is not KeyringMutation.DONE
+                ):
+                    # Backup intent could not be durably recorded: roll
+                    # back nothing (nothing was stored) and fail closed.
+                    clear_journal()
+                    return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
+            write_journal(
+                _journal_entry(
+                    op,
+                    JournalPhase.STAGED_SECRET,
+                    profile=profile,
+                    old_slug=op.old_slug,
+                    secret_slug=secret_slug,
+                    had_backup=had_backup,
+                )
+            )
+            if store_provider_secret(profile.slug, value) is not KeyringMutation.DONE:
+                _rollback_and_clear(profile.slug, had_backup)
+                return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
+        write_journal(
+            _journal_entry(
+                op,
+                JournalPhase.CONFIG_COMMITTED,
+                profile=profile,
+                old_slug=op.old_slug,
+                secret_slug=secret_slug,
+                had_backup=had_backup,
+            )
+        )
+        new_collection = tuple(sorted(base + [profile], key=lambda p: p.slug))
+        try:
+            _persist_profiles(new_collection)
+        except Exception:
+            _rollback_and_clear(profile.slug, had_backup)
+            return _fail_result(op.kind, "Operation failed.", profile.slug)
+        if rename:
+            if erase_provider_secret(op.old_slug) is not KeyringMutation.DONE:
+                # Roll the config back first; only clean secrets once the
+                # config rollback is durable. If even that fails, keep the
+                # journal at config-committed: forward recovery converges.
+                try:
+                    _persist_profiles(current)
+                except Exception:
+                    return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
+                _rollback_and_clear(profile.slug, had_backup)
+                return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
+        if had_backup:
+            erase_provider_secret(profile.slug, BACKUP_PURPOSE)  # best-effort after commit
+        clear_journal()
+        return _ok_result(op.kind, new_collection, profile.slug)
     except Exception:
-        # Compensate the credential store: restore the new slug's prior
-        # secret state (no orphan, no lost overwritten value).
-        if stored:
-            _restore_credential(profile.slug, prior_new)
+        # Unexpected failure: keep the journal — recovery converges to a
+        # documented consistent state on the next reload.
         return _fail_result(op.kind, "Operation failed.", profile.slug)
 
-    if rename:
-        if not clear_provider_secret(op.old_slug):
-            # Roll the whole rename back: original profiles on disk and
-            # the new slug's secret state restored.
-            try:
-                _persist_profiles(current)
-            except Exception:
-                pass
-            if stored:
-                _restore_credential(profile.slug, prior_new)
-            return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
-    return _ok_result(op.kind, new_collection, profile.slug)
+
+def _rollback_and_clear(target: str, had_backup: bool) -> None:
+    """Durable rollback of the staged-secret effect (shared semantics
+    with journal recovery): clear the staged value, restore the backup,
+    drop the backup, then clear the journal. If any step fails the
+    journal is kept for recovery."""
+    from .profile_journal import _rollback_staged_secret
+
+    entry = JournalEntry(
+        1, "save_profile", JournalPhase.STAGED_SECRET, None, "", "", target, had_backup
+    )
+    if _rollback_staged_secret(entry):
+        clear_journal()
 
 
 def _execute_remove_profile(op: ProfileOp) -> ProfileOpResult:
-    """Confirmed removal: either removes both the profile and its Moira
-    credential, or leaves both unchanged. An absent credential is a
-    successful no-op; an unavailable Keyring is a sanitized failure.
+    """Confirmed removal with a durable phase journal.
 
-    Order: persist the collection without the profile, then clear the
-    credential. A failed clear rolls the collection back (the credential
-    was never touched), so the two stores never diverge.
+    Either removes both the profile and its Moira credential, or leaves
+    both unchanged. An absent credential is a successful no-op; an
+    unavailable Keyring is a sanitized failure.
     """
     current = load_settings().provider_profiles
     new_collection = tuple(p for p in current if p.slug != op.slug)
     if len(new_collection) == len(current):
         return _ok_result(op.kind, current, op.slug)  # nothing to remove
     try:
-        _persist_profiles(new_collection)
+        write_journal(_journal_entry(op, JournalPhase.STAGED))
+        write_journal(_journal_entry(op, JournalPhase.CONFIG_COMMITTED))
+        try:
+            _persist_profiles(new_collection)
+        except Exception:
+            clear_journal()  # config unchanged; nothing else happened
+            return _fail_result(op.kind, "Operation failed.", op.slug)
+        if erase_provider_secret(op.slug) is not KeyringMutation.DONE:
+            try:
+                _persist_profiles(current)
+            except Exception:
+                # Rollback persist failed: keep the journal at
+                # config-committed — forward recovery completes the removal.
+                return _fail_result(op.kind, "Keyring unavailable.", op.slug)
+            clear_journal()
+            return _fail_result(op.kind, "Keyring unavailable.", op.slug)
+        clear_journal()
+        return _ok_result(op.kind, new_collection, op.slug)
     except Exception:
         return _fail_result(op.kind, "Operation failed.", op.slug)
-    if not clear_provider_secret(op.slug):
-        try:
-            _persist_profiles(current)
-        except Exception:
-            pass
-        return _fail_result(op.kind, "Keyring unavailable.", op.slug)
-    return _ok_result(op.kind, new_collection, op.slug)
 
 
 def _execute_op(op: ProfileOp) -> ProfileOpResult:
@@ -206,10 +308,15 @@ def _execute_op(op: ProfileOp) -> ProfileOpResult:
     failure maps to a sanitized stable outcome."""
     try:
         if op.kind == "reload":
+            # Recover any journaled operation before accepting the
+            # persisted state (a failed recovery keeps the journal and
+            # surfaces the translated "Recovery required." outcome).
+            if not recover_pending_transaction():
+                return ProfileOpResult(False, "Recovery required.", (), (), "reload", "")
             profiles = load_settings().provider_profiles
             return _ok_result("reload", profiles)
         if op.kind == "remove_credential":
-            if not clear_provider_secret(op.slug):
+            if erase_provider_secret(op.slug) is not KeyringMutation.DONE:
                 return _fail_result(op.kind, "Keyring unavailable.", op.slug)
             return _ok_result(op.kind, load_settings().provider_profiles, op.slug)
         if op.kind == "save_profile":
@@ -266,6 +373,8 @@ class ProviderEditor(Gtk.Window):
         self._submit = submit
         self._on_profiles_changed = on_profiles_changed
         self._shutdown = False
+        self._shutdown_event = threading.Event()
+        self._recovery_blocked = False
         self._in_flight = False
         self._pending_op: ProfileOp | None = None
         self._generation = 0
@@ -316,7 +425,7 @@ class ProviderEditor(Gtk.Window):
     # ── Bounded generation pipeline (off GTK) ──
 
     def _request_op(self, op: ProfileOp) -> None:
-        if self._shutdown:
+        if self._shutdown or self._recovery_blocked:
             return
         if self._in_flight:
             self._pending_op = op  # newest-wins replacement
@@ -329,7 +438,7 @@ class ProviderEditor(Gtk.Window):
         self._in_flight = True
         self.status_label.set_text(_("Loading…") if op.kind == "reload" else _("Saving…"))
         try:
-            self._submit(self._run_op, op, generation)
+            self._submit(self._run_op, op, generation, self._shutdown_event)
         except Exception:
             # Submit rejection (e.g. a closed executor): clear the slot,
             # show a fixed translated outcome, then accept later work.
@@ -342,7 +451,10 @@ class ProviderEditor(Gtk.Window):
             if pending is not None:
                 self._start_op(pending)
 
-    def _run_op(self, op: ProfileOp, generation: int) -> None:
+    def _run_op(self, op: ProfileOp, generation: int, shutdown_event: threading.Event) -> None:
+        if shutdown_event.is_set():
+            # Queued-not-started operations never write after shutdown.
+            return
         result = _execute_op(op)
         GLib.idle_add(self._apply_op, result, generation)
 
@@ -353,6 +465,7 @@ class ProviderEditor(Gtk.Window):
         pending = self._pending_op
         self._pending_op = None
         if result.ok:
+            self._recovery_blocked = False
             self._profiles = result.profiles
             self._configured = dict(result.configured)
             self._render_list()
@@ -362,6 +475,7 @@ class ProviderEditor(Gtk.Window):
                 if self._on_profiles_changed is not None:
                     self._on_profiles_changed()
         else:
+            self._recovery_blocked = result.reason == "Recovery required."
             self.status_label.set_text(_(result.reason))
         if pending is not None:
             self._start_op(pending)
@@ -641,6 +755,8 @@ class ProviderEditor(Gtk.Window):
         self._request_op(op)
 
     def shutdown(self) -> None:
-        """Idempotent: stop accepting operations and drop the pending one."""
+        """Idempotent: stop accepting operations, drop the pending one and
+        flag queued-not-started ``_run_op`` calls so they never write."""
         self._shutdown = True
+        self._shutdown_event.set()
         self._pending_op = None
