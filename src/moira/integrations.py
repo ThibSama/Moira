@@ -24,6 +24,7 @@ holding the state lock.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -39,6 +40,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Generic, TypeVar
+from urllib.parse import urlsplit
 
 from .activity import AgentRuntime
 from .agent_integration import CapabilityReport
@@ -304,6 +306,132 @@ class IntegrationProbe:
             raise ValueError("inventory must be a HermesInventory value")
         if not isinstance(self.token_status, TokenStatusView):
             raise ValueError("token_status must be a TokenStatusView value")
+
+
+# ── Provider profiles (Package 7d) ──────────────────────────────────────────
+
+
+class ProviderKind(StrEnum):
+    """Closed set of provider kinds a local profile may claim.
+
+    ``local`` is the only kind allowed to use a loopback HTTP base URL;
+    every other kind requires HTTPS. Unknown persisted kinds fail closed.
+    """
+
+    DEEPSEEK = "deepseek"
+    OPENAI_COMPATIBLE = "openai_compatible"
+    OPENROUTER = "openrouter"
+    ANTHROPIC = "anthropic"
+    OPENAI = "openai"
+    LOCAL = "local"
+    CUSTOM = "custom"
+
+
+#: Runtime slugs a provider profile can never claim.
+RESERVED_PROFILE_SLUGS = frozenset(("claude", "codex", "hermes"))
+
+#: Bounded profile limits (slugs, labels, models, URLs and count).
+MAX_PROFILE_SLUG_LENGTH = 64
+MAX_PROFILE_LABEL_LENGTH = 64
+MAX_PROFILE_MODEL_LENGTH = 128
+MAX_PROFILE_URL_LENGTH = 256
+MAX_PROFILE_HERMES_LABEL_LENGTH = 64
+MAX_PROFILES = 50
+
+_PROFILE_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    """True only for literal loopback hosts (localhost or loopback IPs)."""
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_base_url(kind: ProviderKind, url: str) -> None:
+    """Base-URL policy (fail closed).
+
+    Remote kinds require https. ``local`` allows http but only for
+    loopback hosts. Embedded credentials, query strings, fragments,
+    control characters, oversized values, missing hosts and unknown
+    schemes are all rejected.
+    """
+    if not url:
+        return
+    if len(url) > MAX_PROFILE_URL_LENGTH:
+        raise ValueError("base URL is too long")
+    # Control characters AND whitespace (a URL may never contain a raw
+    # space or control byte).
+    if any(ord(ch) < 33 or ord(ch) == 127 for ch in url):
+        raise ValueError("base URL must not contain control characters")
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        raise ValueError("base URL is not a valid URL") from None
+    if parts.scheme not in ("http", "https"):
+        raise ValueError("base URL scheme must be http or https")
+    if parts.username or parts.password:
+        raise ValueError("base URL must not embed credentials")
+    if parts.query or parts.fragment:
+        raise ValueError("base URL must not contain a query or fragment")
+    hostname = parts.hostname
+    if not hostname:
+        raise ValueError("base URL must include a host")
+    if kind is ProviderKind.LOCAL:
+        if not _is_loopback_host(hostname):
+            raise ValueError("local profiles require a loopback base URL")
+        return
+    if parts.scheme != "https":
+        raise ValueError("remote profiles require an https base URL")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderProfile:
+    """Immutable local provider profile (secrets are never stored here).
+
+    ``slug`` is the stable bounded identifier (never one of the reserved
+    runtime slugs), ``label`` the display label, ``kind`` a closed
+    ``ProviderKind``, ``model`` the model identifier (empty when unset),
+    ``enabled`` a strict boolean, ``base_url`` an optional sanitized API
+    base URL (validated by the URL policy) and ``hermes_label`` an
+    optional Hermes display label. API credentials never live in the
+    profile: they are stored in the Keyring keyed by slug + purpose.
+    """
+
+    slug: str
+    label: str
+    kind: ProviderKind
+    model: str
+    enabled: bool
+    base_url: str = ""
+    hermes_label: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.slug, str) or not _PROFILE_SLUG_RE.fullmatch(self.slug):
+            raise ValueError(
+                "profile slug must start and end with a lowercase digit/letter "
+                "(letters, digits, dashes and underscores inside, at most 64)"
+            )
+        if self.slug in RESERVED_PROFILE_SLUGS:
+            raise ValueError("profile slug is reserved")
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError("profile label must be a non-empty string")
+        if len(self.label) > MAX_PROFILE_LABEL_LENGTH:
+            raise ValueError("profile label is too long")
+        if not isinstance(self.kind, ProviderKind):
+            raise ValueError("profile kind must be a ProviderKind value")
+        if not isinstance(self.model, str) or len(self.model) > MAX_PROFILE_MODEL_LENGTH:
+            raise ValueError("profile model must be a bounded string")
+        if not isinstance(self.enabled, bool):
+            raise ValueError("profile enabled must be a boolean")
+        if not isinstance(self.base_url, str) or not isinstance(self.hermes_label, str):
+            raise ValueError("profile base_url and hermes_label must be strings")
+        if len(self.hermes_label) > MAX_PROFILE_HERMES_LABEL_LENGTH:
+            raise ValueError("profile hermes_label is too long")
+        _validate_base_url(self.kind, self.base_url)
 
 
 # ── Bounded subprocess reader (hard caps while the child runs) ──────────────

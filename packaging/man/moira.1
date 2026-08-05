@@ -40,8 +40,12 @@ the latest typed availability observation in History (with stored exact
 data or an official summary for the available state), and unknown
 balance/cost is a state, never zero. DeepSeek
 balance is reported as not configured (no \fB/user/balance\fR call).
-Provider editing, Keyring credentials, DeepSeek balance and financial
-units are deferred. Independent Codex CLI sessions are never observed.
+Provider editing is available as an Edit providers view managing local
+profiles (config v4) and per-profile Keyring credentials: remote base
+URLs require HTTPS, local only loopback, blank input preserves the
+existing secret, removal is confirmed and never touches Hermes files.
+Hermes writes, connection tests, DeepSeek balance and financial units
+are deferred. Independent Codex CLI sessions are never observed.
 Inventory probes run only on page visibility and the explicit Refresh
 button, off the GTK thread, bounded and newest\-wins with sanitized
 translated statuses.

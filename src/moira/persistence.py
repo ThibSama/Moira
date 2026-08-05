@@ -1,14 +1,19 @@
-"""Versioned JSON configuration (v3) and a small last-known-state cache.
+"""Versioned JSON configuration (v4) and a small last-known-state cache.
 
 Config v3 adds typed per-service alert rules (``ProviderRules``), separate
 Claude/Codex collection toggles, native-desktop-notification enablement,
 compact mode, persisted window geometry, and the update-check repository.
-The v1 → v2 → v3 chain is additive: every prior user setting is preserved
-exactly, and the legacy global rule fields remain the source that v2→v3
-copies into both providers' rules. Invalid configuration fails closed:
-``load_settings`` falls back to defaults on any validation error.
+Config v4 (Package 7d) adds the exact deterministic ``provider_profiles``
+collection: unique bounded slugs, bounded count/fields, strict booleans
+and exact keys. The v1 → v2 → v3 → v4 chain is additive: every prior
+user setting is preserved exactly, and the legacy global rule fields
+remain the source that v2→v3 copies into both providers' rules. Invalid
+configuration fails closed: ``load_settings`` falls back to defaults on
+any validation error, and an invalid profile collection is rejected as a
+whole — never partially accepted.
 
-Secrets (NTFY token) never enter JSON — they live in GNOME Keyring only.
+Secrets (NTFY token and provider credentials) never enter JSON — they
+live in GNOME Keyring only.
 """
 
 from __future__ import annotations
@@ -19,9 +24,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .integrations import MAX_PROFILES, ProviderKind, ProviderProfile
 from .models import QuotaReading, Service
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 VALID_REFRESH_MINUTES = (1, 2, 5, 10, 15, 30)
 DEFAULT_REFRESH_MINUTES = 2
@@ -159,6 +165,9 @@ class Settings:
     window_maximized: bool = False
     repo: str = DEFAULT_REPO
     autostart: bool = False
+    # Local provider profiles (v4): exact deterministic collection,
+    # validated as a whole. Credentials never live here — Keyring only.
+    provider_profiles: tuple[ProviderProfile, ...] = ()
 
     def validate(self) -> None:
         if not isinstance(self.version, int) or isinstance(self.version, bool):
@@ -192,18 +201,33 @@ class Settings:
                 key: ProviderRules(list(self.thresholds), self.reset_alerts, self.error_alerts)
                 for key in VALID_RULE_KEYS
             }
-            return
-        if not isinstance(self.rules, dict):
-            raise ValueError("rules must be an object mapping providers to ProviderRules")
-        # Typed per-service contract: exactly the two providers, each valid.
-        for key in VALID_RULE_KEYS:
-            rules = self.rules.get(key)
-            if not isinstance(rules, ProviderRules):
-                raise ValueError(f"missing or invalid rules for provider {key!r}")
-            rules.validate()
-        for key in self.rules:
-            if key not in VALID_RULE_KEYS:
-                raise ValueError(f"unknown provider in rules: {key!r}")
+        else:
+            if not isinstance(self.rules, dict):
+                raise ValueError("rules must be an object mapping providers to ProviderRules")
+            # Typed per-service contract: exactly the two providers, each valid.
+            for key in VALID_RULE_KEYS:
+                rules = self.rules.get(key)
+                if not isinstance(rules, ProviderRules):
+                    raise ValueError(f"missing or invalid rules for provider {key!r}")
+                rules.validate()
+            for key in self.rules:
+                if key not in VALID_RULE_KEYS:
+                    raise ValueError(f"unknown provider in rules: {key!r}")
+        if not isinstance(self.provider_profiles, tuple):
+            raise ValueError("provider_profiles must be a tuple")
+        if len(self.provider_profiles) > MAX_PROFILES:
+            raise ValueError("too many provider profiles")
+        seen_slugs: set[str] = set()
+        for profile in self.provider_profiles:
+            if not isinstance(profile, ProviderProfile):
+                raise ValueError("provider_profiles must contain ProviderProfile values")
+            if profile.slug in seen_slugs:
+                raise ValueError(f"duplicate profile slug: {profile.slug!r}")
+            seen_slugs.add(profile.slug)
+        # Deterministic ordering: profiles are always kept sorted by slug.
+        self.provider_profiles = tuple(
+            sorted(self.provider_profiles, key=lambda profile: profile.slug)
+        )
 
     def rules_for(self, service: Service | str) -> ProviderRules:
         """Return the typed alert rules for one provider.
@@ -318,6 +342,19 @@ def _migrate_v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
     migrated.setdefault("window_height", None)
     migrated.setdefault("window_maximized", False)
     migrated.setdefault("repo", DEFAULT_REPO)
+    migrated["version"] = 3  # this migration's own target; v4 stamps later
+    return migrated
+
+
+def _migrate_v3_to_v4(data: dict[str, Any]) -> dict[str, Any]:
+    """Additively migrate a v3 config dict to v4.
+
+    Preserves every prior setting; v3 files carry no profiles, so the
+    collection starts empty. The profile collection itself is validated
+    as a whole by ``_coerce_profiles`` (invalid v4 data fails closed).
+    """
+    migrated = dict(data)
+    migrated.setdefault("provider_profiles", {})
     migrated["version"] = CONFIG_VERSION
     return migrated
 
@@ -355,6 +392,59 @@ def _coerce_rules(data: dict[str, Any]) -> dict[str, ProviderRules]:
     return rules
 
 
+#: Exact field set of one persisted provider profile record. The record
+#: lives under its slug key, so ``slug`` itself is never a field.
+PROFILE_FIELDS = ("label", "kind", "model", "enabled", "base_url", "hermes_label")
+
+
+def _coerce_profiles(data: dict[str, Any]) -> tuple[ProviderProfile, ...]:
+    """Strictly decode the persisted v4 ``provider_profiles`` collection.
+
+    The collection is an object keyed by slug; each record must contain
+    EXACTLY ``label``, ``kind``, ``model``, ``enabled``, ``base_url`` and
+    ``hermes_label`` with strict types, and the whole collection must fit
+    the bounded count. Any violation — unknown kind, reserved slug,
+    malformed record, invalid base URL, oversize — raises ValueError so
+    ``load_settings`` falls back to complete defaults: profiles are
+    accepted as a whole or not at all, never partially.
+    """
+    if "provider_profiles" not in data:
+        return ()
+    raw = data["provider_profiles"]
+    if not isinstance(raw, dict):
+        raise ValueError("provider_profiles must be an object")
+    if len(raw) > MAX_PROFILES:
+        raise ValueError("too many provider profiles")
+    profiles: list[ProviderProfile] = []
+    for slug, record in raw.items():
+        if not isinstance(record, dict):
+            raise ValueError("profile record must be an object")
+        if set(record) != set(PROFILE_FIELDS):
+            raise ValueError(
+                "profile record must contain exactly label, kind, model, enabled, "
+                "base_url and hermes_label"
+            )
+        kind_value = record["kind"]
+        if not isinstance(kind_value, str):
+            raise ValueError("profile kind must be a string")
+        try:
+            kind = ProviderKind(kind_value)
+        except ValueError:
+            raise ValueError("unknown profile kind") from None
+        profiles.append(
+            ProviderProfile(
+                slug=slug,
+                label=record["label"],
+                kind=kind,
+                model=record["model"],
+                enabled=record["enabled"],
+                base_url=record["base_url"],
+                hermes_label=record["hermes_label"],
+            )
+        )
+    return tuple(sorted(profiles, key=lambda profile: profile.slug))
+
+
 @dataclass(slots=True)
 class AppState:
     readings: list[QuotaReading] = field(default_factory=list)
@@ -374,20 +464,20 @@ def _atomic_json(path: Path, value: Any) -> None:
 def _decode_version(data: dict[str, Any]) -> int:
     """Decode the persisted configuration version with exact semantics.
 
-    Only a non-bool integer ``1``, ``2`` or ``3`` is accepted. The sole
-    documented deterministic legacy rule: an ABSENT ``version`` key means a
-    versionless v1 file and is migrated. Every other explicit value —
-    boolean, float, string, zero, negative, unsupported — raises ValueError
-    so ``load_settings`` fails closed to complete defaults WITHOUT any
-    partial preservation (an explicit malformed ``version`` is never
-    reinterpreted as a legacy version).
+    Only a non-bool integer ``1``, ``2``, ``3`` or ``4`` is accepted. The
+    sole documented deterministic legacy rule: an ABSENT ``version`` key
+    means a versionless v1 file and is migrated. Every other explicit
+    value — boolean, float, string, zero, negative, unsupported — raises
+    ValueError so ``load_settings`` fails closed to complete defaults
+    WITHOUT any partial preservation (an explicit malformed ``version``
+    is never reinterpreted as a legacy version).
     """
     if "version" not in data:
         return 1  # documented legacy rule: versionless files are v1
     version = data["version"]
     if type(version) is not int:
         raise ValueError("configuration version must be a non-bool integer")
-    if version not in (1, 2, 3):
+    if version not in (1, 2, 3, 4):
         raise ValueError("unsupported configuration version")
     return version
 
@@ -405,7 +495,15 @@ def load_settings() -> Settings:
             data = _migrate_v1_to_v2(data)
         if version <= 2:
             data = _migrate_v2_to_v3(data)
-        settings = Settings(**{**data, "rules": _coerce_rules(data)})
+        if version <= 3:
+            data = _migrate_v3_to_v4(data)
+        settings = Settings(
+            **{
+                **data,
+                "rules": _coerce_rules(data),
+                "provider_profiles": _coerce_profiles(data),
+            }
+        )
         settings.validate()
         return settings
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -414,7 +512,21 @@ def load_settings() -> Settings:
 
 def save_settings(settings: Settings) -> None:
     settings.validate()
-    _atomic_json(config_dir() / "config.json", asdict(settings))
+    payload = asdict(settings)
+    # Profiles serialize as a slug-keyed record object (the key IS the
+    # slug); the atomic writer sorts keys, so output is deterministic.
+    payload["provider_profiles"] = {
+        profile.slug: {
+            "label": profile.label,
+            "kind": profile.kind.value,
+            "model": profile.model,
+            "enabled": profile.enabled,
+            "base_url": profile.base_url,
+            "hermes_label": profile.hermes_label,
+        }
+        for profile in settings.provider_profiles
+    }
+    _atomic_json(config_dir() / "config.json", payload)
 
 
 def load_state() -> AppState:

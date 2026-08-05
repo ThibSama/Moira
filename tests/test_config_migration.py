@@ -24,8 +24,8 @@ from moira.persistence import (
 )
 
 
-def test_config_version_is_3() -> None:
-    assert CONFIG_VERSION == 3
+def test_config_version_is_4() -> None:
+    assert CONFIG_VERSION == 4
 
 
 def test_default_refresh_is_2_minutes() -> None:
@@ -125,7 +125,7 @@ def test_v2_to_v3_invalid_legacy_thresholds_fail_closed_to_defaults() -> None:
     assert v3["rules"]["codex"]["thresholds"] == [50, 75, 90]
 
 
-def test_load_settings_migrates_v1_to_v3(tmp_path: Path) -> None:
+def test_load_settings_migrates_v1_to_v4(tmp_path: Path) -> None:
     config = tmp_path / "moira" / "config.json"
     config.parent.mkdir(parents=True)
     config.write_text(
@@ -145,7 +145,7 @@ def test_load_settings_migrates_v1_to_v3(tmp_path: Path) -> None:
     )
     with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
         settings = load_settings()
-    assert settings.version == 3
+    assert settings.version == 4
     assert settings.refresh_minutes == 10
     assert settings.ntfy_topic == "test"
     assert settings.ntfy_enabled is True
@@ -154,7 +154,7 @@ def test_load_settings_migrates_v1_to_v3(tmp_path: Path) -> None:
     assert settings.rules_for(Service.CODEX).thresholds == [50, 75, 90]
 
 
-def test_load_settings_migrates_v2_to_v3(tmp_path: Path) -> None:
+def test_load_settings_migrates_v2_to_v4(tmp_path: Path) -> None:
     config = tmp_path / "moira" / "config.json"
     config.parent.mkdir(parents=True)
     config.write_text(
@@ -172,7 +172,7 @@ def test_load_settings_migrates_v2_to_v3(tmp_path: Path) -> None:
     )
     with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
         settings = load_settings()
-    assert settings.version == 3
+    assert settings.version == 4
     assert settings.refresh_minutes == 5
     assert settings.ntfy_topic == "roundtrip"
     assert settings.collect_claude is False
@@ -193,7 +193,7 @@ def test_save_and_load_v3_settings(tmp_path: Path) -> None:
     with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
         save_settings(settings)
         loaded = load_settings()
-    assert loaded.version == 3
+    assert loaded.version == 4
     assert loaded.refresh_minutes == 5
     assert loaded.rules_for(Service.CLAUDE).thresholds == [30, 60]
     assert loaded.rules_for(Service.CLAUDE).reset_alerts is False
@@ -263,7 +263,7 @@ def test_invalid_config_file_fails_closed_to_defaults(tmp_path: Path) -> None:
     config.write_text(json.dumps({"version": 3, "thresholds": [999]}))
     with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
         settings = load_settings()
-    assert settings.version == 3
+    assert settings.version == 4
     assert settings.thresholds == [50, 75, 90]
 
 
@@ -408,7 +408,7 @@ def test_invalid_v3_json_fails_closed(tmp_path: Path) -> None:
         config.write_text(json.dumps(payload))
         with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
             settings = load_settings()
-        assert settings.version == 3
+        assert settings.version == 4
         assert settings.collect_claude is True
         assert settings.ntfy_enabled is False
         assert settings.thresholds == [50, 75, 90]
@@ -524,7 +524,7 @@ def test_persisted_rules_matrix_fails_closed_to_complete_defaults(tmp_path: Path
         with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
             settings = load_settings()
         # COMPLETE default instance: not even ntfy_topic is preserved.
-        assert settings.version == 3
+        assert settings.version == 4
         assert settings.ntfy_topic == "", payload["rules"] if "rules" in payload else "missing"
         assert settings.thresholds == [50, 75, 90]
         assert settings.collect_claude is True
@@ -574,13 +574,13 @@ def test_saved_default_settings_round_trip(tmp_path: Path) -> None:
 
 
 def test_decode_version_exact_semantics() -> None:
-    """Only a non-bool integer 1/2/3 is a valid persisted version."""
+    """Only a non-bool integer 1/2/3/4 is a valid persisted version."""
     from moira.persistence import _decode_version
 
     assert _decode_version({}) == 1  # sole documented legacy rule: versionless = v1
-    for good in (1, 2, 3):
+    for good in (1, 2, 3, 4):
         assert _decode_version({"version": good}) == good
-    for bad in (True, False, 2.0, "2", 0, -1, 4, 1.0, None):
+    for bad in (True, False, 2.0, "2", 0, -1, 5, 1.0, None):
         with pytest.raises(ValueError):
             _decode_version({"version": bad})
 
@@ -598,7 +598,7 @@ def test_explicit_malformed_version_fails_closed_no_partial_preservation(
         {"version": "2", "ntfy_topic": "keep"},
         {"version": 0, "ntfy_topic": "keep"},
         {"version": -1, "ntfy_topic": "keep"},
-        {"version": 4, "ntfy_topic": "keep"},
+        {"version": 5, "ntfy_topic": "keep"},
         {"version": 1.0, "ntfy_topic": "keep"},
     )
     for payload in cases:
@@ -607,7 +607,7 @@ def test_explicit_malformed_version_fails_closed_no_partial_preservation(
         config.write_text(json.dumps(payload))
         with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
             settings = load_settings()
-        assert settings.version == 3, payload
+        assert settings.version == 4, payload
         assert settings.ntfy_topic == "", payload  # nothing preserved
         assert settings.thresholds == [50, 75, 90]
         assert settings.rules_for(Service.CLAUDE).thresholds == [50, 75, 90]
@@ -622,15 +622,20 @@ def test_versionless_legacy_file_migrates(tmp_path: Path) -> None:
     config.write_text(json.dumps({"refresh_minutes": 10, "ntfy_topic": "legacy"}))
     with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
         settings = load_settings()
-    assert settings.version == 3
+    assert settings.version == 4
     assert settings.refresh_minutes == 10
     assert settings.ntfy_topic == "legacy"
     assert settings.rules_for(Service.CLAUDE).thresholds == [50, 75, 90]
 
 
-def test_valid_v1_v2_v3_round_trips(tmp_path: Path) -> None:
-    """Valid persisted versions 1, 2 and 3 each load correctly."""
-    for version, refresh, topic in ((1, 5, "one"), (2, 10, "two"), (3, 15, "three")):
+def test_valid_v1_v2_v3_v4_round_trips(tmp_path: Path) -> None:
+    """Valid persisted versions 1, 2, 3 and 4 each load correctly."""
+    for version, refresh, topic in (
+        (1, 5, "one"),
+        (2, 10, "two"),
+        (3, 15, "three"),
+        (4, 30, "four"),
+    ):
         config = tmp_path / "moira" / "config.json"
         config.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
@@ -638,12 +643,14 @@ def test_valid_v1_v2_v3_round_trips(tmp_path: Path) -> None:
             "refresh_minutes": refresh,
             "ntfy_topic": topic,
         }
-        if version == 3:
+        if version >= 3:
             payload["rules"] = _valid_rules()
+        if version == 4:
+            payload["provider_profiles"] = {}
         config.write_text(json.dumps(payload))
         with patch.dict("os.environ", {"XDG_CONFIG_HOME": str(tmp_path)}):
             settings = load_settings()
-        assert settings.version == 3, version
+        assert settings.version == 4, version
         assert settings.refresh_minutes == refresh, version
         assert settings.ntfy_topic == topic, version
         config.unlink()

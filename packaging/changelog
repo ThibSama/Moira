@@ -23,14 +23,17 @@ moira (0.3.0) unstable; urgency=medium
     and Hermes hooks and the documented Codex app-server protocol with
     hashed identities, multi-turn correction, and Debian policy compliance
     with reproducible packaging; publication remains deferred.
-  * Package 7: read-only integration registry and Hermes inventory — an
-    Integrations page with an Agents section (controls moved from
-    Settings without behavior change) and a Providers and models
-    inventory with immutable provider-neutral types, exact states,
-    sanitized Hermes main/named model assignments from the installed
-    Hermes CLI, truthful capability badges (Claude percentage-only,
-    unknown balance/cost never zero), and bounded newest-wins probing
-    with generations; provider editing, Keyring credentials, DeepSeek
-    balance and financial units deferred.
+  * Package 7: read-only integration registry, Hermes inventory and local
+    provider profiles — an Integrations page with an Agents section
+    (controls moved from Settings without behavior change) and a
+    Providers and models inventory with immutable provider-neutral types,
+    exact states, sanitized Hermes main/named model assignments from the
+    installed Hermes CLI, truthful capability badges (Claude
+    percentage-only, unknown balance/cost never zero), bounded
+    newest-wins probing with generations, and an Edit providers view
+    managing local profiles (config v4) with per-profile Keyring
+    credentials (local only, HTTPS for remote base URLs, blank input
+    preserves, removal confirmed); Hermes writes, connection tests,
+    DeepSeek balance and financial units remain deferred.
 
  -- Thibault Paul <xpaul.thibault@gmail.com>  Wed, 05 Aug 2026 11:00:00 +0200

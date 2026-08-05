@@ -91,6 +91,7 @@ from .persistence import (
     save_settings,
     save_state,
 )
+from .provider_editor import ProviderEditor
 from .secrets import get_ntfy_token, set_ntfy_token
 from .updates import (
     STATUS_CHECK_FAILED,
@@ -581,7 +582,10 @@ class MainWindow(Adw.ApplicationWindow):
         Settings view without any behavior change: the same handlers,
         the same status labels and the same activity-event suffix.
         """
-        page = IntegrationsPage(on_visible_refresh=self._request_integrations_refresh)
+        page = IntegrationsPage(
+            on_visible_refresh=self._request_integrations_refresh,
+            on_edit_providers=self._open_provider_editor,
+        )
         self._integrations_page = page
         self._build_agents_section()
         return page
@@ -685,6 +689,31 @@ class MainWindow(Adw.ApplicationWindow):
             collect_codex=self.settings.collect_codex,
         )
         page.render_snapshot(snapshot)
+
+    # ── Provider profiles (Edit providers) ──
+
+    def _open_provider_editor(self, *_args: Any) -> None:
+        """Open the provider editor once; subsequent clicks focus it."""
+        editor = getattr(self, "_provider_editor", None)
+        if editor is not None:
+            editor.present()
+            return
+        editor = ProviderEditor(
+            submit=self.executor.submit,
+            on_profiles_changed=self._on_profiles_persisted,
+        )
+        self._provider_editor = editor
+        editor.present()
+
+    def _on_profiles_persisted(self) -> None:
+        """A profile change landed on disk: refresh the in-memory settings
+        and request one bounded inventory refresh."""
+        fresh = load_settings()
+        self.settings.provider_profiles = fresh.provider_profiles
+        page = getattr(self, "_integrations_page", None)
+        if page is not None:
+            self._request_integrations_refresh()
+            self._maybe_render_integrations()
 
     @staticmethod
     def _labeled(label: str, widget: Gtk.Widget) -> Gtk.Widget:

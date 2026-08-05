@@ -56,11 +56,12 @@ class IntegrationsPage(Gtk.Box):
     providers section is rebuilt from each published snapshot.
     """
 
-    def __init__(self, *, on_visible_refresh: Any = None) -> None:
+    def __init__(self, *, on_visible_refresh: Any = None, on_edit_providers: Any = None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self._shutdown = False
         self._visible = False
         self._on_visible_refresh = on_visible_refresh
+        self._on_edit_providers = on_edit_providers
         self.set_margin_top(18)
         self.set_margin_bottom(18)
         self.set_margin_start(18)
@@ -70,6 +71,9 @@ class IntegrationsPage(Gtk.Box):
         self.refresh_button = Gtk.Button(label=_("Refresh"))
         self.refresh_button.connect("clicked", self._on_refresh_clicked)
         header.append(self.refresh_button)
+        self.edit_providers_button = Gtk.Button(label=_("Edit providers"))
+        self.edit_providers_button.connect("clicked", self._on_edit_providers_clicked)
+        header.append(self.edit_providers_button)
         self.status_label = Gtk.Label(xalign=0)
         self.status_label.set_wrap(True)
         self.status_label.add_css_class("dim-label")
@@ -97,6 +101,11 @@ class IntegrationsPage(Gtk.Box):
         if self._shutdown or self._on_visible_refresh is None:
             return
         self._on_visible_refresh()
+
+    def _on_edit_providers_clicked(self, *_args: Any) -> None:
+        if self._shutdown or self._on_edit_providers is None:
+            return
+        self._on_edit_providers()
 
     def on_visible(self) -> None:
         """Page became visible: request one bounded inventory refresh."""

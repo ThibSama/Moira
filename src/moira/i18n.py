@@ -317,6 +317,56 @@ _FRENCH: dict[str, str] = {
     "no default model": "aucun modèle par défaut",
     "inventory probe failed": "échec de la sonde d'inventaire",
     "Claude remains percentage-only": "Claude reste en pourcentage uniquement",
+    # ── Package 7d: provider profiles and Keyring credentials ──
+    "Edit providers": "Modifier les fournisseurs",
+    "Add provider": "Ajouter un fournisseur",
+    "Edit provider": "Modifier le fournisseur",
+    "Slug": "Identifiant",
+    "Label": "Libellé",
+    "Kind": "Type",
+    "Model": "Modèle",
+    "Enabled": "Activé",
+    "API base URL": "URL de base de l'API",
+    "Hermes label": "Libellé Hermes",
+    "API key": "Clé API",
+    "Leave blank to keep the current credential.": (
+        "Laisser vide pour conserver l'identifiant actuel."
+    ),
+    "Changing the slug removes the previous profile and its credential.": (
+        "Changer l'identifiant retire le profil précédent et son identifiant du trousseau."
+    ),
+    "Credential": "Identifiant",
+    "Remove credential": "Retirer l'identifiant",
+    "Remove profile?": "Retirer le profil ?",
+    "This removes the profile and its Moira Keyring credential.": (
+        "Cela retire le profil et son identifiant Moira du trousseau."
+    ),
+    "Profile saved.": "Profil enregistré.",
+    "Profile removed.": "Profil retiré.",
+    "Credential removed.": "Identifiant retiré.",
+    "Keyring unavailable.": "Trousseau indisponible.",
+    "Operation failed.": "Échec de l'opération.",
+    "Invalid profile.": "Profil invalide.",
+    "Slug is reserved.": "Identifiant réservé.",
+    "Invalid slug.": "Identifiant invalide.",
+    "Label is required.": "Le libellé est requis.",
+    "Slug already in use.": "Identifiant déjà utilisé.",
+    "Remote base URLs must use https.": "Les URL de base distantes doivent utiliser https.",
+    "Local base URLs must use a loopback address.": (
+        "Les URL de base locales doivent utiliser une adresse de boucle locale."
+    ),
+    "Base URL must not embed credentials, query or fragment.": (
+        "L'URL de base ne doit pas contenir d'identifiants, de requête ou de fragment."
+    ),
+    "Invalid base URL.": "URL de base invalide.",
+    "Invalid model.": "Modèle invalide.",
+    "Invalid Hermes label.": "Libellé Hermes invalide.",
+    "Invalid kind.": "Type invalide.",
+    "Too many profiles.": "Trop de profils.",
+    "Saving…": "Enregistrement…",
+    "OpenAI compatible": "Compatible OpenAI",
+    "Local": "Local",
+    "Custom": "Personnalisé",
 }
 
 
