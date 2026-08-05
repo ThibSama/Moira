@@ -687,22 +687,27 @@ def _codex_token_state(
 ) -> tuple[IntegrationState, str]:
     """Codex exact-token badge from the history-backed availability view.
 
-    Collection disabled → NOT_CONFIGURED. Enabled: the latest typed
-    provider attempt governs — AVAILABLE_EXACT requires stored exact data
-    or an official summary; TEMPORARILY_UNAVAILABLE, INVALID and
-    UNSUPPORTED map exactly; no record or no stored data yet →
-    TEMPORARILY_UNAVAILABLE. Missing data is never converted to zero, and
-    old exact totals in History are never touched by the badge.
+    Precedence (Package 7c): the latest typed provider attempt is
+    authoritative for every status — only the AVAILABLE_EXACT attempt
+    requires stored exact data or an official summary to become AVAILABLE.
+    Collection disabled → NOT_CONFIGURED; no availability record (or a
+    latest AVAILABLE_EXACT without stored data) → TEMPORARILY_UNAVAILABLE
+    with the ``no exact token data yet`` detail; TEMPORARILY_UNAVAILABLE,
+    INVALID and UNSUPPORTED attempts map exactly. Missing data is never
+    converted to zero, and old exact totals in History are never touched
+    by the badge.
     """
     if not collect_codex:
         return IntegrationState.NOT_CONFIGURED, "collection disabled"
     if view is None:
         return IntegrationState.TEMPORARILY_UNAVAILABLE, "no exact token data yet"
     record = view.latest_for(Service.CODEX)
-    if record is None or not view.codex_has_exact_data:
+    if record is None:
         return IntegrationState.TEMPORARILY_UNAVAILABLE, "no exact token data yet"
     if record.status is HistoryStatus.AVAILABLE_EXACT:
-        return IntegrationState.AVAILABLE, ""
+        if view.codex_has_exact_data:
+            return IntegrationState.AVAILABLE, ""
+        return IntegrationState.TEMPORARILY_UNAVAILABLE, "no exact token data yet"
     if record.status is HistoryStatus.TEMPORARILY_UNAVAILABLE:
         return IntegrationState.TEMPORARILY_UNAVAILABLE, ""
     if record.status is HistoryStatus.INVALID:

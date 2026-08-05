@@ -312,33 +312,62 @@ def _codex_badge(snapshot: Any) -> tuple[IntegrationState, str]:
 
 
 @pytest.mark.parametrize(
-    "status, has_data, collect, expected",
+    "status, has_data, collect, expected_state, expected_detail",
     [
         # collection disabled → NOT_CONFIGURED regardless of history
-        (HistoryStatus.AVAILABLE_EXACT, True, False, IntegrationState.NOT_CONFIGURED),
+        (
+            HistoryStatus.AVAILABLE_EXACT,
+            True,
+            False,
+            IntegrationState.NOT_CONFIGURED,
+            "collection disabled",
+        ),
         # latest AVAILABLE_EXACT + stored data/summary → AVAILABLE
-        (HistoryStatus.AVAILABLE_EXACT, True, True, IntegrationState.AVAILABLE),
-        # AVAILABLE_EXACT without stored data → not available yet
-        (HistoryStatus.AVAILABLE_EXACT, False, True, IntegrationState.TEMPORARILY_UNAVAILABLE),
+        (HistoryStatus.AVAILABLE_EXACT, True, True, IntegrationState.AVAILABLE, ""),
+        # latest AVAILABLE_EXACT without stored data → not available yet
+        (
+            HistoryStatus.AVAILABLE_EXACT,
+            False,
+            True,
+            IntegrationState.TEMPORARILY_UNAVAILABLE,
+            "no exact token data yet",
+        ),
+        # the latest provider attempt is authoritative, with or without data
         (
             HistoryStatus.TEMPORARILY_UNAVAILABLE,
             True,
             True,
             IntegrationState.TEMPORARILY_UNAVAILABLE,
+            "",
         ),
-        (HistoryStatus.INVALID, True, True, IntegrationState.INVALID),
-        (HistoryStatus.UNSUPPORTED, True, True, IntegrationState.UNSUPPORTED),
+        (
+            HistoryStatus.TEMPORARILY_UNAVAILABLE,
+            False,
+            True,
+            IntegrationState.TEMPORARILY_UNAVAILABLE,
+            "",
+        ),
+        (HistoryStatus.INVALID, True, True, IntegrationState.INVALID, ""),
+        (HistoryStatus.INVALID, False, True, IntegrationState.INVALID, ""),
+        (HistoryStatus.UNSUPPORTED, True, True, IntegrationState.UNSUPPORTED, ""),
+        (HistoryStatus.UNSUPPORTED, False, True, IntegrationState.UNSUPPORTED, ""),
     ],
 )
 def test_codex_exact_token_mapping(
     status: HistoryStatus,
     has_data: bool,
     collect: bool,
-    expected: IntegrationState,
+    expected_state: IntegrationState,
+    expected_detail: str,
 ) -> None:
+    """Package 7c: the latest typed availability attempt governs the badge
+    for every status; only AVAILABLE_EXACT requires stored exact data to
+    become AVAILABLE. A latest INVALID or UNSUPPORTED attempt must never
+    degrade to TEMPORARILY_UNAVAILABLE when no exact rows/summary exist."""
     view = TokenStatusView((_record(status),), codex_has_exact_data=has_data)
-    state, _detail = _codex_badge(_snapshot(view, collect_codex=collect))
-    assert state is expected
+    state, detail = _codex_badge(_snapshot(view, collect_codex=collect))
+    assert state is expected_state
+    assert detail == expected_detail
 
 
 def test_codex_no_availability_or_data_yet_is_temporarily_unavailable() -> None:
@@ -515,6 +544,38 @@ def test_view_schema_mismatch_is_fixed_sanitized_state(tmp_path: Path) -> None:
     conn.close()
     view = read_token_status_view(db_path=db_path)
     assert view.latest == () and view.codex_has_exact_data is False
+
+
+@pytest.mark.parametrize(
+    "latest_status, expected_state",
+    [
+        (HistoryStatus.INVALID, IntegrationState.INVALID),
+        (HistoryStatus.UNSUPPORTED, IntegrationState.UNSUPPORTED),
+    ],
+)
+def test_integration_path_preserves_latest_state_without_stored_data(
+    tmp_path: Path, latest_status: HistoryStatus, expected_state: IntegrationState
+) -> None:
+    """Package 7c: through a real temporary History v4 database with a
+    latest INVALID/UNSUPPORTED Codex availability and no exact rows or
+    summary, the view → snapshot path preserves that authoritative state
+    instead of degrading to TEMPORARILY_UNAVAILABLE."""
+    from moira.history_db import record_token_availability
+
+    db_path = tmp_path / "history.sqlite3"
+    conn = _seed_history(db_path)
+    record_token_availability(
+        conn,
+        TokenAvailabilityRecord(
+            Service.CODEX, NOW, "codex-app-server:account/usage/read", latest_status
+        ),
+    )
+    conn.close()
+    view = read_token_status_view(db_path=db_path, now=NOW)
+    assert view.codex_has_exact_data is False
+    state, detail = _codex_badge(_snapshot(view))
+    assert state is expected_state
+    assert detail == ""
 
 
 # ── Coordinator hardening ────────────────────────────────────────────────────
