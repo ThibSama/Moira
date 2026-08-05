@@ -505,6 +505,7 @@ def test_coordinator_newest_pending_wins() -> None:
     coord.request(
         profile, "t3", lambda t, r: published.append(f"{t}:{r.state.value}")
     )  # replaces t2
+    assert published == ["t2:cancelled"]  # t2 terminates as CANCELLED — never silent
     assert len(queued) == 1  # only the first is dispatched
     fn, gen, p, token, cb = queued[0]
     with patch(
@@ -513,14 +514,14 @@ def test_coordinator_newest_pending_wins() -> None:
     ):
         fn(gen, p, token, cb)  # completes → publishes t1 AND dispatches the parked t3
     assert len(queued) == 2
-    assert published == ["t1:connected"]
+    assert published == ["t2:cancelled", "t1:connected"]
     fn2, gen2, p2, token2, cb2 = queued[1]
     with patch(
         "moira.provider_editor.run_connection_test",
         return_value=ctest.ConnectionResult(ctest.ConnectionState.AUTH_FAILED),
     ):
         fn2(gen2, p2, token2, cb2)
-    assert published == ["t1:connected", "t3:auth_failed"]  # t2 never ran
+    assert published == ["t2:cancelled", "t1:connected", "t3:auth_failed"]  # t2 already terminated
 
 
 def test_coordinator_cancel_discards_everything() -> None:

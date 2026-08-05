@@ -466,10 +466,11 @@ def test_newest_wins_under_promotion_failure_parked_during_rejection_dispatched(
         return_value=_result(ctest.ConnectionState.CONNECTED),
     ):
         fn(gen, p, token, cb)
-    assert published[0] == ("a", "connected")
+    assert published[0] == ("b", "cancelled")  # b was replaced by c: terminated as CANCELLED
+    assert ("a", "connected") in published
     assert ("c", "unreachable") in published  # c rejected deterministically
-    assert ("b", "unreachable") not in published  # b was replaced, never fires
-    assert len(queued) == 2  # a + d; b replaced, c rejected
+    assert ("b", "unreachable") not in published  # b never ran — it was cancelled
+    assert len(queued) == 2  # a + d; b cancelled, c rejected
     fn2, gen2, p2, token2, cb2 = queued[1]
     assert token2 == "d"  # parked-during-rejection is dispatched
     with patch(

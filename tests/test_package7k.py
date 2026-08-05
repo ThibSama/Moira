@@ -575,7 +575,10 @@ def test_rapid_retest_preserves_one_inflight_plus_newest_pending() -> None:
     published: list[str] = []
     for tag in ("a", "b", "c", "d"):
         coord.request(profile, tag, lambda t, r: published.append(f"{t}:{r.state.value}"))
-    assert len(queued) == 1  # only the first dispatched; the rest park (newest wins)
+    # Every superseded parked request terminates as CANCELLED; only the
+    # newest (d) stays parked.
+    assert published == ["b:cancelled", "c:cancelled"]
+    assert len(queued) == 1  # only the first dispatched
     fn, gen, p, token, cb = queued[0]
     with patch(
         "moira.provider_editor.run_connection_test",
@@ -583,14 +586,14 @@ def test_rapid_retest_preserves_one_inflight_plus_newest_pending() -> None:
     ):
         fn(gen, p, token, cb)
     assert len(queued) == 2  # only the newest parked (d) is promoted
-    assert published == ["a:connected"]
+    assert published == ["b:cancelled", "c:cancelled", "a:connected"]
     fn2, gen2, p2, token2, cb2 = queued[1]
     with patch(
         "moira.provider_editor.run_connection_test",
         return_value=_result(ctest.ConnectionState.RATE_LIMITED),
     ):
         fn2(gen2, p2, token2, cb2)
-    assert published == ["a:connected", "d:rate_limited"]
+    assert published == ["b:cancelled", "c:cancelled", "a:connected", "d:rate_limited"]
 
 
 def test_click_rejection_resets_row_status(

@@ -57,8 +57,10 @@ verified TLS, no redirects, no proxies, resolved-address policy,
 wall-time bounds with reaping, ten sanitized states, one in-flight
 plus one newest pending through an invariant-preserving coordinator
 whose submits recheck shutdown before committing (close submits
-nothing) and whose rejections reset the row deterministically — never
-stuck on "Testing…", results discarded on edit/remove/disable/
+nothing), whose rejections reset the row deterministically — never
+stuck on "Testing…" — and whose newest-wins replacement terminates
+the superseded request as cancelled through its own callback (no
+silent replacement), results discarded on edit/remove/disable/
 close and ephemeral — nothing persisted, single validated resolution
 carried as an immutable family/socktype/proto/sockaddr target with a
 direct connect and a getpeername check before any credential,

@@ -452,6 +452,21 @@ class _ConnectionCoordinator:
     cancellation before any Keyring read or spawn) and publishes
     nothing (the completion guard discards it).
 
+    NEWEST-WINS REPLACEMENTS TERMINATE AS CANCELLED — there is no
+    silent replacement: under the lock the new request ATOMICALLY
+    replaces the parked one, and the superseded request is completed
+    as ``CANCELLED`` through its own callback by an ITERATIVE drain
+    (``_drain_cancelled``) outside the lock, before the parking
+    ``request()`` returns. A superseded request is never dispatched, so
+    its cancellation is its single terminal disposition. A replacement
+    callback that raises or re-enters ``request()`` cannot corrupt
+    ``_inflight``/``_pending``, recurse without bound or duplicate a
+    completion: the re-entrant request parks (or replaces) under the
+    lock and appends to the drain, which the outermost drain on the
+    calling thread pops with a constant stack depth. After editor
+    shutdown (or a stale editor row) a completion is silently
+    discarded — the only silent cases.
+
     Failure recovery is ITERATIVE, never recursive: on a rejected
     submit (first or promoted) the failed generation is cleared and the
     newest parked request is detached ATOMICALLY under the lock; the
@@ -462,10 +477,12 @@ class _ConnectionCoordinator:
     remains — a request that parks during a rejection is re-attached
     and attempted, so no accepted request can orphan. Runner
     exceptions complete deterministically through the same
-    publish/promote path, ``cancel()`` invalidates in-flight and
-    pending generations atomically, and the row-level token check
-    (widget identity + render epoch) additionally discards results for
-    edited, renamed, removed or disabled profiles.
+    publish/promote path, ``cancel()`` invalidates in-flight, pending
+    and superseded generations atomically, and the row-level token
+    check (widget identity + render epoch + per-row click generation)
+    additionally discards results for edited, renamed, removed or
+    disabled profiles and for generations superseded by a newer click
+    on the same row.
     """
 
     def __init__(self, submit: Any, shutdown_event: threading.Event) -> None:
@@ -475,28 +492,65 @@ class _ConnectionCoordinator:
         self._generation = 0
         self._inflight: int | None = None
         self._pending: tuple[int, ProviderProfile, Any, Any] | None = None
+        #: Superseded requests awaiting their CANCELLED completion,
+        #: published ITERATIVELY by the drain (never under the lock).
+        self._cancelled: list[tuple[int, ProviderProfile, Any, Any]] = []
+        #: True while a drain runs on some thread: a replacement
+        #: callback re-entering ``request()`` appends to ``_cancelled``
+        #: instead of recursing into a nested drain (constant stack).
+        self._draining = False
 
     def request(self, profile: ProviderProfile, token: Any, callback: Any) -> bool:
         """Reserve the slot under the lock; the commit (shutdown recheck
         plus external submit) happens through ``_attempt`` outside the
         lock. Returns False when close already won, when close wins
-        before the commit, or when THIS first submit was rejected."""
+        before the commit, or when THIS first submit was rejected.
+
+        Replacement ordering (deterministic, documented): under the
+        lock the new request ATOMICALLY replaces the parked one; the
+        superseded request is then completed as CANCELLED through its
+        own callback by the ITERATIVE drain, outside the lock, before
+        this ``request()`` returns on the calling thread — a superseded
+        request is never dispatched, so its cancellation is its single
+        terminal disposition. A replacement callback that raises or
+        re-enters ``request()`` parks (or replaces) under the lock and
+        appends to the drain; the outermost drain on the calling thread
+        pops it with a constant stack depth, so re-entry can never
+        corrupt the slots, recurse without bound or duplicate a
+        completion.
+        """
         with self._lock:
             if self._shutdown.is_set():
                 return False  # close racing with request: no new work
             self._generation += 1
             generation = self._generation
             if self._inflight is not None:
+                replaced = self._pending
                 self._pending = (generation, profile, token, callback)  # newest wins
-                return True
-            self._inflight = generation
-        return self._attempt((generation, profile, token, callback))
+                if replaced is not None:
+                    self._cancelled.append(replaced)  # atomic detach under the lock
+            else:
+                self._inflight = generation
+        if self._inflight == generation:
+            # First request: the drain runs AFTER the submit attempt so
+            # a cancellation callback can never widen the
+            # reservation→commit window — a request it parks lands
+            # behind this generation, never stealing the slot.
+            result = self._attempt((generation, profile, token, callback))
+            self._drain_cancelled()
+            return result
+        # Parked request: publish the superseded CANCELLED completions
+        # before returning — the park is dispatched only when the
+        # in-flight generation completes.
+        self._drain_cancelled()
+        return True
 
     def _run(self, generation: int, profile: ProviderProfile, token: Any, callback: Any) -> None:
         if self._shutdown.is_set():
             with self._lock:
                 self._inflight = None
-                self._pending = None  # close discards everything
+                self._pending = None
+                self._cancelled.clear()  # close discards superseded completions too
             return  # queued work after close: zero Keyring, zero spawn
         try:
             result = run_connection_test(profile, cancel_event=self._shutdown)
@@ -508,6 +562,7 @@ class _ConnectionCoordinator:
             if self._shutdown.is_set():
                 self._inflight = None
                 self._pending = None
+                self._cancelled.clear()  # close discards superseded completions too
                 return  # close during the run: never publish
             if generation != self._inflight:
                 return  # superseded (cancelled): never publish
@@ -536,6 +591,7 @@ class _ConnectionCoordinator:
                 if self._shutdown.is_set():
                     self._inflight = None
                     self._pending = None
+                    self._cancelled.clear()  # close discards superseded completions too
                     return False
             try:
                 self._submit(self._run, *request)
@@ -555,6 +611,7 @@ class _ConnectionCoordinator:
                             if self._shutdown.is_set():
                                 self._inflight = None
                                 self._pending = None
+                                self._cancelled.clear()  # close discards everything
                             elif self._inflight is None:
                                 parked = self._pending
                                 self._pending = None
@@ -576,6 +633,7 @@ class _ConnectionCoordinator:
             if self._shutdown.is_set():
                 self._inflight = None
                 self._pending = None
+                self._cancelled.clear()  # close discards superseded completions too
                 return None, True
             if self._inflight == generation:
                 self._inflight = None
@@ -590,6 +648,40 @@ class _ConnectionCoordinator:
                     self._pending = parked
                     parked = None
         return parked, False
+
+    def _drain_cancelled(self) -> None:
+        """Publish the CANCELLED completions queued by replacements,
+        ITERATIVELY — never recursively. A replacement callback that
+        re-enters ``request()`` parks (or replaces) under the lock and
+        appends to the drain instead of recursing; the OUTERMOST drain
+        on the calling thread keeps popping until the drain is empty,
+        so the stack depth stays constant no matter how many requests
+        park during a cancellation. Every request is popped under the
+        lock and completed exactly once, outside the lock, never
+        raising (a failing publisher must not wedge the coordinator)."""
+        if self._draining:
+            return  # an enclosing drain on this thread owns the list
+        self._draining = True
+        try:
+            while True:
+                with self._lock:
+                    if not self._cancelled:
+                        return
+                    request = self._cancelled.pop(0)
+                self._cancel_replaced(request)
+        finally:
+            self._draining = False
+
+    @staticmethod
+    def _cancel_replaced(request: tuple[int, ProviderProfile, Any, Any]) -> None:
+        """Deterministic replacement completion: the superseded
+        request's row is reset from "Testing…" to the translated
+        Cancelled — outside the lock, exactly once, never raising."""
+        _generation, profile, token, callback = request
+        try:
+            callback(token, ConnectionResult(ConnectionState.CANCELLED, profile.slug))
+        except Exception:
+            pass
 
     @staticmethod
     def _reject(callback: Any, token: Any, profile: ProviderProfile) -> None:
@@ -606,6 +698,7 @@ class _ConnectionCoordinator:
             self._generation += 1
             self._inflight = None
             self._pending = None
+            self._cancelled.clear()  # close discards superseded completions too
 
 
 class ProviderEditor(Gtk.Window):
@@ -634,6 +727,7 @@ class ProviderEditor(Gtk.Window):
         self._pending_removal: str | None = None
         self._rendering = False
         self._row_epoch = 0
+        self._test_clicks: dict[str, int] = {}
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         root.set_margin_top(14)
@@ -900,7 +994,13 @@ class ProviderEditor(Gtk.Window):
         """Explicit click only; runs one bounded, read-only test per
         request. Disabled profiles remain testable (the toggle controls
         usage, not testability); editing, renaming, removing, disabling
-        or closing the profile discards any in-flight result."""
+        or closing the profile discards any in-flight result. Every
+        accepted request terminates exactly once: a newer click on the
+        same row supersedes the parked generation (its CANCELLED and
+        any late in-flight result are discarded by the per-row click
+        token), and a newer click on another row terminates the parked
+        request as the translated Cancelled.
+        """
         if self._shutdown:
             return
         widgets = self._row_widgets.get(slug)
@@ -910,20 +1010,28 @@ class ProviderEditor(Gtk.Window):
         if profile is None:
             return
         widgets["test_status"].set_text(_("Testing…"))
-        token = (slug, self._row_epoch, id(widgets))
+        self._test_clicks[slug] = self._test_clicks.get(slug, 0) + 1
+        # The token carries the per-row click generation: an older
+        # generation (a superseded CANCELLED completion or an in-flight
+        # result completing late) can never overwrite a newer
+        # "Testing…" or the final result of the same row.
+        token = (slug, self._row_epoch, id(widgets), self._test_clicks[slug])
         # The coordinator completes every request — including submit
         # rejections, which reset the row to a translated sanitized
-        # failure through the callback — so a row is never stuck.
+        # failure, and newest-wins replacements, which reset it to the
+        # translated Cancelled — so a row is never stuck.
         self._connection_coordinator.request(profile, token, self._publish_test_result)
 
     def _publish_test_result(self, token: Any, result: ConnectionResult) -> None:
         GLib.idle_add(self._apply_test_result, token, result)
 
     def _apply_test_result(self, token: Any, result: ConnectionResult) -> None:
-        slug, epoch, widgets_id = token
+        slug, epoch, widgets_id, click = token
         widgets = self._row_widgets.get(slug)
         if widgets is None or id(widgets) != widgets_id or epoch != self._row_epoch:
             return  # edited, renamed, removed, disabled or closed: discard
+        if click != self._test_clicks.get(slug, 0):
+            return  # superseded by a newer click on the same row: discard
         widgets["test_status"].set_text(_(_CONNECTION_STATE_LABELS[result.state]))
 
     # ── Add/edit form ──
