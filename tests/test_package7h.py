@@ -477,7 +477,7 @@ def _build_window(
     callbacks: list[tuple[Any, tuple[Any, ...]]] = []
     monkeypatch.setattr(GLib, "idle_add", lambda cb, *a: callbacks.append((cb, a)))
     if slow_recovery is not None:
-        monkeypatch.setattr("moira.ui.recover_pending_transaction", slow_recovery)
+        monkeypatch.setattr("moira.ui.MainWindow._run_recovery_bounded", slow_recovery)
     win = MainWindow(app, smoke_test=True)
     return win, callbacks
 
@@ -521,7 +521,7 @@ def test_startup_recovery_worker_exception_is_sanitized(
     """Every worker failure maps to a sanitized failure: controls stay
     disabled and the translated status is shown — no raw error."""
 
-    def boom() -> bool:
+    def boom(self: Any) -> bool:
         raise RuntimeError("vault exploded")
 
     win, callbacks = _build_window(env, monkeypatch, slow_recovery=boom)
@@ -540,7 +540,7 @@ def test_close_during_bootstrap_rejects_late_completion(
     started = threading.Event()
     release = threading.Event()
 
-    def slow() -> bool:
+    def slow(self: Any) -> bool:
         started.set()
         release.wait(2)
         return True
@@ -586,7 +586,7 @@ def test_mutation_controls_gated_until_bootstrap_lands(
     started = threading.Event()
     release = threading.Event()
 
-    def slow() -> bool:
+    def slow(self: Any) -> bool:
         started.set()
         release.wait(2)
         return True
@@ -610,16 +610,19 @@ def test_bootstrap_retry_on_next_window(
     """A failed bootstrap is retried on the next app start (fresh window):
     the second bootstrap succeeds and re-enables the controls."""
 
-    def boom() -> bool:
+    def boom(self: Any) -> bool:
         raise RuntimeError("vault exploded")
 
+    from moira.ui import MainWindow
+
+    real_bounded = MainWindow._run_recovery_bounded
     win1, callbacks1 = _build_window(env, monkeypatch, slow_recovery=boom)
     cb, args = _wait_startup_callback(win1, callbacks1)
     cb(*args)
     assert win1._save_settings_button.get_sensitive() is False
     win1._on_close_request()
     win1.close()
-    monkeypatch.setattr("moira.ui.recover_pending_transaction", recover_pending_transaction)
+    monkeypatch.setattr("moira.ui.MainWindow._run_recovery_bounded", real_bounded)
     win2, callbacks2 = _build_window(env, monkeypatch)
     cb, args = _wait_startup_callback(win2, callbacks2)
     cb(*args)
@@ -648,11 +651,12 @@ def test_journal_write_fault_before_any_effect_leaves_nothing(
     assert _journal_path(env).exists() is False or recover_pending_transaction() is True
 
 
-def test_journal_write_fault_after_store_keeps_rollback_phase(
+def test_journal_write_fault_after_persist_completes_forward(
     env: tuple[Path, _FakeSecret],
 ) -> None:
-    """A fault on the config-committed write leaves the rollback phase:
-    recovery rolls the staged secret back — no orphan, no loss."""
+    """A fault on the forward write (which happens AFTER a successful
+    persist): the operation is durably committed, so recovery completes
+    FORWARD — the new credential is kept, the backup is dropped."""
     _seed(env, _profile("deepseek-main"))
     env[1].items[("deepseek-main", "api_key")] = "sk-old"
     op = ProfileOp(
@@ -663,7 +667,7 @@ def test_journal_write_fault_after_store_keeps_rollback_phase(
 
     def flaky_write(entry: Any) -> None:
         calls["n"] += 1
-        if calls["n"] == 3:  # the config-committed write faults
+        if calls["n"] == 3:  # the config-committed write faults (after persist)
             raise OSError("no space")
         real_write(entry)
 
@@ -671,7 +675,7 @@ def test_journal_write_fault_after_store_keeps_rollback_phase(
         result = _execute_op(op)
     assert result.ok is False
     assert recover_pending_transaction() is True
-    assert env[1].items[("deepseek-main", "api_key")] == "sk-old"  # overwritten value restored
+    assert env[1].items[("deepseek-main", "api_key")] == "sk-new"  # committed forward
     assert ("deepseek-main", "backup") not in env[1].items
-    assert load_settings().provider_profiles[0].label == "DeepSeek main"
+    assert load_settings().provider_profiles[0].label == "Renamed"
     assert _journal_path(env).exists() is False

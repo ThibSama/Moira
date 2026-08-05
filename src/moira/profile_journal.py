@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from .integrations import ProviderKind, ProviderProfile, is_valid_profile_slug
-from .persistence import Settings, state_dir, update_settings
+from .persistence import Settings, load_settings, state_dir, update_settings
 from .secrets import (
     BACKUP_PURPOSE,
     KeyringMutation,
@@ -65,6 +65,9 @@ _VALID_PHASES = tuple(JournalPhase)
 _JOURNAL_KEYS = frozenset(
     {"version", "op", "phase", "profile", "old_slug", "slug", "secret_slug", "had_backup"}
 )
+#: The exact nested profile record — anything else (``api_key``,
+#: ``token``, ``credential``, ``secret``, arbitrary metadata) is rejected.
+_PROFILE_KEYS = frozenset({"slug", "label", "kind", "model", "enabled", "base_url", "hermes_label"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +193,17 @@ def read_journal() -> JournalEntry | None:
     raw = data["profile"]
     if not isinstance(raw, dict):
         raise ValueError("invalid journal profile")
+    if set(raw) != _PROFILE_KEYS:
+        raise ValueError("invalid journal profile keys")
+    # Concrete types are validated BEFORE construction: no defaults, no
+    # coercion, no secret-bearing or undeclared fields.
+    for name in ("slug", "label", "model", "base_url", "hermes_label"):
+        if not isinstance(raw[name], str):
+            raise ValueError(f"invalid journal profile {name} type")
+    if not isinstance(raw["kind"], str):
+        raise ValueError("invalid journal profile kind type")
+    if not isinstance(raw["enabled"], bool):
+        raise ValueError("invalid journal profile enabled type")
     try:
         profile = ProviderProfile(
             slug=raw["slug"],
@@ -298,20 +312,54 @@ def _complete_remove(entry: JournalEntry) -> bool:
 _RECOVERY_LOCK = threading.Lock()
 
 
+def _profile_persisted(profile: ProviderProfile) -> bool:
+    """True when the config already carries the journaled profile record
+    exactly. With the persist-before-forward-write ordering, this is the
+    ground truth that lets recovery choose one direction safely across a
+    crash between config persistence and the next journal write."""
+    try:
+        current = load_settings().provider_profiles
+    except Exception:
+        return False
+    return any(p == profile for p in current)
+
+
+def _slug_absent(slug: str) -> bool:
+    """True when the config no longer carries the slug (a removal already
+    persisted)."""
+    try:
+        current = load_settings().provider_profiles
+    except Exception:
+        return False
+    return not any(p.slug == slug for p in current)
+
+
 def _recover_save(entry: JournalEntry) -> bool:
     phase = entry.phase
     if phase == JournalPhase.STAGED:
-        # No side effect happened: purge any early backup intent and drop
-        # the journal (the op never started).
+        # No side effect happened (and none can have: staged is the
+        # pre-effect phase). Purge any early backup intent and drop the
+        # journal — the operation never started.
         if entry.had_backup and entry.secret_slug:
             if erase_provider_secret(entry.secret_slug, BACKUP_PURPOSE) is not KeyringMutation.DONE:
                 return False
         return clear_journal()
     if phase == JournalPhase.STAGED_SECRET:
-        if not _rollback_staged_secret(entry):
-            return False
+        # Two possible worlds, both safe and idempotent:
+        # - config persistence landed (crash between persist and the
+        #   forward write) → complete FORWARD — a durably committed
+        #   operation may complete forward, never roll back;
+        # - the store happened but the persist did not → roll the staged
+        #   secret effect back (restoring any backup).
+        if _profile_persisted(entry.profile) if entry.profile is not None else False:
+            if not _complete_forward(entry):
+                return False
+        else:
+            if not _rollback_staged_secret(entry):
+                return False
         return clear_journal()
-    # CONFIG_COMMITTED: complete forward.
+    # CONFIG_COMMITTED: the persist ran (the forward write comes after
+    # it) — complete forward.
     if not _complete_forward(entry):
         return False
     return clear_journal()
@@ -319,6 +367,12 @@ def _recover_save(entry: JournalEntry) -> bool:
 
 def _recover_remove(entry: JournalEntry) -> bool:
     if entry.phase == JournalPhase.STAGED:
+        # The removal persist either never ran (no-op: original preserved)
+        # or already landed (crash before the forward write): complete
+        # forward so no orphan credential outlives its profile.
+        if _slug_absent(entry.slug):
+            if not _complete_remove(entry):
+                return False
         return clear_journal()
     if not _complete_remove(entry):
         return False

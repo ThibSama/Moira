@@ -232,6 +232,23 @@ def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
             if store_provider_secret(profile.slug, value) is not KeyringMutation.DONE:
                 _rollback_staged(rollback_entry)
                 return _fail_result(op.kind, "Keyring unavailable.", profile.slug)
+        new_collection = tuple(sorted(base + [profile], key=lambda p: p.slug))
+        try:
+            _persist_profiles(new_collection)
+        except Exception:
+            # Known config failure: the journal is STILL in its rollback /
+            # no-op phase (the forward phase is only written AFTER a
+            # successful persist), so recovery rolls back / no-ops —
+            # never forward — with NO rewrite of the journal required.
+            # A failed cleanup keeps that rollback/no-op journal, retried
+            # idempotently.
+            if secret_slug:
+                _rollback_staged(rollback_entry)
+            else:
+                clear_journal()
+            return _fail_result(op.kind, "Operation failed.", profile.slug)
+        # Forward phase: written only after the config persist succeeded,
+        # so a failed persist can never leave a forward-recovery journal.
         write_journal(
             _journal_entry(
                 op,
@@ -242,32 +259,6 @@ def _execute_save_profile(op: ProfileOp) -> ProfileOpResult:
                 had_backup=had_backup,
             )
         )
-        new_collection = tuple(sorted(base + [profile], key=lambda p: p.slug))
-        try:
-            _persist_profiles(new_collection)
-        except Exception:
-            # Known config failure: durably transition to the ROLLBACK
-            # phase BEFORE touching any secret. With no secret staged the
-            # transaction performed zero Keyring side effects — durably
-            # select the no-op (pre-effect) phase first, so a failed
-            # cleanup can never leave a forward journal that would
-            # complete the already-failed op.
-            if secret_slug:
-                write_journal(rollback_entry)
-                _rollback_staged(rollback_entry)
-            else:
-                write_journal(
-                    _journal_entry(
-                        op,
-                        JournalPhase.STAGED,
-                        profile=profile,
-                        old_slug=op.old_slug,
-                        secret_slug="",
-                        had_backup=False,
-                    )
-                )
-                clear_journal()
-            return _fail_result(op.kind, "Operation failed.", profile.slug)
         if rename:
             if erase_provider_secret(op.old_slug) is not KeyringMutation.DONE:
                 # Restore the config FIRST; only transition to the
@@ -337,16 +328,17 @@ def _execute_remove_profile(op: ProfileOp) -> ProfileOpResult:
         return _ok_result(op.kind, current, op.slug)  # nothing to remove
     try:
         write_journal(_journal_entry(op, JournalPhase.STAGED))
-        write_journal(_journal_entry(op, JournalPhase.CONFIG_COMMITTED))
         try:
             _persist_profiles(new_collection)
         except Exception:
-            # Config unchanged: durably select the no-op (pre-effect)
-            # phase BEFORE cleanup, so a failed cleanup can never leave a
-            # forward journal that would complete the failed removal.
-            write_journal(_journal_entry(op, JournalPhase.STAGED))
+            # Config unchanged and the journal is still in its no-op
+            # phase (the forward phase is only written AFTER a successful
+            # persist): recovery no-ops — the original profile and
+            # credential are preserved. No rewrite of the journal needed.
             clear_journal()
             return _fail_result(op.kind, "Operation failed.", op.slug)
+        # Forward phase: written only after the config persist succeeded.
+        write_journal(_journal_entry(op, JournalPhase.CONFIG_COMMITTED))
         if erase_provider_secret(op.slug) is not KeyringMutation.DONE:
             try:
                 _persist_profiles(current)

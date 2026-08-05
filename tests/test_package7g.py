@@ -599,7 +599,7 @@ def test_startup_recovery_is_async_and_gates_mutation_controls(
     started = threading.Event()
     release = threading.Event()
 
-    def slow_recovery() -> bool:
+    def slow_recovery(self: Any) -> bool:
         started.set()
         release.wait(5)
         return True
@@ -607,7 +607,7 @@ def test_startup_recovery_is_async_and_gates_mutation_controls(
     app = Adw.Application(application_id="io.github.moira.QuotaMonitor.Test7g")
     win: MainWindow | None = None
     try:
-        with patch("moira.ui.recover_pending_transaction", slow_recovery):
+        with patch("moira.ui.MainWindow._run_recovery_bounded", slow_recovery):
             t0 = time.monotonic()
             win = MainWindow(app, smoke_test=True)
             elapsed = time.monotonic() - t0

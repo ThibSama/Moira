@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import functools
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -71,6 +72,7 @@ from .integrations import (
     build_snapshot,
     probe_hermes_inventory,
     read_token_status_view,
+    run_bounded,
 )
 from .integrations_page import IntegrationsPage
 from .models import (
@@ -92,7 +94,6 @@ from .persistence import (
     save_state,
     update_settings,
 )
-from .profile_journal import recover_pending_transaction
 from .provider_editor import ProviderEditor
 from .secrets import get_ntfy_token, set_ntfy_token
 from .updates import (
@@ -326,6 +327,12 @@ class DiagnosticsPage(Gtk.Box):
             return
         self.get_clipboard().set_text(self._text)
         self._status.set_text(_("Diagnostics copied."))
+
+
+#: Wall-time bound for the startup recovery child (seconds). A hung
+#: Keyring/config recovery is terminated and reaped at this boundary;
+#: the child arms the same bound itself via SIGALRM.
+_BOOTSTRAP_RECOVERY_TIMEOUT = 10.0
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -951,17 +958,41 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _startup_recovery(self) -> None:
         """Off-GTK, single-use bootstrap on the dedicated worker: converge
-        any crashed profile transaction. Every worker failure maps to a
-        sanitized failure; the outcome (and the post-recovery settings,
-        loaded on this worker — never in a GTK callback) is published
-        through the idle loop with generation and closure guards."""
+        any crashed profile transaction in a bounded, REAPED subprocess
+        (a hung Keyring/config recovery is terminated on timeout — never
+        an in-process uninterruptible thread). Every worker failure maps
+        to a sanitized failure; the outcome (and the post-recovery
+        settings, loaded on this worker — never in a GTK callback) is
+        published through the idle loop with generation and closure
+        guards."""
         try:
-            recovered = recover_pending_transaction()
+            recovered = self._run_recovery_bounded()
             settings = load_settings() if recovered else None
         except Exception:
             recovered = False
             settings = None
         GLib.idle_add(self._finish_startup_recovery, recovered, settings, self._recovery_generation)
+
+    def _recovery_command(self) -> list[str]:
+        """The bounded recovery child. The child arms its own wall-clock
+        alarm (from the timeout argument) so an orphaned child can never
+        outlive its bound either."""
+        return [
+            sys.executable,
+            "-c",
+            "import signal, sys\n"
+            "signal.alarm(int(float(sys.argv[1])))\n"
+            "from moira.profile_journal import recover_pending_transaction\n"
+            "sys.exit(0 if recover_pending_transaction() else 3)\n",
+            str(_BOOTSTRAP_RECOVERY_TIMEOUT),
+        ]
+
+    def _run_recovery_bounded(self) -> bool:
+        """Run journal recovery in a bounded, reaped subprocess. True only
+        on a clean exit 0; timeout, overflow, spawn failure or a
+        non-zero exit map to a sanitized fail-closed result."""
+        result = run_bounded(self._recovery_command(), timeout=_BOOTSTRAP_RECOVERY_TIMEOUT)
+        return result is not None and result.returncode == 0
 
     def _finish_startup_recovery(
         self, recovered: bool, settings: Settings | None, generation: int
