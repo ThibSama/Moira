@@ -55,7 +55,10 @@ connection test (Keyring credential via a private child stdin pipe,
 documented Models endpoints only, no inference or balance calls,
 verified TLS, no redirects, no proxies, resolved-address policy,
 wall-time bounds with reaping, ten sanitized states, one in-flight
-plus one newest pending, results discarded on edit/remove/disable/
+plus one newest pending through an invariant-preserving coordinator
+whose submits recheck shutdown before committing (close submits
+nothing) and whose rejections reset the row deterministically — never
+stuck on "Testing…", results discarded on edit/remove/disable/
 close and ephemeral — nothing persisted, single validated resolution
 carried as an immutable family/socktype/proto/sockaddr target with a
 direct connect and a getpeername check before any credential,

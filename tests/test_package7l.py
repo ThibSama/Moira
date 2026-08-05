@@ -448,6 +448,10 @@ def test_close_racing_request_submits_no_new_work() -> None:
 
 
 def test_close_during_inflight_run_zero_keyring_zero_spawn_for_queued() -> None:
+    """Close racing the in-flight completion: the parked request is
+    NEVER submitted after close (the promotion commit rechecks shutdown)
+    — zero submits, so zero Keyring reads and zero spawns by
+    construction, and nothing publishes."""
     submit, queued = _capture_submit()
     event = threading.Event()
     coord = _ConnectionCoordinator(submit, event)
@@ -467,14 +471,11 @@ def test_close_during_inflight_run_zero_keyring_zero_spawn_for_queued() -> None:
     ):
         fn(gen, p, token, close_during_publish)
     assert published == ["connected"]  # only t1; t2 never publishes
-    fn2, gen2, p2, token2, cb2 = queued[1]  # t2 was promoted and dispatched
-    runs = {"n": 0}
-    with patch(
-        "moira.provider_editor.run_connection_test",
-        side_effect=lambda *a, **k: runs.__setitem__("n", runs["n"] + 1),
-    ):
-        fn2(gen2, p2, token2, cb2)
-    assert runs["n"] == 0  # queued work after close: zero Keyring reads, zero spawn
+    assert len(queued) == 1  # t2 was NOT submitted after close (zero submit)
+    with coord._lock:
+        assert coord._inflight is None
+        assert coord._pending is None  # no latched generation, no orphan slot
+    coord.cancel()
 
 
 def test_first_rejection_resets_row_to_translated_failure(

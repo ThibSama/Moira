@@ -435,24 +435,35 @@ def _form_error_key(exc: ValueError) -> str:
 class _ConnectionCoordinator:
     """One in-flight connection test plus one NEWEST pending request.
 
-    Runs off GTK through the editor's submit; every request bumps a
-    generation and a completion publishes only while its generation is
-    still the in-flight one — newer requests replace the parked one and
-    shutdown (``cancel``) discards everything, so stale results never
-    publish. Submit rejections (first or promotion) clear the slot AND
-    give the rejected request its deterministic rejection completion (a
-    translated sanitized failure through its own callback) OUTSIDE the
-    lock, so no row can stay on "Testing…" and no submitter or callback
-    is ever invoked under the lock; a request that parks while a
-    promotion fails is still dispatched (the pending slot is emptied
-    before promotion, so the recursion is bounded to one level).
-    Shutdown is rechecked under the lock: a close racing with
-    request/promotion submits no new work, and queued work checks
-    cancellation BEFORE executing, so after close it performs zero
-    Keyring reads and zero spawns (the shutdown event is passed to the
-    test as its cancellation signal). Runner exceptions complete
-    deterministically through the same publish/promote path, so no
-    failure can wedge the coordinator. The row-level token check
+    A single invariant-preserving state machine owns every transition:
+    exactly one of (idle) ``_inflight is None and _pending is None``,
+    (running) ``_inflight == gen and _pending is None``, or (parked)
+    ``_inflight == gen_a`` with ``_pending == (gen_b, ...)`` for a newer
+    gen_b — ``_pending`` is NEVER set while ``_inflight`` is None, and
+    submitters, runners and callbacks are never invoked under the lock.
+
+    Reservation/commit protocol: ``request()`` reserves the slot under
+    the lock; every external submit goes through ``_attempt()``, which
+    RECHECKS shutdown under the lock immediately before committing the
+    submit. If close wins between the reservation and the commit, the
+    reservation and any parked work are released and zero submits
+    happen — uncommitted work is never submitted after cancellation.
+    Work already committed before close self-bounds (``_run`` checks
+    cancellation before any Keyring read or spawn) and publishes
+    nothing (the completion guard discards it).
+
+    Failure recovery is ITERATIVE, never recursive: on a rejected
+    submit (first or promoted) the failed generation is cleared and the
+    newest parked request is detached ATOMICALLY under the lock; the
+    failed request is completed deterministically through its own
+    callback (a translated sanitized failure resetting its row from
+    "Testing…") OUTSIDE the lock; then the detached request is
+    attempted, looping until a submit is accepted or no parked request
+    remains — a request that parks during a rejection is re-attached
+    and attempted, so no accepted request can orphan. Runner
+    exceptions complete deterministically through the same
+    publish/promote path, ``cancel()`` invalidates in-flight and
+    pending generations atomically, and the row-level token check
     (widget identity + render epoch) additionally discards results for
     edited, renamed, removed or disabled profiles.
     """
@@ -466,6 +477,10 @@ class _ConnectionCoordinator:
         self._pending: tuple[int, ProviderProfile, Any, Any] | None = None
 
     def request(self, profile: ProviderProfile, token: Any, callback: Any) -> bool:
+        """Reserve the slot under the lock; the commit (shutdown recheck
+        plus external submit) happens through ``_attempt`` outside the
+        lock. Returns False when close already won, when close wins
+        before the commit, or when THIS first submit was rejected."""
         with self._lock:
             if self._shutdown.is_set():
                 return False  # close racing with request: no new work
@@ -475,22 +490,13 @@ class _ConnectionCoordinator:
                 self._pending = (generation, profile, token, callback)  # newest wins
                 return True
             self._inflight = generation
-        try:
-            self._submit(self._run, generation, profile, token, callback)
-        except Exception:
-            # Submit rejection: clear the slot (never latched) and give
-            # THIS request its deterministic rejection completion (the
-            # row is reset from "Testing…" to a translated sanitized
-            # failure) — outside the lock, never propagated to GTK.
-            with self._lock:
-                if self._inflight == generation:
-                    self._inflight = None
-            self._reject(callback, token, profile)
-            return False
-        return True
+        return self._attempt((generation, profile, token, callback))
 
     def _run(self, generation: int, profile: ProviderProfile, token: Any, callback: Any) -> None:
         if self._shutdown.is_set():
+            with self._lock:
+                self._inflight = None
+                self._pending = None  # close discards everything
             return  # queued work after close: zero Keyring, zero spawn
         try:
             result = run_connection_test(profile, cancel_event=self._shutdown)
@@ -499,8 +505,12 @@ class _ConnectionCoordinator:
             # the SAME publish/promote path as a normal outcome.
             result = ConnectionResult(ConnectionState.UNREACHABLE, profile.slug)
         with self._lock:
-            if self._shutdown.is_set() or generation != self._inflight:
-                return  # superseded or closed: never publish
+            if self._shutdown.is_set():
+                self._inflight = None
+                self._pending = None
+                return  # close during the run: never publish
+            if generation != self._inflight:
+                return  # superseded (cancelled): never publish
             pending = self._pending
             self._pending = None
             self._inflight = pending[0] if pending is not None else None
@@ -509,29 +519,77 @@ class _ConnectionCoordinator:
         except Exception:
             pass  # a failing publisher must not wedge the coordinator
         if pending is not None:
-            self._dispatch_promotion(pending)
+            self._attempt(pending)
 
-    def _dispatch_promotion(self, pending: tuple[int, ProviderProfile, Any, Any]) -> None:
-        generation, profile, token, callback = pending
-        try:
-            self._submit(self._run, generation, profile, token, callback)
-        except Exception:
-            # Promotion rejection: clear the slot, complete the PROMOTED
-            # request deterministically, then dispatch any request that
-            # parked while this one failed (never orphaned). The pending
-            # slot was emptied before promotion, so the recursion is
-            # bounded to one level per concurrent request.
-            parked: tuple[int, ProviderProfile, Any, Any] | None = None
+    def _attempt(self, request: tuple[int, ProviderProfile, Any, Any]) -> bool:
+        """Commit ``request`` (whose generation is ALREADY reserved in
+        ``_inflight``) through the reservation/commit protocol, or on
+        rejection recover and ITERATIVELY attempt the newest parked
+        request — never recursively. Returns True iff the ORIGINAL
+        request's submit was accepted by the executor."""
+        first = True
+        while True:
+            # Commit recheck: close winning here releases the reservation
+            # and performs ZERO submits (uncommitted work is never
+            # submitted after cancellation).
             with self._lock:
-                if self._inflight == generation:
+                if self._shutdown.is_set():
                     self._inflight = None
-                parked = self._pending
+                    self._pending = None
+                    return False
+            try:
+                self._submit(self._run, *request)
+                return first
+            except Exception:
+                # Submit rejection: atomically clear the failed
+                # generation and detach the newest parked request.
+                generation, profile, token, callback = request
+                parked, closed = self._recover_submit_failure(generation)
+                if not closed:
+                    # Deterministic rejection completion (row reset from
+                    # "Testing…") OUTSIDE the lock; a request parking
+                    # DURING the rejection must stay reachable.
+                    self._reject(callback, token, profile)
+                    if parked is None:
+                        with self._lock:
+                            if self._shutdown.is_set():
+                                self._inflight = None
+                                self._pending = None
+                            elif self._inflight is None:
+                                parked = self._pending
+                                self._pending = None
+                                if parked is not None:
+                                    self._inflight = parked[0]
+                if parked is None:
+                    return False
+                first = False
+                request = parked
+
+    def _recover_submit_failure(
+        self, generation: int
+    ) -> tuple[tuple[int, ProviderProfile, Any, Any] | None, bool]:
+        """Atomically clear the failed generation and detach the newest
+        parked request, handing it the slot. Returns ``(parked, closed)``:
+        the request to attempt next (or None) and whether close already
+        discarded everything (in which case nothing may publish)."""
+        with self._lock:
+            if self._shutdown.is_set():
+                self._inflight = None
                 self._pending = None
-                if parked is not None:
-                    self._inflight = parked[0]
-            self._reject(callback, token, profile)
+                return None, True
+            if self._inflight == generation:
+                self._inflight = None
+            parked = self._pending
+            self._pending = None
             if parked is not None:
-                self._dispatch_promotion(parked)
+                if self._inflight is None:
+                    self._inflight = parked[0]
+                else:
+                    # Another attempt owns the slot: keep the detached
+                    # request reachable through that attempt's completion.
+                    self._pending = parked
+                    parked = None
+        return parked, False
 
     @staticmethod
     def _reject(callback: Any, token: Any, profile: ProviderProfile) -> None:
