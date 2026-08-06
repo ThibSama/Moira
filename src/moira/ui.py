@@ -722,6 +722,9 @@ class MainWindow(Adw.ApplicationWindow):
             token_status=probe.token_status,
             collect_claude=self.settings.collect_claude,
             collect_codex=self.settings.collect_codex,
+            # Package 7q: the local typed profiles feed the capability
+            # matrix (balance support derives from ProviderKind).
+            profiles=self.settings.provider_profiles,
         )
         page.render_snapshot(snapshot)
 

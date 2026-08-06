@@ -38,8 +38,16 @@ Mapping (strict, fail closed): 200 → AVAILABLE/INSUFFICIENT from
 ``is_available``; 401/403 → AUTH_FAILED; 402 → INSUFFICIENT without
 invented amounts; 429 → RATE_LIMITED; 5xx → SERVER_ERROR; transport and
 TLS failures stay distinct (UNREACHABLE / TLS_ERROR); every other
-status and every unknown outcome is INVALID_RESPONSE. A successful
-refresh implies NOTHING about token, cost or usage support
+status and every unknown outcome is INVALID_RESPONSE. The child is
+crash-safe (Package 7q): a top-level sanitized exception boundary turns
+any uncaught exception or import failure into the distinct exit 11 with
+nothing on stderr (never a traceback, never an alias of exit 1 /
+NOT_CONFIGURED); the child alarm and the parent deadline share ONE
+deterministic timeout state (exit 12 / TIMEOUT → UNREACHABLE); deep
+JSON (RecursionError) is failed closed; non-empty stderr, abnormal or
+signal exits, unknown codes and malformed stdout are all
+INVALID_RESPONSE, and raw stderr is never rendered or retained. A
+successful refresh implies NOTHING about token, cost or usage support
 (``balance=available`` is reported only for the supported DeepSeek
 adapter). Results are ephemeral: nothing is written to config, schema,
 History, activity, exports or logs.
@@ -139,19 +147,39 @@ def parse_amount(text: object) -> Decimal | None:
         value = Decimal(text)
     except InvalidOperation:
         return None
-    if not value.is_finite() or value < 0 or value >= MAX_AMOUNT_MAGNITUDE:
-        return None
-    if len(value.as_tuple().digits) > MAX_SIGNIFICANT_DIGITS:
-        return None
-    exponent = value.as_tuple().exponent
-    if not isinstance(exponent, int) or exponent < -MAX_FRACTION_DIGITS:
+    if not _amount_decimal_ok(value):
         return None
     return value
 
 
+def _amount_decimal_ok(value: Decimal) -> bool:
+    """True when the Decimal respects the parser's exact bounded contract.
+
+    The SINGLE shared check behind ``parse_amount`` and ``BalanceEntry``:
+    finite, non-negative, below the magnitude bound, within the
+    significant-digit bound and within the fraction-digit bound. A
+    ``BalanceEntry`` can therefore never hold an amount the parser would
+    reject.
+    """
+    if not value.is_finite() or value < 0 or value.is_signed() or value >= MAX_AMOUNT_MAGNITUDE:
+        return False
+    if len(value.as_tuple().digits) > MAX_SIGNIFICANT_DIGITS:
+        return False
+    exponent = value.as_tuple().exponent
+    if not isinstance(exponent, int) or exponent < -MAX_FRACTION_DIGITS:
+        return False
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class BalanceEntry:
-    """One validated currency's exact balances (Decimal only)."""
+    """One validated currency's exact balances (Decimal only).
+
+    Every amount respects the parser's exact bounded contract: finite,
+    non-negative, below the magnitude bound, within the significant- and
+    fraction-digit bounds — an entry can never hold a value ``parse_amount``
+    would reject (Package 7q criterion 5).
+    """
 
     currency: str
     total_balance: Decimal
@@ -162,8 +190,11 @@ class BalanceEntry:
         if self.currency not in _CURRENCY_ORDER:
             raise ValueError(f"currency must be one of {_CURRENCY_ORDER}")
         for name in ("total_balance", "granted_balance", "topped_up_balance"):
-            if not isinstance(getattr(self, name), Decimal):
+            value = getattr(self, name)
+            if not isinstance(value, Decimal):
                 raise ValueError(f"{name} must be a Decimal")
+            if not _amount_decimal_ok(value):
+                raise ValueError(f"{name} violates the exact bounded amount contract")
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,11 +235,17 @@ class BalanceResult:
         object.__setattr__(self, "entries", ordered)
 
 
-#: Exit-code contract of the dedicated balance child. 1 is reserved for
+#: Exit-code contract of the dedicated balance child (Package 7q: no
+#: abnormal exit may alias a valid state). 1 is reserved for
 #: NOT_CONFIGURED (the parent normally fails closed before spawning);
 #: 0/3 are the only amount-bearing states and print the canonical JSON;
-#: every other outcome is explicit — unknown codes map to
-#: INVALID_RESPONSE (unknown outcomes never become AVAILABLE).
+#: 11 is the top-level sanitized crash boundary (any uncaught exception
+#: or import failure — never a traceback on stderr, so a crashed child
+#: can never become NOT_CONFIGURED); 12 is the child's own alarm, which
+#: shares ONE deterministic timeout state with the parent deadline
+#: (UNREACHABLE). Every other outcome is explicit — unknown, signal or
+#: negative codes map to INVALID_RESPONSE (unknown outcomes never
+#: become AVAILABLE). Non-empty stderr fails closed in the parent.
 _CHILD_CODES: dict[int, BalanceState] = {
     0: BalanceState.AVAILABLE,
     1: BalanceState.NOT_CONFIGURED,
@@ -221,6 +258,8 @@ _CHILD_CODES: dict[int, BalanceState] = {
     8: BalanceState.UNSUPPORTED,
     9: BalanceState.CANCELLED,
     10: BalanceState.SERVER_ERROR,
+    11: BalanceState.INVALID_RESPONSE,  # sanitized crash boundary
+    12: BalanceState.UNREACHABLE,  # the child's own alarm (one timeout state)
 }
 
 
@@ -238,24 +277,41 @@ def _reject_non_finite(_value: str) -> Any:
 #: compared before any TLS or HTTP header, SNI/hostname verification on
 #: the ORIGINAL hostname); no redirects; no proxy environment. Outcome
 #: = exit code (0/3 for amount states, plus canonical JSON on stdout).
+#:
+#: Package 7q crash safety: ALL imports live inside ``main()`` and the
+#: whole script runs under a top-level sanitized exception boundary —
+#: an uncaught exception or import failure exits the DISTINCT code 11
+#: with NOTHING on stderr (no traceback), so a crashed child can never
+#: alias exit 1 (NOT_CONFIGURED). The child alarm exits 12 (the same
+#: timeout state as the parent deadline, UNREACHABLE); deep JSON raises
+#: ``RecursionError`` and control-character credentials are each failed
+#: closed explicitly.
 _BALANCE_CHILD_CODE = r"""
-import http.client
-import json
+import os
 import signal
-import socket
-import ssl
 import sys
-from urllib.parse import urlsplit
-
-from moira.balance import parse_amount
-from moira.connection_test import contains_secret_keys, resolve_target, same_endpoint
 
 
-def _reject_constant(_value):
-    raise ValueError("non-finite constant")
+def _timeout_exit(_signum, _frame):
+    # The child alarm and the parent deadline share ONE deterministic
+    # timeout state (12 → UNREACHABLE). os._exit: no cleanup, no
+    # exception propagation, no partial output.
+    os._exit(12)
 
 
 def main() -> int:
+    import http.client
+    import json
+    import socket
+    import ssl
+    from urllib.parse import urlsplit
+
+    from moira.balance import parse_amount
+    from moira.connection_test import contains_secret_keys, resolve_target, same_endpoint
+
+    def _reject_constant(_value):
+        raise ValueError("non-finite constant")
+
     try:
         url, connect_s, read_s, total_s, cap_s, policy = sys.argv[1:7]
         connect = float(connect_s)
@@ -264,10 +320,13 @@ def main() -> int:
         cap = int(cap_s)
     except (IndexError, ValueError):
         return 7  # invalid response: malformed invocation
-    signal.alarm(int(total))  # self-bound, mirroring the parent's bound
+    signal.signal(signal.SIGALRM, _timeout_exit)
+    signal.alarm(max(1, int(total)))  # self-bound, mirroring the parent's bound
     key = sys.stdin.read().strip()
     if not key:
         return 1  # not configured (the parent normally fails before spawn)
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in key):
+        return 7  # control characters could inject headers: invalid response
     try:
         parts = urlsplit(url)
         if parts.scheme == "https":
@@ -335,10 +394,12 @@ def main() -> int:
     # a REAL boolean, a non-empty bounded array, unique CNY/USD entries
     # and exact bounded string amounts; extra, missing,
     # secret/account-bearing or malformed data is INVALID_RESPONSE.
+    # Deep nesting raises RecursionError — failed closed like any
+    # malformed body (never an uncaught crash).
     try:
         payload = json.loads(body, parse_constant=_reject_constant)
-    except (ValueError, UnicodeDecodeError):
-        return 7  # invalid response: malformed JSON (NaN/Infinity rejected)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return 7  # invalid response: malformed or too-deep JSON
     if not isinstance(payload, dict) or contains_secret_keys(payload):
         return 7
     if set(payload) != {"is_available", "balance_infos"}:
@@ -385,7 +446,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(11)  # sanitized crash boundary: no traceback, never alias exit 1
 """.replace("%(max_infos)d", str(MAX_BALANCE_INFOS))
 
 
@@ -401,8 +465,8 @@ def _decode_child_output(raw: str) -> tuple[bool, tuple[BalanceEntry, ...]] | No
         return None
     try:
         payload = json.loads(text, parse_constant=_reject_non_finite)
-    except (ValueError, UnicodeDecodeError):
-        return None
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None  # malformed, NaN/Infinity or too-deep JSON
     if not isinstance(payload, dict) or set(payload) != {"is_available", "currencies"}:
         return None
     is_available = payload["is_available"]
@@ -463,6 +527,10 @@ def bounded_balance_refresh(
         return preflight
     if len(key.encode("utf-8")) > MAX_KEY_BYTES:
         return BalanceResult(BalanceState.INVALID_RESPONSE, profile.slug)
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in key):
+        # Control characters in a credential could inject HTTP headers:
+        # rejected BEFORE any spawn (the child re-checks independently).
+        return BalanceResult(BalanceState.INVALID_RESPONSE, profile.slug)
     result = run_bounded(
         [
             sys.executable,
@@ -483,6 +551,14 @@ def bounded_balance_refresh(
     if result.outcome is ProbeOutcome.TIMEOUT:
         return BalanceResult(BalanceState.UNREACHABLE, profile.slug)
     if result.outcome is not ProbeOutcome.OK:
+        return BalanceResult(BalanceState.INVALID_RESPONSE, profile.slug)
+    if result.returncode is None or result.returncode < 0:
+        # Abnormal/signal exits never alias a valid state: a child killed
+        # by a signal is INVALID_RESPONSE, never NOT_CONFIGURED.
+        return BalanceResult(BalanceState.INVALID_RESPONSE, profile.slug)
+    if result.stderr.strip():
+        # Non-empty stderr (warnings, tracebacks, crash text) fails
+        # closed. The raw text is never rendered or retained anywhere.
         return BalanceResult(BalanceState.INVALID_RESPONSE, profile.slug)
     state = _CHILD_CODES.get(result.returncode) if result.returncode is not None else None
     if state is None:

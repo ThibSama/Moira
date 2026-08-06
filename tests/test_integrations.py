@@ -539,14 +539,15 @@ def test_snapshot_full_capability_matrix() -> None:
     assert caps[("hermes", "quota_percentage")].state is IntegrationState.UNSUPPORTED
     assert caps[("hermes", "exact_tokens")].state is IntegrationState.UNSUPPORTED
     assert caps[("hermes", "balance")].state is IntegrationState.UNSUPPORTED
-    # Discovered providers: balance/cost NOT_CONFIGURED and deferred — the
-    # /user/balance endpoint is never called in 7a.
+    # Discovered providers without a typed local profile: no adapter
+    # knowledge — balance is UNSUPPORTED (fail closed; never
+    # NOT_CONFIGURED/"deferred"), cost stays deferred (Package 7q).
     for slug in ("deepseek", "openrouter"):
         assert caps[(slug, "activity")].state is IntegrationState.UNSUPPORTED
         assert caps[(slug, "quota_percentage")].state is IntegrationState.UNSUPPORTED
         assert caps[(slug, "exact_tokens")].state is IntegrationState.UNSUPPORTED
-        assert caps[(slug, "balance")].state is IntegrationState.NOT_CONFIGURED
-        assert caps[(slug, "balance")].detail == "deferred"
+        assert caps[(slug, "balance")].state is IntegrationState.UNSUPPORTED
+        assert caps[(slug, "balance")].detail == ""
         assert caps[(slug, "cost")].state is IntegrationState.NOT_CONFIGURED
         assert caps[(slug, "cost")].detail == "deferred"
     assert [p.slug for p in snapshot.providers] == [
@@ -1004,7 +1005,9 @@ def test_page_structure_and_snapshot_rendering_en() -> None:
             f"{tr('Exact tokens')}: {tr('Unsupported')} ({tr('Claude remains percentage-only')})"
             in texts
         )
-        assert f"{tr('Balance')}: {tr('Not configured')} ({tr('deferred')})" in texts
+        # Package 7q: a discovered provider without a typed local profile
+        # reports balance as Unsupported; cost stays deferred.
+        assert f"{tr('Balance')}: {tr('Unsupported')}" in texts
         # Unknown cost/balance is a state, never a zero value.
         assert "0" not in [t for t in texts if "Balance" in t or "Cost" in t]
         local = NOW.astimezone()
@@ -1023,7 +1026,7 @@ def test_page_structure_and_snapshot_rendering_fr() -> None:
         assert "Fournisseurs et modèles" in texts
         assert tr("Integrations") == "Intégrations"
         assert f"deepseek-v4-flash ({tr('Principal')})" in texts
-        assert "Solde: Non configuré (différé)" in texts
+        assert "Solde: Non pris en charge" in texts
         assert "Pourcentage de quota: Disponible" in texts
         assert "Jetons exacts: Non pris en charge (Claude reste en pourcentage uniquement)" in texts
 

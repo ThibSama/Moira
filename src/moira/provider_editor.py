@@ -914,10 +914,36 @@ class ProviderEditor(Gtk.Window):
     def _request_op(self, op: ProfileOp) -> None:
         if self._shutdown or self._recovery_blocked:
             return
+        # Package 7q: every mutation invalidates test and balance row
+        # generations at the START of the action — before the persistence
+        # op runs — so a late completion performs ZERO GTK writes even
+        # when persistence blocks, is rejected or fails.
+        self._invalidate_test_balance_generations()
         if self._in_flight:
             self._pending_op = op  # newest-wins replacement
             return
         self._start_op(op)
+
+    def _invalidate_test_balance_generations(self) -> None:
+        """Invalidate test and balance generations when a mutation BEGINS
+        (edit, toggle, remove confirmation, credential removal, save or
+        rename — rebuilds invalidate through ``_render_list``).
+
+        Bumping the render epoch makes every outstanding row token stale:
+        a late completion can never pass the epoch guard, so it performs
+        ZERO GTK writes. The visible working states are reset to their
+        truthful initial values (no status for the test, "Not checked"
+        for the balance) so no stale or stuck status lingers while the
+        persistence op blocks, is rejected or fails.
+        """
+        self._row_epoch += 1
+        for widgets in self._row_widgets.values():
+            test_status = widgets.get("test_status")
+            if test_status is not None:
+                test_status.set_text("")
+            balance_status = widgets.get("balance_status")
+            if balance_status is not None:
+                balance_status.set_text(_("Not checked"))
 
     def _start_op(self, op: ProfileOp) -> None:
         self._generation += 1
@@ -1126,6 +1152,10 @@ class ProviderEditor(Gtk.Window):
     def _on_edit_clicked(self, _button: Any, slug: str) -> None:
         if self._shutdown:
             return
+        # Package 7q: editing begins — in-flight test/balance results are
+        # invalidated NOW (before the form opens), so a late completion
+        # can never write to the row being edited.
+        self._invalidate_test_balance_generations()
         profile = next((p for p in self._profiles if p.slug == slug), None)
         if profile is not None:
             self._show_form(profile)
@@ -1133,6 +1163,9 @@ class ProviderEditor(Gtk.Window):
     def _on_remove_clicked(self, _button: Any, slug: str) -> None:
         if self._shutdown:
             return
+        # Package 7q: the remove confirmation begins a mutation — the
+        # row's in-flight test/balance results are invalidated NOW.
+        self._invalidate_test_balance_generations()
         self._pending_removal = slug
         self._refresh_row_confirm(slug)
 

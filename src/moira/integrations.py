@@ -954,6 +954,7 @@ def build_snapshot(
     token_status: TokenStatusView | None = None,
     collect_claude: bool = True,
     collect_codex: bool = True,
+    profiles: Sequence[ProviderProfile] = (),
     now: datetime | None = None,
 ) -> IntegrationSnapshot:
     """Assemble the immutable integration snapshot from accepted sources.
@@ -962,15 +963,23 @@ def build_snapshot(
     collector/history quota readings (Claude/Codex quota capabilities),
     the history-backed ``TokenStatusView`` (Codex exact-token capability,
     derived from the latest typed availability record and stored exact
-    data/summaries through the existing History query path), and the
-    decoded Hermes inventory (provider/model assignments). Discovered
-    assignments are collapsed deterministically: the main provider wins
-    over a same-slug named entry, named entries colliding with the
-    reserved runtime slugs are dropped, and everything is sorted by
-    (role, slug) / slug. Capability badges are independent and truthful:
-    Claude stays percentage-only, Codex's badge reflects the latest
-    provider attempt while old exact totals stay untouched, and unknown
-    cost/balance is a state, never a zero value.
+    data/summaries through the existing History query path), the decoded
+    Hermes inventory (provider/model assignments) and — Package 7q — the
+    LOCAL typed provider profiles (a bounded immutable sequence; only
+    slug, label and kind are used — credentials, URLs and raw
+    configuration never enter the snapshot). Discovered assignments are
+    collapsed deterministically: the main provider wins over a same-slug
+    named entry, named entries colliding with the reserved runtime slugs
+    are dropped, and everything is sorted by (role, slug) / slug.
+    Capability badges are independent and truthful: Claude stays
+    percentage-only, Codex's badge reflects the latest provider attempt
+    while old exact totals stay untouched, unknown cost/balance is a
+    state never a zero value, and balance support is derived ONLY from
+    the typed ``ProviderKind`` — a local DeepSeek profile may report
+    ``balance=available`` (the implemented adapter), every other kind
+    and every profile-less discovered provider stays UNSUPPORTED.
+    Reporting balance support changes no token, cost, usage, quota or
+    activity badge.
     """
     if not isinstance(hermes, HermesInventory):
         raise ValueError("hermes must be a HermesInventory value")
@@ -980,6 +989,15 @@ def build_snapshot(
         raise ValueError("quota_readings must be a sequence")
     if token_status is not None and not isinstance(token_status, TokenStatusView):
         raise ValueError("token_status must be a TokenStatusView value")
+    if not isinstance(profiles, Sequence):
+        raise ValueError("profiles must be a sequence")
+    profile_tuple = tuple(profiles)  # bounded immutable input
+    if len(profile_tuple) > MAX_PROFILES:
+        raise ValueError(f"too many profiles (limit {MAX_PROFILES})")
+    for profile in profile_tuple:
+        if not isinstance(profile, ProviderProfile):
+            raise ValueError("profiles must contain ProviderProfile values")
+    local_by_slug = {profile.slug: profile for profile in profile_tuple}
     observed_at = now or utc_now()
     if observed_at.tzinfo is None:
         raise ValueError("now must be timezone-aware")
@@ -1001,14 +1019,17 @@ def build_snapshot(
             detail = report.detail
         runtimes.append(RuntimeIntegration(runtime.value, runtime_labels[runtime], state, detail))
 
-    # ── Provider identities: runtimes first, then discovered, sorted ──
+    # ── Provider identities: runtimes first, then local typed profiles
+    # ── (deduplicated against the inventory), then discovered, sorted ──
     discovered_slugs = {hermes.main_provider} if hermes.main_provider else set()
     discovered_slugs.update(slug for slug, _model in hermes.named)
     discovered_slugs -= set(_RUNTIME_SLUGS)
     providers: list[ProviderIdentity] = [
         ProviderIdentity(slug, label) for slug, label in runtime_labels.items()
     ]
-    for slug in sorted(discovered_slugs):
+    for slug in sorted(local_by_slug):
+        providers.append(ProviderIdentity(slug, local_by_slug[slug].label))
+    for slug in sorted(discovered_slugs - set(local_by_slug)):
         providers.append(ProviderIdentity(slug, slug))
 
     # ── Model assignments (Hermes inventory only), collapsed ──
@@ -1102,13 +1123,36 @@ def build_snapshot(
             CapabilityState("hermes", "cost", IntegrationState.UNSUPPORTED),
         ]
     )
-    for slug in sorted(discovered_slugs):
+    # Package 7q: balance support is derived ONLY from the typed kind of
+    # a LOCAL profile — DeepSeek reports the implemented adapter as
+    # available, every other kind stays UNSUPPORTED. Discovered providers
+    # with no typed profile have no adapter knowledge: balance stays
+    # UNSUPPORTED (never NOT_CONFIGURED/"deferred" — that would claim an
+    # unconfigured capability). Cost remains deferred for every local and
+    # discovered provider; the runtimes never report balance or cost.
+    for slug in sorted(local_by_slug):
+        kind = local_by_slug[slug].kind
+        balance_state = (
+            IntegrationState.AVAILABLE
+            if kind is ProviderKind.DEEPSEEK
+            else IntegrationState.UNSUPPORTED
+        )
         capabilities_out.extend(
             [
                 CapabilityState(slug, "activity", IntegrationState.UNSUPPORTED),
                 CapabilityState(slug, "quota_percentage", IntegrationState.UNSUPPORTED),
                 CapabilityState(slug, "exact_tokens", IntegrationState.UNSUPPORTED),
-                CapabilityState(slug, "balance", IntegrationState.NOT_CONFIGURED, "deferred"),
+                CapabilityState(slug, "balance", balance_state),
+                CapabilityState(slug, "cost", IntegrationState.NOT_CONFIGURED, "deferred"),
+            ]
+        )
+    for slug in sorted(discovered_slugs - set(local_by_slug)):
+        capabilities_out.extend(
+            [
+                CapabilityState(slug, "activity", IntegrationState.UNSUPPORTED),
+                CapabilityState(slug, "quota_percentage", IntegrationState.UNSUPPORTED),
+                CapabilityState(slug, "exact_tokens", IntegrationState.UNSUPPORTED),
+                CapabilityState(slug, "balance", IntegrationState.UNSUPPORTED),
                 CapabilityState(slug, "cost", IntegrationState.NOT_CONFIGURED, "deferred"),
             ]
         )

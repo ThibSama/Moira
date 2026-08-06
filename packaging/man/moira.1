@@ -38,7 +38,10 @@ Base URLs, credentials, paths and raw output are never displayed;
 Claude remains percentage\-only, the Codex exact\-token badge follows
 the latest typed availability observation in History (with stored exact
 data or an official summary for the available state), and unknown
-balance/cost is a state, never zero. DeepSeek balance
+balance/cost is a state, never zero. Balance support derives only from
+typed local provider kinds: a DeepSeek profile reports balance as
+available (the implemented exact adapter), every other kind and every
+profile\-less discovered provider stays unsupported. DeepSeek balance
 is refreshed only through the explicit Refresh balance action on
 DeepSeek profile rows (Edit providers); the inventory itself makes no
 \fB/user/balance\fR call, and a successful refresh never implies token,

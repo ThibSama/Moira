@@ -66,6 +66,23 @@ moira (0.3.0) unstable; urgency=medium
     time/body/output, reaping) with minimal canonical JSON on stdout
     only and ephemeral results that never imply token, cost or usage
     support, reusing the same linearizable coordinator;
+    hardened in Package 7q: the balance child is crash-safe (a
+    top-level sanitized exception boundary exits the distinct code 11
+    with nothing on stderr so a crashed child can never alias
+    not-configured, the child alarm and the parent deadline share one
+    deterministic timeout state, deep JSON and header-injecting
+    credentials fail closed, and non-empty stderr, signal exits,
+    unknown codes and malformed stdout are invalid responses that are
+    never rendered or retained), every balance amount enforces the
+    parser's exact finite/non-negative/precision/magnitude contract,
+    edit/toggle/remove-confirmation/credential-removal/save/rename
+    invalidate test and balance generations immediately (late
+    completions perform zero GTK writes even when persistence blocks,
+    rejects or fails), and the capability matrix derives balance
+    support only from typed provider kinds — a DeepSeek profile
+    reports balance available, every other kind and every profile-less
+    discovered provider stays unsupported — without changing any
+    token, cost, usage, quota or activity badge;
     Hermes writes, financial units and publication remain deferred.
 
  -- Thibault Paul <xpaul.thibault@gmail.com>  Wed, 05 Aug 2026 11:00:00 +0200
