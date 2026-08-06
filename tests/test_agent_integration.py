@@ -152,24 +152,27 @@ def test_hermes_test_does_not_alter_external_config(
 # ── Codex ──
 
 
-def test_codex_capability_unsupported_without_binary(
+def test_codex_capability_not_installed_without_binary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     report = probe_capability(AgentRuntime.CODEX)
-    assert report.level == "unsupported"
+    assert report.level == "not_installed"  # explicit, truthful (Package 8a)
     assert report.detail
 
 
-def test_codex_setup_reprobes_and_remove_is_noop(
+def test_codex_setup_and_remove_without_binary_are_explicit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     setup_result = setup_runtime(AgentRuntime.CODEX)
     assert not setup_result.changed
-    assert setup_result.capability.level == "unsupported"
+    assert setup_result.capability.level == "not_installed"
     remove_result = remove_runtime(AgentRuntime.CODEX)
     assert not remove_result.changed
+    assert remove_result.capability.level == "not_installed"
 
 
 def test_codex_test_proves_real_boundary_without_persisting(
@@ -225,6 +228,7 @@ for raw in sys.stdin:
     )
     binary.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))  # no real hooks
     real_state = tmp_path / "real-state"
     monkeypatch.setenv("XDG_STATE_HOME", str(real_state))
     result = fire_runtime_test(AgentRuntime.CODEX)
@@ -251,6 +255,7 @@ def test_live_probes_report_truthfully(tmp_path: Path) -> None:
             "full",
             "session_owned",
             "completion_only",
+            "awaiting_trust",
             "unsupported",
             "not_installed",
         )

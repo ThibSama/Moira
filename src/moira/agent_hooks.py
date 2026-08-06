@@ -1,17 +1,23 @@
-"""Packaged agent hook entry — the command Claude Code and Hermes invoke.
+"""Packaged agent hook entry — the command Claude Code, Codex CLI and Hermes invoke.
 
-Usage: ``moira-agent-hook <runtime>`` where ``<runtime>`` is ``claude`` or
-``hermes``. Reads a bounded JSON payload from stdin, extracts only the
-privacy-minimal identity/model fields, records the typed activity event and
-exits 0 with EMPTY stdout — the fixed observer output. Any failure (bad
-JSON, oversized input, store error, unknown event) is silent and still
-exits 0: hooks are network-free, bounded-input, fixed-output and
-nonblocking, and failure leaves the agent untouched.
+Usage: ``moira-agent-hook <runtime>`` where ``<runtime>`` is ``claude``,
+``codex`` or ``hermes``. Reads a bounded JSON payload from stdin,
+extracts only the privacy-minimal identity/model fields, records the
+typed activity event and exits 0 with EMPTY stdout — the fixed observer
+output. Any failure (bad JSON, oversized input, store error, unknown
+event) is silent and still exits 0: hooks are network-free,
+bounded-input, fixed-output and nonblocking, and failure leaves the
+agent untouched.
 
 Never stored: prompts, responses, transcripts, paths, raw payloads,
 error/stop details, accounts or secrets. Claude Code hook inputs carry
-``prompt``, ``last_assistant_message``, ``error`` and ``error_details`` —
-all of them are ignored here.
+``prompt``, ``last_assistant_message``, ``error`` and ``error_details``;
+Codex hook inputs carry ``cwd``, ``transcript_path``, ``prompt``,
+``last_assistant_message``, ``permission_mode`` and ``source`` — all of
+them are ignored here (Codex is the user-level lifecycle contract of
+Package 8a: SessionStart/UserPromptSubmit/Stop from
+``$CODEX_HOME/hooks.json``; only the documented scalars
+``hook_event_name``, ``session_id``, ``turn_id`` and ``model`` are read).
 
 The wrapper honours ``XDG_STATE_HOME`` for the activity store, which lets
 tests and the settings-page test action redirect writes to a throwaway
@@ -27,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from .activity import (
+    MAX_RAW_IDENTITY_LEN,
     ActivityEvent,
     ActivityOutcome,
     ActivityState,
@@ -34,6 +41,7 @@ from .activity import (
     AgentRuntime,
     LastActivityEvent,
     composite_identity,
+    sanitize_model,
     validate_identity,
 )
 
@@ -55,6 +63,19 @@ CLAUDE_EVENT_STATES: dict[str, ActivityState] = {
     "Stop": ActivityState.COMPLETED,
     "StopFailure": ActivityState.FAILED,
     "SessionEnd": ActivityState.INTERRUPTED,
+}
+
+#: Codex CLI user-level lifecycle events Moira observes (Package 8a).
+#: SessionStart is validated for the trust marker but never fabricates
+#: activity; UserPromptSubmit starts a turn; Stop is the documented
+#: neutral terminal event (Codex documents no failure outcome in the
+#: Stop payload — failures are only ever mapped from an explicit
+#: documented outcome; a missing Stop expires through the watchdog to
+#: INTERRUPTED, never to success).
+CODEX_OBSERVED_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop")
+CODEX_EVENT_STATES: dict[str, ActivityState] = {
+    "UserPromptSubmit": ActivityState.RUNNING,
+    "Stop": ActivityState.COMPLETED,
 }
 
 #: Hermes shell-hook events Moira observes.
@@ -224,13 +245,69 @@ def _record_hermes(payload: dict[str, Any], store: ActivityStore) -> None:
         )
 
 
+def _record_codex(payload: dict[str, Any], store: ActivityStore) -> None:
+    """Record one Codex CLI lifecycle event (Package 8a, bounded decode).
+
+    Accepts ONLY the documented user-level events and the documented
+    scalar fields ``hook_event_name``, ``session_id``, ``turn_id`` and
+    ``model``; every other field (cwd, transcript_path, prompt,
+    last_assistant_message, permission_mode, source, agent_type, …) is
+    ignored and never stored. SessionStart validates the session and
+    proves Codex executed the hook (trust marker) but NEVER fabricates
+    activity, model, tokens or outcome. UserPromptSubmit starts one
+    RUNNING turn; Stop terminates the exact documented turn when a
+    ``turn_id`` exists, otherwise the store closes only the newest
+    compatible running turn in that validated session.
+    """
+    event_name = payload.get("hook_event_name")
+    if not isinstance(event_name, str) or event_name not in CODEX_OBSERVED_EVENTS:
+        return  # an event Moira does not own — observer ignores it
+    session_raw = payload.get("session_id")
+    if not isinstance(session_raw, str) or not session_raw.strip():
+        return
+    try:
+        session_hash = validate_identity(session_raw)
+    except ValueError:
+        return
+    # Documented scalars only (fail closed): a present-but-non-string or
+    # oversized turn id rejects the whole event — the derived fallback is
+    # reserved for a genuinely ABSENT turn id (requirement 3).
+    turn_raw = payload.get("turn_id")
+    turn_hash = None
+    if turn_raw is not None:
+        if not isinstance(turn_raw, str) or len(turn_raw) > MAX_RAW_IDENTITY_LEN:
+            return
+        if turn_raw.strip():
+            turn_hash = composite_identity(session_raw, turn_raw)
+    model_raw = payload.get("model")
+    if model_raw is not None and not isinstance(model_raw, str):
+        return  # a non-scalar model is malformed — never recorded
+    model = sanitize_model(model_raw if isinstance(model_raw, str) else "")
+    from .codex_hooks import write_verified_marker
+
+    write_verified_marker()  # Codex really executed the hook → trust evidence
+    state = CODEX_EVENT_STATES.get(event_name)
+    if state is None:
+        return  # SessionStart: metadata validated, zero fabricated activity
+    store.record(
+        ActivityEvent(
+            runtime=AgentRuntime.CODEX,
+            state=state,
+            session_hash=session_hash,
+            turn_hash=turn_hash,
+            model=model,
+            at=datetime.now(UTC),
+        )
+    )
+
+
 def agent_hook_main(argv: list[str] | None = None) -> int:
     """Run the packaged hook for one runtime. Always exits 0, empty stdout."""
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
         return 0
     runtime = args[0]
-    if runtime not in ("claude", "hermes"):
+    if runtime not in ("claude", "codex", "hermes"):
         return 0
     payload_text = _read_bounded_stdin()
     if payload_text is None:
@@ -245,6 +322,8 @@ def agent_hook_main(argv: list[str] | None = None) -> int:
         store = ActivityStore()
         if runtime == "claude":
             _record_claude(payload, store)
+        elif runtime == "codex":
+            _record_codex(payload, store)
         else:
             _record_hermes(payload, store)
     except Exception:

@@ -874,15 +874,16 @@ def _activity_state(level: str) -> IntegrationState:
     """Map an ``agent_integration`` capability level to an exact state.
 
     ``full`` and ``session_owned`` are available; ``not_installed`` maps
-    to NOT_INSTALLED; ``completion_only`` (a reduced Codex capability)
-    maps to TEMPORARILY_UNAVAILABLE; anything else (including the
-    unsupported level) maps to UNSUPPORTED.
+    to NOT_INSTALLED; ``completion_only`` and ``awaiting_trust`` (the
+    reduced Codex capabilities) map to TEMPORARILY_UNAVAILABLE —
+    truthful, never claimed supported or unsupported; anything else
+    (including the unsupported level) maps to UNSUPPORTED.
     """
     if level in ("full", "session_owned"):
         return IntegrationState.AVAILABLE
     if level == "not_installed":
         return IntegrationState.NOT_INSTALLED
-    if level == "completion_only":
+    if level in ("completion_only", "awaiting_trust"):
         return IntegrationState.TEMPORARILY_UNAVAILABLE
     return IntegrationState.UNSUPPORTED
 

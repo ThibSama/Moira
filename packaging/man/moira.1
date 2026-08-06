@@ -27,9 +27,13 @@ copied; history can be exported as CSV/JSON; manual update checks use
 strict SemVer parsing.
 .PP
 The Integrations view contains the Agents section (Set up / Remove /
-Test controls for Claude Code and Hermes hooks and Moira\-owned Codex
-app\-server sessions, moved from the Settings view without behavior
-change) and a read\-only Providers and models inventory: capability
+Test controls for Claude Code, Codex CLI and Hermes; the Codex setup
+installs the Moira\-owned user\-level lifecycle hooks in
+\fB$CODEX_HOME/hooks.json\fR \-\- SessionStart, UserPromptSubmit and
+Stop \-\- without touching Codex's private trust state, and the
+capability is reported honestly as full (hooks verified), awaiting
+trust, session\-owned (Moira app\-server sessions only) or
+unsupported) and a read\-only Providers and models inventory: capability
 badges per provider (activity, quota percentage, exact tokens, balance,
 cost) and the Hermes main model plus discovered named providers, read
 from the installed Hermes CLI (\fBhermes config get model \-\-json\fR and

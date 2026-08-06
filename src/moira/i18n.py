@@ -275,6 +275,20 @@ _FRENCH: dict[str, str] = {
         "Complétions Codex uniquement — session indisponible."
     ),
     "Codex activity is unsupported.": "L'activité Codex n'est pas prise en charge.",
+    "Codex CLI is not installed.": "Le CLI Codex n'est pas installé.",
+    "Codex hooks are not supported by this version of Codex.": (
+        "Les hooks Codex ne sont pas pris en charge par cette version de Codex."
+    ),
+    "The Codex hooks feature is disabled.": (
+        "La fonctionnalité de hooks Codex est désactivée."
+    ),
+    "Codex CLI hooks installed and verified.": (
+        "Hooks du CLI Codex installés et vérifiés."
+    ),
+    "Codex CLI hooks installed — approve the Codex hook trust prompt.": (
+        "Hooks du CLI Codex installés — approuvez la demande de confiance des hooks Codex."
+    ),
+    "Codex CLI hook callbacks verified.": "Rappels de hooks du CLI Codex vérifiés.",
     "Codex turn notifications verified (real app-server session).": (
         "Notifications de tour Codex vérifiées (session app-server réelle)."
     ),

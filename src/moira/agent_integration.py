@@ -4,19 +4,21 @@ One facade the Settings page uses for the three agent runtimes (Claude
 Code, Codex CLI, Hermes):
 
 - ``probe_capability`` reports the current capability (full /
-  session-owned / completion-only / unsupported / not installed) with a
-  sanitized detail;
+  session-owned / awaiting-trust / completion-only / unsupported / not
+  installed) with a sanitized detail;
 - ``setup_runtime`` installs only Moira-owned entries (Claude Code hooks
-  + status line, Hermes shell hooks) and never touches anything Moira
-  does not own; Codex has nothing to install — setup re-probes the
-  documented app-server protocol;
+  + status line, Codex CLI user-level lifecycle hooks in
+  ``$CODEX_HOME/hooks.json`` with the ownership-scoped hooks feature
+  flag, Hermes shell hooks) and never touches anything Moira does not
+  own (Codex trust state is NEVER written or bypassed);
 - ``remove_runtime`` removes only owned entries;
 - ``test_runtime`` proves the integration boundary: Claude and Hermes
   fire the installed hook callbacks with the documented payloads, Codex
-  starts a real Moira-owned app-server session and verifies real turn
-  notifications — always against a throwaway ``XDG_STATE_HOME`` so fake
-  events never persist into the real activity store and quota-alert
-  deduplication is never altered.
+  fires its documented lifecycle payloads through the installed hooks
+  (or, without hooks, starts a real Moira-owned app-server session and
+  verifies real turn notifications) — always against a throwaway
+  ``XDG_STATE_HOME`` so fake events never persist into the real
+  activity store and quota-alert deduplication is never altered.
 
 Every failure returns a fixed translated outcome; raw exceptions never
 reach the UI.
@@ -37,6 +39,13 @@ from .agent_hooks import agent_hook_main
 from .claude_integration import remove as remove_claude
 from .claude_integration import setup as setup_claude
 from .codex_activity import CodexCapability, CodexSession, CodexSessionError, probe_codex
+from .codex_hooks import clear_verified_marker as codex_clear_marker
+from .codex_hooks import enable_hooks_feature as codex_enable_hooks_feature
+from .codex_hooks import feature_state as codex_feature_state
+from .codex_hooks import hooks_installed as codex_hooks_installed
+from .codex_hooks import marker_exists
+from .codex_hooks import remove as remove_codex_hooks
+from .codex_hooks import setup as setup_codex_hooks
 from .hermes_hooks import remove as remove_hermes
 from .hermes_hooks import setup as setup_hermes
 from .hermes_hooks import test_hooks as test_hermes_hooks
@@ -99,6 +108,25 @@ def probe_capability(runtime: AgentRuntime) -> CapabilityReport:
             "full", _("Hermes ") + probe.version + " — " + _("shell hooks available.")
         )
     # Codex
+    if shutil.which("codex") is None:
+        return CapabilityReport("not_installed", _("Codex CLI is not installed."))
+    feature = codex_feature_state()
+    if feature == "removed":
+        return CapabilityReport(
+            "unsupported",
+            _("Codex hooks are not supported by this version of Codex."),
+        )
+    if feature == "disabled":
+        return CapabilityReport("unsupported", _("The Codex hooks feature is disabled."))
+    if codex_hooks_installed():
+        if marker_exists():
+            return CapabilityReport("full", _("Codex CLI hooks installed and verified."))
+        # Truthful reduced state: the hook is installed but Codex has NOT
+        # yet run it — the user must approve Codex's own trust prompt.
+        return CapabilityReport(
+            "awaiting_trust",
+            _("Codex CLI hooks installed — approve the Codex hook trust prompt."),
+        )
     capability = probe_codex()
     if capability is CodexCapability.SESSION_OWNED:
         return CapabilityReport(
@@ -135,8 +163,23 @@ def setup_runtime(runtime: AgentRuntime) -> IntegrationResult:
         except Exception:
             return IntegrationResult(False, probe_capability(runtime))
         return IntegrationResult(changed, probe_capability(runtime))
-    # Codex: nothing to install — re-probe the documented protocol.
-    return IntegrationResult(False, probe_capability(runtime))
+    # Codex: install the user-level lifecycle hooks. The supported hooks
+    # feature flag is enabled through Codex's OWN documented
+    # ``features enable`` surface (ownership-scoped — never a hand edit
+    # of config.toml, never Codex trust state); the hooks themselves are
+    # Moira-owned entries merged into ``$CODEX_HOME/hooks.json``.
+    if shutil.which("codex") is None:
+        return IntegrationResult(False, probe_capability(runtime))
+    feature = codex_feature_state()
+    if feature == "removed":
+        return IntegrationResult(False, probe_capability(runtime))
+    if feature == "disabled" and not codex_enable_hooks_feature():
+        return IntegrationResult(False, probe_capability(runtime))
+    try:
+        changed = setup_codex_hooks()
+    except Exception:
+        return IntegrationResult(False, probe_capability(runtime))
+    return IntegrationResult(changed, probe_capability(runtime))
 
 
 def remove_runtime(runtime: AgentRuntime) -> IntegrationResult:
@@ -153,8 +196,14 @@ def remove_runtime(runtime: AgentRuntime) -> IntegrationResult:
         except Exception:
             return IntegrationResult(False, probe_capability(runtime))
         return IntegrationResult(changed, probe_capability(runtime))
-    # Codex: nothing owned to remove.
-    return IntegrationResult(False, probe_capability(runtime))
+    # Codex: remove only the Moira-owned hooks.json entries and the
+    # Moira-owned verification marker; Codex trust state is untouched.
+    try:
+        changed = remove_codex_hooks()
+    except Exception:
+        return IntegrationResult(False, probe_capability(runtime))
+    codex_clear_marker()
+    return IntegrationResult(changed, probe_capability(runtime))
 
 
 def _fire_payload(payload: dict[str, Any], runtime: str) -> None:
@@ -284,24 +333,92 @@ def _codex_test() -> bool:
         return last is not None and last["state"] != ActivityState.RUNNING.value
 
 
+def _codex_hooks_test() -> bool:
+    """Prove the installed Codex hook callbacks with documented payloads.
+
+    Fires the exact documented lifecycle payloads (SessionStart,
+    UserPromptSubmit, Stop) through the packaged hook into a throwaway
+    ``XDG_STATE_HOME`` and verifies the turn lifecycle and the trust
+    marker. Never touches the real activity store.
+    """
+    with tempfile.TemporaryDirectory() as temp:
+        previous = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = temp
+        try:
+            store = ActivityStore()
+            _fire_payload(
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "moira-test-codex-session",
+                    "model": "gpt-5.2-codex",
+                    "cwd": "/must/never/be/stored",
+                },
+                "codex",
+            )
+            _fire_payload(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "moira-test-codex-session",
+                    "turn_id": "moira-test-codex-turn-1",
+                    "model": "gpt-5.2-codex",
+                    "prompt": "must never be stored",
+                },
+                "codex",
+            )
+            _fire_payload(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "moira-test-codex-session",
+                    "turn_id": "moira-test-codex-turn-1",
+                    "model": "gpt-5.2-codex",
+                    "last_assistant_message": "must never be stored",
+                },
+                "codex",
+            )
+            store.reload()
+            sessions = store.snapshot()["sessions"].get("codex", {})
+            if len(sessions) != 1:
+                return False
+            turns = next(iter(sessions.values()))["turns"]
+            if len(turns) != 1 or next(iter(turns.values()))["state"] != (
+                ActivityState.COMPLETED.value
+            ):
+                return False
+            marker = Path(temp) / "moira" / "codex-hooks-verified.json"
+            if not marker.exists():
+                return False
+        finally:
+            if previous is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = previous
+    return True
+
+
 def test_runtime(runtime: AgentRuntime) -> IntegrationResult:
     """Prove the integration boundary; never persists fake success.
 
     Distinguishes the test kinds: Claude and Hermes fire the installed
     packaged hook with the documented payloads (installed hook callback
-    test); Codex starts a real app-server session and verifies real turn
-    notifications (external integration test). "Callbacks verified" is
-    never reported unless the actual installed or subprocess protocol
-    boundary was exercised.
+    test); Codex fires its documented lifecycle payloads through the
+    installed hooks when present, otherwise starts a real app-server
+    session and verifies real turn notifications (external integration
+    test). "Callbacks verified" is never reported unless the actual
+    installed or subprocess protocol boundary was exercised.
     """
     if runtime is AgentRuntime.CLAUDE:
         ok = _claude_test()
     elif runtime is AgentRuntime.HERMES:
         ok = test_hermes_hooks()
     else:
-        ok = _codex_test()
+        ok = _codex_hooks_test() if codex_hooks_installed() else _codex_test()
     if ok:
         if runtime is AgentRuntime.CODEX:
+            if codex_hooks_installed():
+                return IntegrationResult(
+                    False,
+                    CapabilityReport("full", _("Codex CLI hook callbacks verified.")),
+                )
             return IntegrationResult(
                 False,
                 CapabilityReport(

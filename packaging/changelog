@@ -99,5 +99,27 @@ moira (0.3.0) unstable; urgency=medium
     ships md5sums and one justified override for the intentional
     /usr/lib/moira/moira layout;
     Hermes writes, financial units and publication remain deferred.
+  * Package 8a: ordinary Codex CLI/TUI activity feeds the Agent activity
+    panel through the documented user-level lifecycle hooks
+    (SessionStart, UserPromptSubmit, Stop) installed in
+    $CODEX_HOME/hooks.json — Moira-owned entries only, backup + atomic
+    0600 replace, idempotent and fail closed on malformed files; the
+    hooks feature flag is enabled through Codex's own `features enable`
+    surface and Codex's private trust state is never written or
+    bypassed (the capability stays awaiting-trust until Codex really
+    executes the hook, proven by a privacy-minimal verification
+    marker). The bounded decoder accepts the documented lifecycle names
+    and scalar fields only (hook_event_name, session_id, turn_id,
+    model); UserPromptSubmit starts one RUNNING turn, Stop terminates
+    the exact documented turn (or the newest compatible running turn
+    without a turn id), SessionStart never fabricates activity, and a
+    missing Stop expires through the watchdog to interrupted. The model
+    is displayed only from the exact documented payload field — blank
+    otherwise, never the configured default. App-server sessions remain
+    available and are reported honestly as session-owned; hook and
+    app-server events cannot double-count one validated session/turn
+    (deterministic identity deduplication through the shared store).
+    No pgrep, /proc, transcript scraping, daemon or polling; Desktop,
+    IDE, cloud and codex exec support are not claimed.
 
  -- Thibault Paul <xpaul.thibault@gmail.com>  Wed, 05 Aug 2026 11:00:00 +0200

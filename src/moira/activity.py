@@ -10,16 +10,19 @@ States: RUNNING, COMPLETED, FAILED, INTERRUPTED. Incoming events are
 validated fail-closed (malformed, naive, future-skewed, oversized and
 unknown events are rejected). Replays are idempotent.
 
-Turn lifecycle: Claude ``UserPromptSubmit``/``Stop``/``StopFailure`` and
-Hermes ``pre_llm_call``/``post_llm_call`` are turn-level events that
-repeat under one provider session. Each turn transitions independently
-RUNNING → COMPLETED/FAILED/INTERRUPTED, keyed by a hashed turn identity:
+Turn lifecycle: Claude ``UserPromptSubmit``/``Stop``/``StopFailure``,
+Hermes ``pre_llm_call``/``post_llm_call`` and Codex CLI
+``UserPromptSubmit``/``Stop`` (Package 8a user-level hooks) are
+turn-level events that repeat under one provider session. Each turn
+transitions independently RUNNING → COMPLETED/FAILED/INTERRUPTED, keyed
+by a hashed turn identity:
 
 - when the provider supplies a real turn identifier (Claude ``prompt_id``
   in every hook event, Hermes ``turn_id`` in every shell-hook event,
-  Codex ``turn.id`` per thread), the turn identity is the hashed composite
-  of the session identity and the turn identifier — late or reordered
-  events resolve to the exact turn they belong to;
+  Codex ``turn_id`` in the user-level hook payloads and Codex
+  ``turn.id`` per app-server thread), the turn identity is the hashed
+  composite of the session identity and the turn identifier — late or
+  reordered events resolve to the exact turn they belong to;
 - otherwise the store derives a deterministic privacy-safe turn identity
   from the lifecycle (a per-session ordinal, ``seq:N``), so legitimate
   replays never create duplicate turns.
