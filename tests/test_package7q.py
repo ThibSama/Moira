@@ -382,12 +382,14 @@ def test_exit_stderr_matrix(monkeypatch: pytest.MonkeyPatch) -> None:
     cases: list[tuple[int, str, str, BalanceState]] = [
         (0, valid, "", BalanceState.AVAILABLE),
         (3, insufficient, "", BalanceState.INSUFFICIENT),
-        (1, "", "", BalanceState.NOT_CONFIGURED),
+        (1, "", "", BalanceState.INVALID_RESPONSE),  # code 1 removed (7r): no valid-state alias
         (7, "", "", BalanceState.INVALID_RESPONSE),
         (12, "", "", BalanceState.UNREACHABLE),  # child alarm = parent deadline state
         (0, valid, "warning", BalanceState.INVALID_RESPONSE),  # RED pre-fix
         (1, "", "Traceback", BalanceState.INVALID_RESPONSE),  # RED pre-fix
         (4, "", "log noise", BalanceState.INVALID_RESPONSE),  # RED pre-fix
+        (0, valid, " ", BalanceState.INVALID_RESPONSE),  # 7r: whitespace-only stderr
+        (2, "\n", "", BalanceState.INVALID_RESPONSE),  # 7r: whitespace-only stdout
         (-9, "", "", BalanceState.INVALID_RESPONSE),  # signal exit
         (-15, "", "", BalanceState.INVALID_RESPONSE),  # signal exit
         (42, "", "", BalanceState.INVALID_RESPONSE),  # unknown code

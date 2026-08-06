@@ -39,18 +39,25 @@ Mapping (strict, fail closed): 200 → AVAILABLE/INSUFFICIENT from
 invented amounts; 429 → RATE_LIMITED; 5xx → SERVER_ERROR; transport and
 TLS failures stay distinct (UNREACHABLE / TLS_ERROR); every other
 status and every unknown outcome is INVALID_RESPONSE. The child is
-crash-safe (Package 7q): a top-level sanitized exception boundary turns
-any uncaught exception or import failure into the distinct exit 11 with
-nothing on stderr (never a traceback, never an alias of exit 1 /
-NOT_CONFIGURED); the child alarm and the parent deadline share ONE
-deterministic timeout state (exit 12 / TIMEOUT → UNREACHABLE); deep
-JSON (RecursionError) is failed closed; non-empty stderr, abnormal or
-signal exits, unknown codes and malformed stdout are all
-INVALID_RESPONSE, and raw stderr is never rendered or retained. A
-successful refresh implies NOTHING about token, cost or usage support
-(``balance=available`` is reported only for the supported DeepSeek
-adapter). Results are ephemeral: nothing is written to config, schema,
-History, activity, exports or logs.
+crash-safe (Package 7q/7r): ``main()`` runs under a ``BaseException``
+boundary that terminates through ``os._exit(validated_code)`` — any
+uncaught exception, an imported module's ``sys.exit(1)``, a
+``KeyboardInterrupt`` or an import failure exits the distinct code 11
+with nothing on stderr (never a traceback, and code 1 is NOT part of
+the protocol, so no abnormal exit can alias NOT_CONFIGURED); the child
+alarm and the parent deadline share ONE deterministic timeout state
+(exit 12 / TIMEOUT → UNREACHABLE); deep JSON (RecursionError) is failed
+closed; the key is validated on RAW stdin (only the one transport
+newline is removed — leading/trailing/embedded controls, empty and
+oversized keys are rejected); non-empty stderr, abnormal or signal
+exits, unknown codes and malformed or whitespace-prefixed/suffixed
+stdout are all INVALID_RESPONSE (accepted outcomes require byte-for-byte
+empty stderr, non-amount outcomes byte-for-byte empty stdout), and raw
+stderr is never rendered or retained. A successful refresh implies
+NOTHING about token, cost or usage support (``balance=available`` is
+reported only for the supported DeepSeek adapter). Results are
+ephemeral: nothing is written to config, schema, History, activity,
+exports or logs.
 """
 
 from __future__ import annotations
@@ -235,20 +242,22 @@ class BalanceResult:
         object.__setattr__(self, "entries", ordered)
 
 
-#: Exit-code contract of the dedicated balance child (Package 7q: no
-#: abnormal exit may alias a valid state). 1 is reserved for
-#: NOT_CONFIGURED (the parent normally fails closed before spawning);
-#: 0/3 are the only amount-bearing states and print the canonical JSON;
-#: 11 is the top-level sanitized crash boundary (any uncaught exception
-#: or import failure — never a traceback on stderr, so a crashed child
-#: can never become NOT_CONFIGURED); 12 is the child's own alarm, which
-#: shares ONE deterministic timeout state with the parent deadline
-#: (UNREACHABLE). Every other outcome is explicit — unknown, signal or
-#: negative codes map to INVALID_RESPONSE (unknown outcomes never
-#: become AVAILABLE). Non-empty stderr fails closed in the parent.
+#: Exit-code contract of the dedicated balance child (Package 7q/7r: no
+#: abnormal exit may alias a valid state). 0/3 are the only
+#: amount-bearing states and print the canonical JSON; 11 is the
+#: sanitized crash boundary (any uncaught ``BaseException`` — including
+#: imported ``SystemExit`` and ``KeyboardInterrupt`` — exits 11 with
+#: nothing on stderr, so a crashed child can never become a valid
+#: state); 12 is the child's own alarm, which shares ONE deterministic
+#: timeout state with the parent deadline (UNREACHABLE). Code 1
+#: (NOT_CONFIGURED) is REMOVED from the protocol: missing credentials
+#: already fail before spawn in the parent, so a generic interpreter
+#: exit (e.g. an imported module calling ``sys.exit(1)``) can never
+#: forge a valid state. Every other outcome is explicit — unknown,
+#: signal or negative codes map to INVALID_RESPONSE. Non-empty stderr
+#: fails closed in the parent (byte-for-byte empty required).
 _CHILD_CODES: dict[int, BalanceState] = {
     0: BalanceState.AVAILABLE,
-    1: BalanceState.NOT_CONFIGURED,
     2: BalanceState.AUTH_FAILED,
     3: BalanceState.INSUFFICIENT,
     4: BalanceState.UNREACHABLE,
@@ -258,7 +267,7 @@ _CHILD_CODES: dict[int, BalanceState] = {
     8: BalanceState.UNSUPPORTED,
     9: BalanceState.CANCELLED,
     10: BalanceState.SERVER_ERROR,
-    11: BalanceState.INVALID_RESPONSE,  # sanitized crash boundary
+    11: BalanceState.INVALID_RESPONSE,  # sanitized BaseException boundary
     12: BalanceState.UNREACHABLE,  # the child's own alarm (one timeout state)
 }
 
@@ -278,14 +287,18 @@ def _reject_non_finite(_value: str) -> Any:
 #: the ORIGINAL hostname); no redirects; no proxy environment. Outcome
 #: = exit code (0/3 for amount states, plus canonical JSON on stdout).
 #:
-#: Package 7q crash safety: ALL imports live inside ``main()`` and the
-#: whole script runs under a top-level sanitized exception boundary —
-#: an uncaught exception or import failure exits the DISTINCT code 11
-#: with NOTHING on stderr (no traceback), so a crashed child can never
-#: alias exit 1 (NOT_CONFIGURED). The child alarm exits 12 (the same
-#: timeout state as the parent deadline, UNREACHABLE); deep JSON raises
-#: ``RecursionError`` and control-character credentials are each failed
-#: closed explicitly.
+#: Package 7q/7r crash safety: ALL imports live inside ``main()`` and the
+#: whole script runs under a top-level ``BaseException`` boundary that
+#: terminates through ``os._exit(validated_code)`` — an uncaught
+#: exception, an imported module's ``sys.exit(1)``, a
+#: ``KeyboardInterrupt`` or an import failure all exit the DISTINCT
+#: code 11 with NOTHING on stderr (no traceback), so a crashed child can
+#: never alias any valid state (code 1 is not part of the protocol).
+#: The child alarm exits 12 (the same timeout state as the parent
+#: deadline, UNREACHABLE); deep JSON raises ``RecursionError`` and
+#: control-character, empty or oversized credentials are each failed
+#: closed explicitly on RAW stdin (only the one transport newline is
+#: removed).
 _BALANCE_CHILD_CODE = r"""
 import os
 import signal
@@ -307,7 +320,12 @@ def main() -> int:
     from urllib.parse import urlsplit
 
     from moira.balance import parse_amount
-    from moira.connection_test import contains_secret_keys, resolve_target, same_endpoint
+    from moira.connection_test import (
+        MAX_KEY_BYTES,
+        contains_secret_keys,
+        resolve_target,
+        same_endpoint,
+    )
 
     def _reject_constant(_value):
         raise ValueError("non-finite constant")
@@ -322,11 +340,21 @@ def main() -> int:
         return 7  # invalid response: malformed invocation
     signal.signal(signal.SIGALRM, _timeout_exit)
     signal.alarm(max(1, int(total)))  # self-bound, mirroring the parent's bound
-    key = sys.stdin.read().strip()
-    if not key:
-        return 1  # not configured (the parent normally fails before spawn)
-    if any(ord(ch) < 32 or ord(ch) == 127 for ch in key):
+    # RAW stdin (Package 7r): no strip() — leading/trailing controls must
+    # be REJECTED, not silently removed. Remove exactly the ONE transport
+    # newline the parent appends, then reject empty, oversized and any
+    # remaining control-character key. The read is bounded so a broken
+    # parent can never make the child buffer unbounded input.
+    raw = sys.stdin.read(MAX_KEY_BYTES + 2)
+    if raw.endswith("\n"):
+        raw = raw[:-1]
+    if not raw:
+        return 7  # empty credential: invalid response (the parent fails before spawn)
+    if len(raw.encode("utf-8", "replace")) > MAX_KEY_BYTES:
+        return 7  # oversized credential: invalid response
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
         return 7  # control characters could inject headers: invalid response
+    key = raw
     try:
         parts = urlsplit(url)
         if parts.scheme == "https":
@@ -447,9 +475,20 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        _code = main()
+    except BaseException:
+        # Sanitized boundary (Package 7r): SystemExit (e.g. an imported
+        # module calling sys.exit(1)), KeyboardInterrupt, runtime and
+        # import failures ALL exit the DISTINCT code 11 — never a valid
+        # state, never a traceback on stderr.
+        _code = 11
+    try:
+        sys.stdout.flush()  # os._exit below skips Python's normal flush
     except Exception:
-        sys.exit(11)  # sanitized crash boundary: no traceback, never alias exit 1
+        _code = 11
+    if _code in (0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+        os._exit(_code)  # validated protocol code only
+    os._exit(11)  # anything else is an abnormal termination
 """.replace("%(max_infos)d", str(MAX_BALANCE_INFOS))
 
 
@@ -457,14 +496,14 @@ def _decode_child_output(raw: str) -> tuple[bool, tuple[BalanceEntry, ...]] | No
     """Strict decode of the child's canonical minimal JSON.
 
     Returns ``(is_available, entries)``; None on ANY deviation (empty
-    output, malformed JSON, NaN/Infinity, wrong shape, unknown or
-    duplicate currencies, non-string or invalid amounts, secret keys).
+    output, whitespace prefix/suffix — the canonical JSON is exact,
+    malformed JSON, NaN/Infinity, wrong shape, unknown or duplicate
+    currencies, non-string or invalid amounts, secret keys).
     """
-    text = raw.strip()
-    if not text:
-        return None
+    if not raw or raw != raw.strip():
+        return None  # empty, or prefixed/suffixed: not the exact canonical JSON
     try:
-        payload = json.loads(text, parse_constant=_reject_non_finite)
+        payload = json.loads(raw, parse_constant=_reject_non_finite)
     except (ValueError, UnicodeDecodeError, RecursionError):
         return None  # malformed, NaN/Infinity or too-deep JSON
     if not isinstance(payload, dict) or set(payload) != {"is_available", "currencies"}:
@@ -554,11 +593,12 @@ def bounded_balance_refresh(
         return BalanceResult(BalanceState.INVALID_RESPONSE, profile.slug)
     if result.returncode is None or result.returncode < 0:
         # Abnormal/signal exits never alias a valid state: a child killed
-        # by a signal is INVALID_RESPONSE, never NOT_CONFIGURED.
+        # by a signal is INVALID_RESPONSE, never a valid state.
         return BalanceResult(BalanceState.INVALID_RESPONSE, profile.slug)
-    if result.stderr.strip():
-        # Non-empty stderr (warnings, tracebacks, crash text) fails
-        # closed. The raw text is never rendered or retained anywhere.
+    if result.stderr:
+        # Byte-for-byte empty stderr is required for accepted outcomes
+        # (Package 7r): any byte — even whitespace-only diagnostics —
+        # fails closed. Raw stderr is never rendered or retained.
         return BalanceResult(BalanceState.INVALID_RESPONSE, profile.slug)
     state = _CHILD_CODES.get(result.returncode) if result.returncode is not None else None
     if state is None:
@@ -576,9 +616,10 @@ def bounded_balance_refresh(
         if decoded[0]:
             return BalanceResult(BalanceState.INVALID_RESPONSE, profile.slug)
         return BalanceResult(state, profile.slug, decoded[1])
-    if result.stdout.strip():
-        # The child may return ONLY minimal canonical balance JSON on
-        # stdout: any output for a non-amount state is a leak.
+    if result.stdout:
+        # The child may return ONLY the minimal canonical balance JSON on
+        # stdout (Package 7r: byte-for-byte — even whitespace-only output
+        # for a non-amount state is a leak).
         return BalanceResult(BalanceState.INVALID_RESPONSE, profile.slug)
     return BalanceResult(state, profile.slug)
 
@@ -618,6 +659,11 @@ def run_balance_refresh(
         # configured, before any spawn.
         return BalanceResult(BalanceState.NOT_CONFIGURED, profile.slug)
     assert inspection.value is not None
+    if not inspection.value:
+        # An EMPTY stored credential is a missing credential (Package 7r):
+        # fail closed as not configured before any spawn — the child never
+        # needs an exit-1 protocol code for it.
+        return BalanceResult(BalanceState.NOT_CONFIGURED, profile.slug)
     return bounded_balance_refresh(
         profile,
         inspection.value,

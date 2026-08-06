@@ -83,6 +83,21 @@ moira (0.3.0) unstable; urgency=medium
     reports balance available, every other kind and every profile-less
     discovered provider stays unsupported — without changing any
     token, cost, usage, quota or activity badge;
+    closed in Package 7r: the child runs main() under a BaseException
+    boundary and terminates through a validated os._exit code, exit
+    code 1 is removed from the protocol (an imported sys.exit(1), a
+    KeyboardInterrupt or any runtime/import failure exits a distinct
+    crash code with nothing on stderr — no valid-state alias), the
+    credential is validated on raw stdin (only the one transport
+    newline is removed; leading/trailing/embedded controls, empty and
+    oversized keys are rejected with zero requests), accepted outcomes
+    require byte-for-byte empty stderr and non-amount outcomes
+    byte-for-byte empty stdout (whitespace-only diagnostics fail
+    closed), and the Lintian gate is pinned immutably (digest-pinned
+    image, exact lintian version) covering every tag level with a
+    deterministic self-test proving a hidden info tag fails — the deb
+    ships md5sums and one justified override for the intentional
+    /usr/lib/moira/moira layout;
     Hermes writes, financial units and publication remain deferred.
 
  -- Thibault Paul <xpaul.thibault@gmail.com>  Wed, 05 Aug 2026 11:00:00 +0200

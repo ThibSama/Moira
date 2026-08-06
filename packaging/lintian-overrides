@@ -1,0 +1,9 @@
+# Lintian overrides for moira (Package 7r, all-tags gate).
+#
+# repeated-path-segment (pedantic): the private library directory
+# /usr/lib/moira hosts the moira Python package itself. The repeated
+# path segment is the conventional layout for a private package
+# directory and is documented in the man pages, the launchers and the
+# upgrade/clean-install gates; it is intentional and reviewed, so the
+# pedantic tag is suppressed with this justification.
+moira: repeated-path-segment

@@ -30,7 +30,8 @@ fi
 
 # Policy files that must exist; the build fails closed when any is absent.
 policy_sources="packaging/control packaging/copyright packaging/changelog \
-packaging/man/moira.1 packaging/man/moira-claude-statusline.1 packaging/man/moira-agent-hook.1"
+packaging/man/moira.1 packaging/man/moira-claude-statusline.1 packaging/man/moira-agent-hook.1 \
+packaging/lintian-overrides"
 for source in $policy_sources; do
   [ -f "$project_dir/$source" ] || {
     echo "build-deb: missing required packaging source '$source'" >&2
@@ -74,6 +75,18 @@ gzip -n -9 -c "$project_dir/packaging/changelog" > "$stage/usr/share/doc/moira/c
 for page in moira.1 moira-claude-statusline.1 moira-agent-hook.1; do
   gzip -n -9 -c "$project_dir/packaging/man/$page" > "$stage/usr/share/man/man1/$page.gz"
 done
+# Lintian all-tags gate (Package 7r): the justified override for the
+# intentional /usr/lib/moira/moira layout, and the md5sums control file
+# (the debhelper equivalent for a hand-built package). Both are
+# normalized by the chmod passes below; md5sums is generated from the
+# FINAL file set (after the override is installed).
+mkdir -p "$stage/usr/share/lintian/overrides"
+install -m 0644 "$project_dir/packaging/lintian-overrides" "$stage/usr/share/lintian/overrides/moira"
+(
+  cd "$stage" &&
+    find usr -type f -print0 | sort -z | xargs -0 md5sum | sed 's|  \./|  |' > DEBIAN/md5sums
+)
+chmod 0644 "$stage/DEBIAN/md5sums"
 find "$stage" -type d -exec chmod 0755 {} +
 # Normalize every regular file to 0644, then restore the launcher
 # executability (documentation and man pages must be 0644, never
