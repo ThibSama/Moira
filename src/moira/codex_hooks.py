@@ -24,11 +24,22 @@ Codex CLI 0.146.0 and the official sources:
   actually executed it, which is what lifts the capability from
   ``awaiting_trust`` (reduced) to ``full``.
 
-Setup/remove touch only Moira-owned entries (exact command match),
-preserve every unrelated hook, use backup + atomic replace + restrictive
-permissions (0600), recover after interruption (a stale temporary file
-can never corrupt the atomic file) and are idempotent. A malformed
-existing ``hooks.json`` is NEVER clobbered — setup fails closed.
+Setup/remove manage ownership at the INDIVIDUAL handler level (Package
+8b): the owned handler is exactly ``{type: "command", command:
+MOIRA_HOOK_COMMAND}`` — a mixed ``MatcherGroup`` is preserved handler by
+handler, with every sibling, matcher and unrelated group field kept
+without semantic alteration; a group is dropped only when its hooks list
+becomes empty from a removal, an event only when its group list becomes
+empty. Setup leaves an existing valid owned handler in place and
+collapses duplicate exact Moira handlers. The complete mutable shape
+(root object, optional string/null description, hooks object, event
+lists, group objects with list-valued hooks, handler objects with string
+type and string command for command handlers) is validated BEFORE any
+backup or write; any malformed shape raises ``CodexHookError`` and the
+original file stays byte-identical. Writes are backup + atomic replace
+at 0600, recover after interruption (a stale temporary file can never
+corrupt the atomic file) and are idempotent. A malformed existing
+``hooks.json`` is NEVER clobbered — setup fails closed.
 
 No ``pgrep``, ``/proc``, transcript scraping, daemon, polling or global
 process monitor: the hook is a pure event observer. Desktop, IDE, cloud
@@ -96,26 +107,36 @@ def _moira_group(command: str) -> dict[str, Any]:
     return {"matcher": "*", "hooks": [{"type": "command", "command": command}]}
 
 
-def _is_moira_group(group: Any, command: str) -> bool:
+def _is_moira_handler(handler: Any, command: str) -> bool:
+    """Ownership at the INDIVIDUAL handler level (Package 8b).
+
+    The owned handler is EXACTLY ``{"type": "command", "command":
+    MOIRA_HOOK_COMMAND}`` — never a group, never a matcher, never a
+    sibling handler. A mixed ``MatcherGroup`` holding the Moira command
+    next to unrelated handlers is owned only through its single Moira
+    handler; every sibling survives.
+    """
     return (
-        isinstance(group, dict)
-        and isinstance(group.get("hooks"), list)
-        and any(
-            isinstance(hook, dict)
-            and hook.get("type") == "command"
-            and hook.get("command") == command
-            for hook in group["hooks"]
-        )
+        isinstance(handler, dict)
+        and handler.get("type") == "command"
+        and handler.get("command") == command
     )
 
 
 def read_hooks_file(path: Path | None = None) -> dict[str, Any]:
-    """Read and validate ``hooks.json`` (fail closed).
+    """Read and validate ``hooks.json`` (fail closed, complete shape).
 
     Returns ``{"description": ..., "hooks": {...}}`` (the canonical
-    ``HooksFile`` shape). A missing file yields the empty shape; a
-    malformed, oversized or non-object file raises ``CodexHookError`` —
-    the user's file is never clobbered.
+    ``HooksFile`` shape). A missing file yields the empty shape. The
+    COMPLETE mutable shape is validated BEFORE any backup or write
+    (Package 8b): the root object, an optional string/null description,
+    the ``hooks`` object, every event value a list, every group an
+    object with a list-valued ``hooks``, every handler an object with a
+    string ``type``, and command handlers a string ``command``. Any
+    unsafe or malformed shape raises ``CodexHookError`` and the original
+    file is never touched. Supported non-command handlers (prompt,
+    agent) and additional fields (matcher, commandWindows, timeout,
+    async, statusMessage, …) are preserved untouched.
     """
     target = path or hooks_path()
     try:
@@ -131,10 +152,32 @@ def read_hooks_file(path: Path | None = None) -> dict[str, Any]:
         raise CodexHookError("Codex hooks.json is malformed") from exc
     if not isinstance(raw, dict):
         raise CodexHookError("Codex hooks.json must be an object")
+    description = raw.get("description")
+    if description is not None and not isinstance(description, str):
+        raise CodexHookError("Codex hooks.json description must be a string or null")
     hooks = raw.get("hooks", {})
     if not isinstance(hooks, dict):
         raise CodexHookError("Codex hooks.json hooks must be an object")
-    return {"description": raw.get("description"), "hooks": hooks}
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            raise CodexHookError(f"Codex hooks.json event {event!r} must be a list")
+        for group in groups:
+            if not isinstance(group, dict):
+                raise CodexHookError("Codex hooks.json hook groups must be objects")
+            handlers = group.get("hooks")
+            if not isinstance(handlers, list):
+                raise CodexHookError("Codex hooks.json hook groups must carry a list-valued hooks")
+            for handler in handlers:
+                if not isinstance(handler, dict):
+                    raise CodexHookError("Codex hooks.json handlers must be objects")
+                handler_type = handler.get("type")
+                if not isinstance(handler_type, str):
+                    raise CodexHookError("Codex hooks.json handler type must be a string")
+                if handler_type == "command" and not isinstance(handler.get("command"), str):
+                    raise CodexHookError(
+                        "Codex hooks.json command handlers must carry a string command"
+                    )
+    return {"description": description, "hooks": hooks}
 
 
 def _atomic_json(path: Path, data: dict[str, Any]) -> None:
@@ -162,32 +205,83 @@ def _backup(path: Path) -> None:
         _atomic_json(path.with_name(f"{path.name}.moira-backup"), read_hooks_file(path))
 
 
-def _with_moira_groups(data: dict[str, Any], command: str) -> dict[str, Any]:
-    hooks = data["hooks"]
-    merged = {event: list(groups) for event, groups in hooks.items()}
+def _merge_owned(data: dict[str, Any], command: str) -> dict[str, Any]:
+    """Guarantee the exact Moira handler exactly once per owned event.
+
+    Handler-level merge (Package 8b): an existing valid owned handler is
+    LEFT IN PLACE inside its group (siblings, matcher and every group
+    field preserved without semantic alteration); duplicate exact Moira
+    handlers are collapsed to one; a fresh Moira group is appended only
+    when no group carries the exact Moira handler.
+    """
+    hooks: dict[str, list[Any]] = {}
+    for event, groups in data["hooks"].items():
+        event_groups: list[Any] = []
+        for group in groups:
+            owned_seen = False
+            kept: list[Any] = []
+            for handler in group["hooks"]:
+                if _is_moira_handler(handler, command):
+                    if owned_seen:
+                        continue  # collapse duplicate exact Moira handlers
+                    owned_seen = True
+                kept.append(handler)
+            merged_group = dict(group)
+            merged_group["hooks"] = kept
+            event_groups.append(merged_group)
+        hooks[event] = event_groups
     for event in CODEX_HOOK_EVENTS:
-        groups = [g for g in merged.get(event, []) if not _is_moira_group(g, command)]
-        groups.append(_moira_group(command))
-        merged[event] = groups
-    return {"description": data.get("description"), "hooks": merged}
+        present = any(
+            _is_moira_handler(handler, command)
+            for group in hooks.get(event, [])
+            for handler in group["hooks"]
+        )
+        if not present:
+            hooks.setdefault(event, []).append(_moira_group(command))
+    return {"description": data.get("description"), "hooks": hooks}
+
+
+def _without_owned(data: dict[str, Any], command: str) -> dict[str, Any]:
+    """Remove ONLY the exact Moira handler from every group.
+
+    A group is dropped only when its ``hooks`` list BECOMES empty as a
+    result of the removal; an event is dropped only when its group list
+    becomes empty. Sibling handlers, matchers, unrelated groups and
+    unrelated events survive untouched.
+    """
+    hooks: dict[str, list[Any]] = {}
+    for event, groups in data["hooks"].items():
+        event_groups: list[Any] = []
+        for group in groups:
+            had_owned = any(_is_moira_handler(h, command) for h in group["hooks"])
+            kept = [h for h in group["hooks"] if not _is_moira_handler(h, command)]
+            if had_owned and not kept:
+                continue  # drop the group only when the removal emptied it
+            merged_group = dict(group)
+            merged_group["hooks"] = kept
+            event_groups.append(merged_group)
+        if event_groups:
+            hooks[event] = event_groups
+    return {"description": data.get("description"), "hooks": hooks}
 
 
 def setup(path: Path | None = None, command: str = MOIRA_HOOK_COMMAND) -> bool:
-    """Install Moira-owned hook entries (idempotent, atomic, backed up).
+    """Install Moira-owned hook handlers (idempotent, atomic, backed up).
 
-    Returns True when the file changed. Preserves every unrelated entry
-    and the ``description``. Raises ``CodexHookError`` on a malformed
-    existing file (fail closed — never clobbered). A stale temporary
-    file from an interrupted write can never corrupt the atomic file.
+    Returns True when the file changed. Ownership is per HANDLER: an
+    existing valid owned handler stays in place, duplicate exact Moira
+    handlers collapse to one, and every unrelated handler, group,
+    matcher and field is preserved. Raises ``CodexHookError`` on any
+    malformed existing shape (fail closed, never clobbered) — the
+    complete shape is validated before any backup or write. A stale
+    temporary file from an interrupted write can never corrupt the
+    atomic file.
     """
     target = path or hooks_path()
     current = read_hooks_file(target)
-    if all(
-        any(_is_moira_group(g, command) for g in current["hooks"].get(event, []))
-        for event in CODEX_HOOK_EVENTS
-    ):
-        return False  # already installed — nothing to change
-    merged = _with_moira_groups(current, command)
+    merged = _merge_owned(current, command)
+    if merged == current:
+        return False  # already installed with exactly one owned handler each
     if not merged.get("description"):
         merged["description"] = "Moira agent activity observer hooks"
     _backup(target)
@@ -196,45 +290,49 @@ def setup(path: Path | None = None, command: str = MOIRA_HOOK_COMMAND) -> bool:
 
 
 def remove(path: Path | None = None, command: str = MOIRA_HOOK_COMMAND) -> bool:
-    """Remove ONLY Moira-owned hook entries (idempotent, atomic, backed up).
+    """Remove ONLY the Moira-owned handler entries (idempotent, atomic).
 
-    Unrelated entries are preserved; an event left empty is dropped; a
-    file that held nothing but Moira entries is deleted (restoring the
-    pre-setup state). Returns True when something changed.
+    Unrelated entries are preserved; a group is dropped only when its
+    hooks list becomes empty from the removal; an event only when its
+    group list becomes empty; a file that held nothing but Moira
+    entries is deleted (restoring the pre-setup state). Returns True
+    when something changed.
     """
     target = path or hooks_path()
     if not target.exists():
         return False
     current = read_hooks_file(target)
-    hooks = current["hooks"]
-    kept: dict[str, list[Any]] = {}
-    for event, groups in hooks.items():
-        remaining = [g for g in groups if not _is_moira_group(g, command)]
-        if remaining:
-            kept[event] = remaining
-    if kept == hooks and all(
-        not any(_is_moira_group(g, command) for g in groups) for groups in hooks.values()
+    if not any(
+        _is_moira_handler(handler, command)
+        for groups in current["hooks"].values()
+        for group in groups
+        for handler in group["hooks"]
     ):
-        return False  # no Moira entry present
+        return False  # no Moira handler present
+    merged = _without_owned(current, command)
     _backup(target)
-    if not kept:
+    if not merged["hooks"]:
         try:
             target.unlink()
         except OSError:
             pass
         return True
-    _atomic_json(target, {"description": current.get("description"), "hooks": kept})
+    _atomic_json(target, merged)
     return True
 
 
 def hooks_installed(path: Path | None = None, command: str = MOIRA_HOOK_COMMAND) -> bool:
-    """True when every owned event carries a Moira group in the file."""
+    """True when every owned event carries the exact Moira handler."""
     try:
         current = read_hooks_file(path)
     except CodexHookError:
         return False
     return all(
-        any(_is_moira_group(g, command) for g in current["hooks"].get(event, []))
+        any(
+            _is_moira_handler(handler, command)
+            for group in current["hooks"].get(event, [])
+            for handler in group["hooks"]
+        )
         for event in CODEX_HOOK_EVENTS
     )
 

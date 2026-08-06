@@ -556,6 +556,144 @@ def test_hook_and_app_server_do_not_double_count_same_turn(state_home: Path) -> 
     assert len(_turns(store)) == 1  # one lifecycle for one turn
 
 
+# ── Mixed groups: handler-level ownership (Package 8b) ─────────────────────
+
+
+def test_mixed_group_setup_preserves_sibling_command(codex_home: Path) -> None:
+    """RED on 4927880: a group carrying the Moira command next to an
+    unrelated command was discarded wholesale. Ownership is per HANDLER:
+    the sibling survives, the owned handler stays in place, and no
+    duplicate Moira group is appended."""
+    path = ch.hooks_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "hooks": {
+            "UserPromptSubmit": [
+                {"matcher": "*", "hooks": [
+                    {"type": "command", "command": "/usr/bin/other"},
+                    {"type": "command", "command": ch.MOIRA_HOOK_COMMAND},
+                ]},
+            ],
+        },
+    }))
+    assert ch.setup() is True
+    data = json.loads(path.read_text(encoding="utf-8"))
+    groups = data["hooks"]["UserPromptSubmit"]
+    assert len(groups) == 1  # no duplicate Moira group appended
+    commands = [h["command"] for h in groups[0]["hooks"]]
+    assert commands == ["/usr/bin/other", ch.MOIRA_HOOK_COMMAND]
+
+
+def test_mixed_group_removal_preserves_sibling_and_matcher(codex_home: Path) -> None:
+    """RED on 4927880: removal discarded the whole mixed group. Only the
+    exact Moira handler is removed; the sibling and the matcher survive."""
+    path = ch.hooks_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "hooks": {
+            "UserPromptSubmit": [
+                {"matcher": "*.py", "hooks": [
+                    {"type": "command", "command": ch.MOIRA_HOOK_COMMAND},
+                    {"type": "command", "command": "/usr/bin/other"},
+                ]},
+            ],
+        },
+    }))
+    assert ch.remove() is True
+    data = json.loads(path.read_text(encoding="utf-8"))
+    groups = data["hooks"]["UserPromptSubmit"]
+    assert len(groups) == 1
+    assert groups[0]["matcher"] == "*.py"  # matcher preserved
+    assert groups[0]["hooks"] == [{"type": "command", "command": "/usr/bin/other"}]
+
+
+def test_duplicate_owned_handlers_collapse_on_setup(codex_home: Path) -> None:
+    """Duplicate exact Moira handlers are collapsed to one; unrelated
+    handlers in the same group survive and setup becomes stable."""
+    path = ch.hooks_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "hooks": {
+            "Stop": [
+                {"matcher": "*", "hooks": [
+                    {"type": "command", "command": ch.MOIRA_HOOK_COMMAND},
+                    {"type": "command", "command": ch.MOIRA_HOOK_COMMAND},
+                    {"type": "command", "command": "/usr/bin/other"},
+                ]},
+            ],
+        },
+    }))
+    assert ch.setup() is True  # the duplicates are collapsed
+    data = json.loads(path.read_text(encoding="utf-8"))
+    groups = data["hooks"]["Stop"]
+    assert len(groups) == 1
+    commands = [h["command"] for h in groups[0]["hooks"]]
+    assert commands == [ch.MOIRA_HOOK_COMMAND, "/usr/bin/other"]
+    assert ch.setup() is False  # stable afterwards
+
+
+@pytest.mark.parametrize(
+    "file_hooks",
+    [
+        {"UserPromptSubmit": "broken"},  # event value is a plain string
+        {"UserPromptSubmit": {"hooks": []}},  # event value is a dict
+    ],
+)
+def test_parseable_string_or_dict_event_value_fails_closed(
+    codex_home: Path, file_hooks: dict[str, Any]
+) -> None:
+    """RED on 4927880: a parseable-but-schema-invalid event value was
+    iterated and rewritten (a string even became a list of characters).
+    The complete mutable shape is validated before ANY write:
+    CodexHookError, original file byte-identical."""
+    path = ch.hooks_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"hooks": file_hooks}))
+    before = path.read_bytes()
+    with pytest.raises(ch.CodexHookError):
+        ch.setup()
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "file_hooks",
+    [
+        {"UserPromptSubmit": ["not-a-group"]},  # group is not an object
+        {"UserPromptSubmit": [{"matcher": "*"}]},  # group without list-valued hooks
+        {"UserPromptSubmit": [{"hooks": ["not-a-handler"]}]},  # handler not an object
+        {"UserPromptSubmit": [{"hooks": [{"type": 42, "command": "x"}]}]},  # non-string type
+        {"UserPromptSubmit": [{"hooks": [{"type": "command"}]}]},  # command without command
+    ],
+)
+def test_malformed_group_hooks_handler_shape_fails_closed(
+    codex_home: Path, file_hooks: dict[str, Any]
+) -> None:
+    """Every unsafe or malformed shape raises CodexHookError before any
+    backup or write; the original file stays byte-identical."""
+    path = ch.hooks_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"hooks": file_hooks}))
+    before = path.read_bytes()
+    with pytest.raises(ch.CodexHookError):
+        ch.setup()
+    assert path.read_bytes() == before
+
+
+def test_clean_setup_remove_cycle_idempotent(codex_home: Path) -> None:
+    """Ordinary clean setup/remove stays idempotent and re-installable."""
+    path = ch.hooks_path()
+    assert ch.setup() is True
+    first = path.read_bytes()
+    assert ch.setup() is False
+    assert path.read_bytes() == first
+    assert ch.remove() is True
+    assert not path.exists()
+    assert ch.remove() is False
+    assert ch.setup() is True  # re-install works after removal
+    assert ch.remove() is True
+    assert not path.exists()
+
+
 # ── Real installed-Codex probe (may SKIP) ──────────────────────────────────
 
 
