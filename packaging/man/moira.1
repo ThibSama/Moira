@@ -38,8 +38,11 @@ Base URLs, credentials, paths and raw output are never displayed;
 Claude remains percentage\-only, the Codex exact\-token badge follows
 the latest typed availability observation in History (with stored exact
 data or an official summary for the available state), and unknown
-balance/cost is a state, never zero. DeepSeek
-balance is reported as not configured (no \fB/user/balance\fR call).
+balance/cost is a state, never zero. DeepSeek balance
+is refreshed only through the explicit Refresh balance action on
+DeepSeek profile rows (Edit providers); the inventory itself makes no
+\fB/user/balance\fR call, and a successful refresh never implies token,
+cost or usage support.
 Provider editing is available as an Edit providers view managing local
 profiles (config v4) and per-profile Keyring credentials: remote base
 URLs require HTTPS and reject loopback (local accepts only loopback),
@@ -66,7 +69,25 @@ carried as an immutable family/socktype/proto/sockaddr target with a
 direct connect and a getpeername check before any credential,
 nonblocking stdin delivery inside the total deadline, strict Models
 JSON and fail-closed preflight before any Keyring read or spawn).
-Hermes writes, DeepSeek balance and financial units
+DeepSeek profile rows add an explicit Refresh balance action against
+the official read-only \fBGET https://api.deepseek.com/user/balance\fR
+endpoint (Bearer auth, never the profile URL): exact Decimal-parsed
+amounts rendered separately in deterministic currency order (Total,
+Granted and Topped up; CNY then USD), a strict payload contract
+(documented keys only, a real is_available boolean, a non-empty bounded
+balance_infos array, unique CNY/USD entries, exact string amounts;
+extra, missing, secret/account-bearing or malformed data is invalid),
+mapping 200 to available/insufficient from is_available, 401/403 to
+auth failed, 402 to insufficient without invented amounts, 429 to rate
+limited, 5xx to server error, transport and TLS distinct, everything
+else invalid, through the same child boundary (private stdin, single
+validated resolution, peer check before TLS/headers, verified TLS, no
+redirects or proxies, bounded time/body/output, reaping) with minimal
+canonical JSON on stdout only; results are ephemeral (no config,
+schema, History, activity, export or log write) and reuse the same
+linearizable coordinator (one in-flight plus newest pending, cancelled
+replacement, stale-row guards), starting from a Not checked state.
+Hermes writes and financial units
 are deferred. Independent Codex CLI sessions are never observed.
 Inventory probes run only on page visibility and the explicit Refresh
 button, off the GTK thread, bounded and newest\-wins with sanitized

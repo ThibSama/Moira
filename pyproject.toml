@@ -59,6 +59,7 @@ select = ["E", "F", "I", "UP", "B"]
 "tests/test_package7m.py" = ["E402"]
 "tests/test_package7n.py" = ["E402"]
 "tests/test_package7o.py" = ["E402"]
+"tests/test_package7p.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.11"

@@ -49,7 +49,23 @@ moira (0.3.0) unstable; urgency=medium
     with reaping,
     ten sanitized states, one in-flight plus one newest pending, stale
     results discarded on edit/remove/disable/close, nothing persisted);
-    Hermes writes, DeepSeek balance, financial units and publication
-    remain deferred.
+    each DeepSeek profile row also adds an explicit Refresh balance
+    action against the official read-only /user/balance endpoint
+    (Bearer auth, never the profile URL) with exact Decimal-parsed
+    amounts rendered separately in deterministic currency order (Total,
+    Granted and Topped up; CNY then USD), a strict payload contract
+    (documented keys only, a real is_available boolean, a non-empty
+    bounded array, unique CNY/USD entries, exact string amounts; extra,
+    missing, secret/account-bearing or malformed data invalid), strict
+    status mapping (200 to available/insufficient from is_available,
+    401/403 auth failed, 402 insufficient without invented amounts, 429
+    rate limited, 5xx server error, transport and TLS distinct,
+    everything else invalid) through the same bounded child boundary
+    (private stdin, single validated resolution, peer check before
+    TLS/headers, verified TLS, no redirects or proxies, bounded
+    time/body/output, reaping) with minimal canonical JSON on stdout
+    only and ephemeral results that never imply token, cost or usage
+    support, reusing the same linearizable coordinator;
+    Hermes writes, financial units and publication remain deferred.
 
  -- Thibault Paul <xpaul.thibault@gmail.com>  Wed, 05 Aug 2026 11:00:00 +0200

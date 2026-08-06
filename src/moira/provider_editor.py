@@ -26,6 +26,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import GLib, Gtk  # noqa: E402
 
+from .balance import BalanceResult, BalanceState, run_balance_refresh
 from .connection_test import ConnectionResult, ConnectionState, run_connection_test
 from .i18n import tr
 from .integrations import (
@@ -79,6 +80,22 @@ _CONNECTION_STATE_LABELS = {
     ConnectionState.INVALID_RESPONSE: "Invalid response",
     ConnectionState.UNSUPPORTED: "Unsupported",
     ConnectionState.CANCELLED: "Cancelled",
+}
+
+#: Balance-refresh state labels (translated at render; every state has a
+#: key, so an unknown state can never reach the UI). Package 7p.
+_BALANCE_STATE_LABELS = {
+    BalanceState.AVAILABLE: "Balance available",
+    BalanceState.INSUFFICIENT: "Insufficient balance",
+    BalanceState.NOT_CONFIGURED: "Not configured",
+    BalanceState.AUTH_FAILED: "Authentication failed",
+    BalanceState.RATE_LIMITED: "Rate limited",
+    BalanceState.SERVER_ERROR: "Server error",
+    BalanceState.UNREACHABLE: "Unreachable",
+    BalanceState.TLS_ERROR: "TLS error",
+    BalanceState.INVALID_RESPONSE: "Invalid response",
+    BalanceState.UNSUPPORTED: "Unsupported",
+    BalanceState.CANCELLED: "Cancelled",
 }
 
 #: Stable sanitized success text per operation kind.
@@ -523,9 +540,28 @@ class _ConnectionCoordinator:
     on the same row.
     """
 
-    def __init__(self, submit: Any, shutdown_event: threading.Event) -> None:
+    def __init__(
+        self,
+        submit: Any,
+        shutdown_event: threading.Event,
+        *,
+        runner: Any = None,
+        cancelled: Any = None,
+        rejected: Any = None,
+    ) -> None:
+        """``runner(profile, *, cancel_event)`` executes one bounded
+        operation and returns its typed result (Package 7p: the balance
+        refresh reuses this machinery through an injected runner).
+        ``cancelled(profile)`` / ``rejected(profile)`` build the
+        deterministic fallback results of replacements and submit
+        rejections. Defaults preserve the connection-test behavior; the
+        default runner is resolved at CALL time (``run_connection_test``
+        module global), so tests can still patch it."""
         self._submit = submit
         self._shutdown = shutdown_event
+        self._runner = runner
+        self._cancelled_factory = cancelled
+        self._rejected_factory = rejected
         self._lock = threading.Lock()
         self._generation = 0
         self._inflight: int | None = None
@@ -537,8 +573,8 @@ class _ConnectionCoordinator:
         #: the claim and the empty-exit are single critical sections so
         #: the handoff cannot lose wakeups. True while a drain runs on
         #: some thread: a replacement callback re-entering ``request()``
-        #: appends to ``_cancelled`` instead of recursing into a nested
-        #: drain (constant stack).
+        #: appends to the cancelled queue instead of recursing into a
+        #: nested drain (constant stack).
         self._draining = False
 
     def _reserve(
@@ -613,12 +649,16 @@ class _ConnectionCoordinator:
                 self._pending = None
                 self._cancelled.clear()  # close discards superseded completions too
             return  # queued work after close: zero Keyring, zero spawn
+        # The default runner is the connection test resolved at CALL time
+        # (module global, so it stays patchable); an injected runner
+        # (Package 7p balance refresh) is used as-is.
+        runner = self._runner if self._runner is not None else run_connection_test
         try:
-            result = run_connection_test(profile, cancel_event=self._shutdown)
+            result = runner(profile, cancel_event=self._shutdown)
         except Exception:
             # A runner failure still completes deterministically through
             # the SAME publish/promote path as a normal outcome.
-            result = ConnectionResult(ConnectionState.UNREACHABLE, profile.slug)
+            result = self._rejected_result(profile)
         with self._lock:
             if self._shutdown.is_set():
                 self._inflight = None
@@ -751,24 +791,36 @@ class _ConnectionCoordinator:
                 self._draining = False
             raise
 
-    @staticmethod
-    def _cancel_replaced(request: tuple[int, ProviderProfile, Any, Any]) -> None:
+    def _cancelled_result(self, profile: ProviderProfile) -> Any:
+        """Deterministic replacement completion result: the injected
+        factory (Package 7p) or the connection-test CANCELLED default."""
+        if self._cancelled_factory is not None:
+            return self._cancelled_factory(profile)
+        return ConnectionResult(ConnectionState.CANCELLED, profile.slug)
+
+    def _rejected_result(self, profile: ProviderProfile) -> Any:
+        """Deterministic rejection-completion result: the injected
+        factory (Package 7p) or the connection-test UNREACHABLE default."""
+        if self._rejected_factory is not None:
+            return self._rejected_factory(profile)
+        return ConnectionResult(ConnectionState.UNREACHABLE, profile.slug)
+
+    def _cancel_replaced(self, request: tuple[int, ProviderProfile, Any, Any]) -> None:
         """Deterministic replacement completion: the superseded
-        request's row is reset from "Testing…" to the translated
+        request's row is reset from its working state to the translated
         Cancelled — outside the lock, exactly once, never raising."""
         _generation, profile, token, callback = request
         try:
-            callback(token, ConnectionResult(ConnectionState.CANCELLED, profile.slug))
+            callback(token, self._cancelled_result(profile))
         except Exception:
             pass
 
-    @staticmethod
-    def _reject(callback: Any, token: Any, profile: ProviderProfile) -> None:
+    def _reject(self, callback: Any, token: Any, profile: ProviderProfile) -> None:
         """Deterministic rejection completion: the request's row is
-        reset from "Testing…" to the translated sanitized failure —
-        outside the lock, never raising."""
+        reset from its working state to the translated sanitized
+        failure — outside the lock, never raising."""
         try:
-            callback(token, ConnectionResult(ConnectionState.UNREACHABLE, profile.slug))
+            callback(token, self._rejected_result(profile))
         except Exception:
             pass
 
@@ -796,6 +848,16 @@ class ProviderEditor(Gtk.Window):
         self._shutdown = False
         self._shutdown_event = threading.Event()
         self._connection_coordinator = _ConnectionCoordinator(submit, self._shutdown_event)
+        #: Package 7p: the balance refresh reuses the SAME linearizable
+        #: disposition machinery with an injected runner and fallback
+        #: factories (one in-flight plus newest pending per action kind).
+        self._balance_coordinator = _ConnectionCoordinator(
+            submit,
+            self._shutdown_event,
+            runner=run_balance_refresh,
+            cancelled=lambda p: BalanceResult(BalanceState.CANCELLED, p.slug),
+            rejected=lambda p: BalanceResult(BalanceState.UNREACHABLE, p.slug),
+        )
         self._recovery_blocked = False
         self._in_flight = False
         self._pending_op: ProfileOp | None = None
@@ -807,6 +869,7 @@ class ProviderEditor(Gtk.Window):
         self._rendering = False
         self._row_epoch = 0
         self._test_clicks: dict[str, int] = {}
+        self._balance_clicks: dict[str, int] = {}
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         root.set_margin_top(14)
@@ -970,6 +1033,20 @@ class ProviderEditor(Gtk.Window):
         test_status = Gtk.Label(label="", xalign=0)
         test_status.add_css_class("dim-label")
         actions.append(test_status)
+        # Package 7p: the Refresh balance action exists ONLY on DeepSeek
+        # rows (the only supported balance adapter), with the initial
+        # "Not checked" state. Results are ephemeral.
+        balance_button: Gtk.Button | None = None
+        balance_status: Gtk.Label | None = None
+        if profile.kind is ProviderKind.DEEPSEEK:
+            button = Gtk.Button(label=_("Refresh balance"))
+            button.connect("clicked", self._on_refresh_balance, slug)
+            actions.append(button)
+            balance_button = button
+            status = Gtk.Label(label=_("Not checked"), xalign=0)
+            status.add_css_class("dim-label")
+            actions.append(status)
+            balance_status = status
         edit_button = Gtk.Button(label=_("Edit"))
         edit_button.connect("clicked", self._on_edit_clicked, slug)
         actions.append(edit_button)
@@ -1004,6 +1081,8 @@ class ProviderEditor(Gtk.Window):
             "remove_credential": remove_credential,
             "test": test_button,
             "test_status": test_status,
+            "balance": balance_button,
+            "balance_status": balance_status,
             "edit": edit_button,
             "remove": remove_button,
             "confirm": confirm,
@@ -1023,6 +1102,12 @@ class ProviderEditor(Gtk.Window):
             not confirming and self._configured.get(slug, False)
         )
         widgets["test"].set_visible(not confirming)
+        balance = widgets.get("balance")
+        balance_status = widgets.get("balance_status")
+        if balance is not None:
+            balance.set_visible(not confirming)
+        if balance_status is not None:
+            balance_status.set_visible(not confirming)
         widgets["edit"].set_visible(not confirming)
         widgets["remove"].set_visible(not confirming)
 
@@ -1093,7 +1178,9 @@ class ProviderEditor(Gtk.Window):
         # The token carries the per-row click generation: an older
         # generation (a superseded CANCELLED completion or an in-flight
         # result completing late) can never overwrite a newer
-        # "Testing…" or the final result of the same row.
+        # "Testing…" or the final result of the same row. (The balance
+        # refresh keeps its own click counter and callback chain, so the
+        # two action kinds can never cross-publish.)
         token = (slug, self._row_epoch, id(widgets), self._test_clicks[slug])
         # The coordinator completes every request — including submit
         # rejections, which reset the row to a translated sanitized
@@ -1112,6 +1199,63 @@ class ProviderEditor(Gtk.Window):
         if click != self._test_clicks.get(slug, 0):
             return  # superseded by a newer click on the same row: discard
         widgets["test_status"].set_text(_(_CONNECTION_STATE_LABELS[result.state]))
+
+    # ── Balance refresh (Package 7p) ──
+
+    def _on_refresh_balance(self, _button: Any, slug: str) -> None:
+        """Explicit click only, on DeepSeek rows only; runs one bounded,
+        read-only balance refresh per request through the SAME
+        linearizable coordinator machinery (one in-flight plus newest
+        pending, CANCELLED replacement, submit/lookup/spawn/callback
+        cardinalities). Editing, renaming, removing, disabling or
+        closing the profile discards any in-flight result; a newer click
+        on the same row supersedes the parked generation.
+        """
+        if self._shutdown:
+            return
+        widgets = self._row_widgets.get(slug)
+        if widgets is None:
+            return
+        profile = next((p for p in self._profiles if p.slug == slug), None)
+        if profile is None:
+            return
+        widgets["balance_status"].set_text(_("Checking balance…"))
+        self._balance_clicks[slug] = self._balance_clicks.get(slug, 0) + 1
+        # The token carries the per-row balance click generation: an
+        # older generation (a superseded CANCELLED completion or an
+        # in-flight result completing late) can never overwrite a newer
+        # working state or the final result of the same row.
+        token = (slug, self._row_epoch, id(widgets), self._balance_clicks[slug])
+        self._balance_coordinator.request(profile, token, self._publish_balance_result)
+
+    def _publish_balance_result(self, token: Any, result: BalanceResult) -> None:
+        GLib.idle_add(self._apply_balance_result, token, result)
+
+    def _apply_balance_result(self, token: Any, result: BalanceResult) -> None:
+        slug, epoch, widgets_id, click = token
+        widgets = self._row_widgets.get(slug)
+        if widgets is None or id(widgets) != widgets_id or epoch != self._row_epoch:
+            return  # edited, renamed, removed, disabled or closed: discard
+        if click != self._balance_clicks.get(slug, 0):
+            return  # superseded by a newer click on the same row: discard
+        widgets["balance_status"].set_text(self._balance_label(result))
+
+    @staticmethod
+    def _balance_label(result: BalanceResult) -> str:
+        """Translated state plus the EXACT amounts — Total, Granted and
+        Topped up rendered separately, in deterministic currency order
+        (CNY then USD). Amounts are Decimal-rendered fixed-point text:
+        never estimates, conversions or rounded values."""
+        text = _(_BALANCE_STATE_LABELS[result.state])
+        if not result.entries:
+            return text
+        parts = [
+            f"{entry.currency}: {_('Total')} {format(entry.total_balance, 'f')} · "
+            f"{_('Granted')} {format(entry.granted_balance, 'f')} · "
+            f"{_('Topped up')} {format(entry.topped_up_balance, 'f')}"
+            for entry in result.entries
+        ]
+        return f"{text} — {' — '.join(parts)}"
 
     # ── Add/edit form ──
 
@@ -1244,3 +1388,4 @@ class ProviderEditor(Gtk.Window):
         self._shutdown_event.set()
         self._pending_op = None
         self._connection_coordinator.cancel()
+        self._balance_coordinator.cancel()

@@ -357,6 +357,15 @@ _FRENCH: dict[str, str] = {
     "Rate limited": "Limite de débit atteinte",
     "Invalid response": "Réponse invalide",
     "Cancelled": "Annulé",
+    # ── Package 7p: exact DeepSeek balance refresh ──
+    "Refresh balance": "Actualiser le solde",
+    "Checking balance…": "Vérification du solde…",
+    "Not checked": "Non vérifié",
+    "Balance available": "Solde disponible",
+    "Insufficient balance": "Solde insuffisant",
+    "Server error": "Erreur serveur",
+    "Granted": "Octroyé",
+    "Topped up": "Rechargé",
     "Invalid profile.": "Profil invalide.",
     "Invalid value.": "Valeur invalide.",
     "Remote base URLs must not use a loopback address.": (

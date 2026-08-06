@@ -168,11 +168,14 @@ def test_appstream_release_notes_cover_0_3_0_features() -> None:
     assert "hashed session identities" in description
     assert "no polling or terminal scraping" in description
     # Package 7a: the Integrations page and inventory are documented
-    # truthfully — read-only now, editing and balance deferred.
+    # truthfully — read-only now, editing implemented and balance
+    # deferred to the explicit Refresh balance action (Package 7p).
     for keyword in ("read-only", "integrations", "providers and models", "inventory"):
         assert keyword in description, keyword
     assert "deferred" in description
-    assert "deepseek balance is not configured" in description
+    assert "refresh balance" in description
+    assert "no /user/balance call" in description
+    assert "never imply token, cost or usage support" in description
 
 
 def test_appstream_about_text_mentions_integrations() -> None:
@@ -193,14 +196,16 @@ def test_readme_documents_integrations_view() -> None:
     # The activity setup reference now points at the Integrations view.
     assert "configured in the Integrations view" in readme
     # Deferred scope is stated honestly: provider editing, Keyring
-    # credentials and bounded read-only connection tests are implemented
-    # (local only, fakes-only in the suite); the rest stays deferred.
+    # credentials, bounded read-only connection tests and the exact
+    # DeepSeek balance refresh are implemented (fakes-only in the
+    # suite); Hermes writes and financial units stay deferred.
     for deferred in (
         "Hermes writes",
         "DeepSeek balance",
         "financial units",
     ):
         assert deferred in readme, deferred
+    assert "Refresh balance" in readme
     assert "Test connection" in readme
     assert "Edit providers" in readme
     assert "GNOME Keyring" in readme
